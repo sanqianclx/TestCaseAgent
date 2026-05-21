@@ -7,8 +7,8 @@ import { executePytest, type ExecuteTestsOutput } from "../tools/execute-tests-t
 import { exportCases } from "../tools/export-cases-tool.js"
 import { checkTestQuality } from "../tools/check-quality-tool.js"
 import { testCaseAgent } from "../agents/test-case-agent.js"
-import { testCodeAgent } from "../agents/test-code-agent.js"
-import { diagnosisAgent } from "../agents/diagnosis-agent.js"
+import { testCodeAgent, testCodeAgentPro } from "../agents/test-code-agent.js"
+import { diagnosisAgent, diagnosisAgentPro } from "../agents/diagnosis-agent.js"
 
 const testCaseSchema = z.object({
   case_number: z.string(),
@@ -49,10 +49,47 @@ const workflowOutputSchema = z.object({
   diagnosis: z.any().optional(),
 })
 
-const generateAllStep = createStep({
-  id: "generate-test-artifacts",
+/* ================================================================
+ * 逐步递进的 Schema 定义
+ * ================================================================ */
+
+/** Step 1：源码 + AST */
+const step1OutputSchema = workflowInputSchema.extend({
+  source_file: z.string(),
+  source_code: z.string(),
+  filename: z.string(),
+  parsed: z.any(),
+})
+
+/** Step 2：+ 测试用例 */
+const step2OutputSchema = step1OutputSchema.extend({
+  test_cases: z.array(testCaseSchema),
+})
+
+/** Step 3：+ 生成的首版测试代码 + 当前尝试次数 */
+const step3OutputSchema = step2OutputSchema.extend({
+  test_code: z.string(),
+  attempt: z.number().default(1),
+})
+
+/** Step 4：+ pytest 执行结果 */
+const step4OutputSchema = step3OutputSchema.extend({
+  execution_result: z.any(),
+})
+
+/** Step 5：自愈后输出中间结构，携带 output_dir 和 test_cases 供导出步骤使用 */
+const step5OutputSchema = workflowOutputSchema.extend({
+  output_dir: z.string(),
+  test_cases: z.array(testCaseSchema),
+})
+
+/* ================================================================
+ * Step 1: 读取源代码 & AST 解析
+ * ================================================================ */
+const readParseStep = createStep({
+  id: "read-parse-source",
   inputSchema: workflowInputSchema,
-  outputSchema: workflowOutputSchema,
+  outputSchema: step1OutputSchema,
   execute: async ({ inputData }) => {
     const source = await readPythonFile({ path: inputData.file_path, encoding: "utf-8" })
     const parseResult = parseSourceCode({
@@ -60,30 +97,214 @@ const generateAllStep = createStep({
       filename: source.filename,
     })
 
-    const testCases = await generateTestCases(source.content, parseResult, inputData.requirements_text)
+    return {
+      file_path: inputData.file_path,
+      output_dir: inputData.output_dir,
+      max_attempts: inputData.max_attempts,
+      requirements_text: inputData.requirements_text,
+      source_file: source.file_path,
+      source_code: source.content,
+      filename: source.filename,
+      parsed: parseResult,
+    }
+  },
+})
 
-    let testCode = ""
-    let executionResult: ExecuteTestsOutput = emptyExecutionResult()
+/* ================================================================
+ * Step 2: 设计测试用例
+ * ================================================================ */
+const designCasesStep = createStep({
+  id: "design-test-cases",
+  inputSchema: step1OutputSchema,
+  outputSchema: step2OutputSchema,
+  execute: async ({ inputData }) => {
+    const testCases = await generateTestCases(
+      inputData.source_code,
+      inputData.parsed,
+      inputData.requirements_text
+    )
+
+    return {
+      file_path: inputData.file_path,
+      output_dir: inputData.output_dir,
+      max_attempts: inputData.max_attempts,
+      requirements_text: inputData.requirements_text,
+      source_file: inputData.source_file,
+      source_code: inputData.source_code,
+      filename: inputData.filename,
+      parsed: inputData.parsed,
+      test_cases: testCases,
+    }
+  },
+})
+
+/* ================================================================
+ * Step 3: 导出测试用例预案
+ * 生成测试代码与执行测试的耗时不可控（LLM调用 + pytest超时），
+ * 而测试用例本身在 Step 2 完成后已是稳定的交付物。
+ * 此步骤在进入代码生成前立即将测试用例落盘，确保：
+ *   1. 即使后续步骤失败，用户已拥有可查阅的测试用例文档
+ *   2. 用户无需等待全流程结束即可预览用例计划
+ *
+ * 导出耗时 < 100ms（纯文件 I/O），不显著影响主流程。
+ * Mastra 的 .then() 为顺序链，无原生分支语法，
+ * 但此步骤作为透传节点，效果等价于旁路导出。
+ * ================================================================ */
+const exportCasesPlanStep = createStep({
+  id: "export-cases-plan",
+  inputSchema: step2OutputSchema,
+  outputSchema: step2OutputSchema,
+  execute: async ({ inputData }) => {
+    exportCases({
+      test_cases: inputData.test_cases,
+      test_code: "# 测试代码尚未生成 —— 此文件为测试用例预案导出版本\n",
+      output_dir: path.resolve(inputData.output_dir),
+      execution_result: undefined,
+      diagnosis: undefined,
+    })
+
+    return {
+      file_path: inputData.file_path,
+      output_dir: inputData.output_dir,
+      max_attempts: inputData.max_attempts,
+      requirements_text: inputData.requirements_text,
+      source_file: inputData.source_file,
+      source_code: inputData.source_code,
+      filename: inputData.filename,
+      parsed: inputData.parsed,
+      test_cases: inputData.test_cases,
+    }
+  },
+})
+
+/* ================================================================
+ * Step 4: 生成测试代码（首次，使用 deepseek-chat 快速生成）
+ * 纯 LLM 调用，不涉及执行或诊断，返回生成的首版 pytest 代码。
+ * ================================================================ */
+const generateCodeStep = createStep({
+  id: "generate-test-code",
+  inputSchema: step2OutputSchema,
+  outputSchema: step3OutputSchema,
+  execute: async ({ inputData }) => {
+    const testCode = await generateTestCode({
+      sourceCode: inputData.source_code,
+      filename: inputData.filename,
+      parseResult: inputData.parsed,
+      testCases: inputData.test_cases,
+      attempt: 1,
+      previousDiagnosis: undefined,
+    })
+
+    return {
+      file_path: inputData.file_path,
+      output_dir: inputData.output_dir,
+      max_attempts: inputData.max_attempts,
+      requirements_text: inputData.requirements_text,
+      source_file: inputData.source_file,
+      source_code: inputData.source_code,
+      filename: inputData.filename,
+      parsed: inputData.parsed,
+      test_cases: inputData.test_cases,
+      test_code: testCode,
+      attempt: 1,
+    }
+  },
+})
+
+/* ================================================================
+ * Step 5: 执行 pytest & 质量检查
+ * 纯 Python 运行时调用，无 LLM 依赖。执行快（~3-5秒），
+ * 失败时进入下一步自愈修复。
+ * ================================================================ */
+const executeVerifyStep = createStep({
+  id: "execute-verify",
+  inputSchema: step3OutputSchema,
+  outputSchema: step4OutputSchema,
+  execute: async ({ inputData }) => {
+    const executionResult = executePytest({
+      test_code: inputData.test_code,
+      source_code: inputData.source_code,
+      filename: inputData.filename,
+      timeout: 60,
+    })
+
+    return {
+      file_path: inputData.file_path,
+      output_dir: inputData.output_dir,
+      max_attempts: inputData.max_attempts,
+      requirements_text: inputData.requirements_text,
+      source_file: inputData.source_file,
+      source_code: inputData.source_code,
+      filename: inputData.filename,
+      parsed: inputData.parsed,
+      test_cases: inputData.test_cases,
+      test_code: inputData.test_code,
+      attempt: inputData.attempt,
+      execution_result: executionResult,
+    }
+  },
+})
+
+/* ================================================================
+ * Step 6: 自愈修复
+ * 仅在上一步失败时执行。先诊断失败原因，再用 v4-pro 深度推理
+ * 重新生成代码 → 再执行，最多重试 max_attempts-1 次。
+ * 首次诊断用 chat 快速判断，若仍不明确则换 v4-pro 深度诊断。
+ * ================================================================ */
+const selfHealingStep = createStep({
+  id: "self-healing",
+  inputSchema: step4OutputSchema,
+  outputSchema: step5OutputSchema,
+  execute: async ({ inputData }) => {
+    let testCode = inputData.test_code
+    let executionResult = inputData.execution_result
     let diagnosis: Diagnosis | undefined
 
-    for (let attempt = 1; attempt <= inputData.max_attempts; attempt += 1) {
+    let quality = checkTestQuality({ test_code: inputData.test_code })
+
+    const passed =
+      executionResult.status === "passed" &&
+      executionResult.failed === 0 &&
+      executionResult.errors === 0 &&
+      quality.ok
+
+    if (passed) {
+      return finalizeOutput(inputData, testCode, executionResult, undefined)
+    }
+
+    for (let attempt = 2; attempt <= inputData.max_attempts; attempt += 1) {
+      diagnosis = await diagnoseFailure(
+        inputData.source_code,
+        testCode,
+        executionResult,
+        attempt,
+        quality.ok ? undefined : quality.issues
+      )
+
+      if (
+        diagnosis.diagnosis_type !== "TEST_CODE_ERROR" ||
+        diagnosis.confidence < 0.7
+      ) {
+        return finalizeOutput(inputData, testCode, executionResult, diagnosis)
+      }
+
       testCode = await generateTestCode({
-        sourceCode: source.content,
-        filename: source.filename,
-        parseResult,
-        testCases,
+        sourceCode: inputData.source_code,
+        filename: inputData.filename,
+        parseResult: inputData.parsed,
+        testCases: inputData.test_cases,
         attempt,
         previousDiagnosis: diagnosis,
       })
 
       executionResult = executePytest({
         test_code: testCode,
-        source_code: source.content,
-        filename: source.filename,
+        source_code: inputData.source_code,
+        filename: inputData.filename,
         timeout: 60,
       })
 
-      const quality = checkTestQuality({ test_code: testCode })
+      quality = checkTestQuality({ test_code: testCode })
 
       if (
         executionResult.status === "passed" &&
@@ -92,53 +313,97 @@ const generateAllStep = createStep({
         quality.ok
       ) {
         diagnosis = undefined
-        break
-      }
-
-      diagnosis = quality.ok
-        ? await diagnoseFailure(source.content, testCode, executionResult)
-        : {
-            diagnosis_type: "TEST_CODE_ERROR",
-            confidence: 0.85,
-            evidence: quality.issues,
-            next_action: "REGENERATE_TEST_CODE",
-          }
-      if (
-        diagnosis.diagnosis_type !== "TEST_CODE_ERROR" ||
-        diagnosis.confidence < 0.7 ||
-        attempt >= inputData.max_attempts
-      ) {
-        break
+        return finalizeOutput(inputData, testCode, executionResult, undefined)
       }
     }
 
+    return finalizeOutput(inputData, testCode, executionResult, diagnosis)
+  },
+})
+
+/* ================================================================
+ * Step 7: 导出最终完整结果
+ * 将最终的测试代码、用例和执行结果导出为 .py / .md。
+ * ================================================================ */
+const exportResultsStep = createStep({
+  id: "export-results",
+  inputSchema: step5OutputSchema,
+  outputSchema: workflowOutputSchema,
+  execute: async ({ inputData }) => {
     const exportResult = exportCases({
-      test_cases: testCases,
-      test_code: testCode,
+      test_cases: inputData.test_cases,
+      test_code: inputData.test_code,
       output_dir: path.resolve(inputData.output_dir),
-      execution_result: executionResult,
-      diagnosis,
+      execution_result: inputData.execution_detail,
+      diagnosis: inputData.diagnosis,
     })
 
     return {
-      source_file: source.file_path,
-      test_code: testCode,
-      test_cases_count: testCases.length,
-      passed: executionResult.status === "passed" && executionResult.failed === 0 && executionResult.errors === 0,
+      source_file: inputData.source_file,
+      test_code: inputData.test_code,
+      test_cases_count: inputData.test_cases_count,
+      passed: inputData.passed,
       exported_files: exportResult.exported_files,
-      execution_detail: executionResult,
-      diagnosis,
+      execution_detail: inputData.execution_detail,
+      diagnosis: inputData.diagnosis,
     }
   },
 })
 
+/* ================================================================
+ * 工作流串联
+ * 读解析 → 设用例 → 导出预案 → 生成代码 → 执行验证 → 自愈修复 → 导出最终结果
+ * ================================================================ */
 export const generateTestWorkflow = createWorkflow({
   id: "generate-test-workflow",
   inputSchema: workflowInputSchema,
   outputSchema: workflowOutputSchema,
 })
-  .then(generateAllStep)
+  .then(readParseStep)
+  .then(designCasesStep)
+  .then(exportCasesPlanStep)
+  .then(generateCodeStep)
+  .then(executeVerifyStep)
+  .then(selfHealingStep)
+  .then(exportResultsStep)
   .commit()
+
+/* ================================================================
+ * 辅助函数
+ * ================================================================ */
+
+/**
+ * 将中间状态转换为工作流最终输出结构
+ * 提取 runPayload 中累积的字段，统一计算 passed 标记。
+ */
+function finalizeOutput(
+  runPayload: {
+    source_file: string
+    output_dir: string
+    test_cases: TestCase[]
+    diagnosis?: Diagnosis
+  },
+  finalTestCode: string,
+  finalExec: ExecuteTestsOutput,
+  finalDiagnosis?: Diagnosis
+) {
+  const passed =
+    finalExec.status === "passed" &&
+    finalExec.failed === 0 &&
+    finalExec.errors === 0
+
+  return {
+    source_file: runPayload.source_file,
+    test_code: finalTestCode,
+    test_cases_count: runPayload.test_cases.length,
+    passed,
+    exported_files: [],
+    execution_detail: finalExec,
+    diagnosis: finalDiagnosis,
+    output_dir: runPayload.output_dir,
+    test_cases: runPayload.test_cases,
+  }
+}
 
 /**
  * 生成测试用例（核心生成步骤之一）
@@ -157,7 +422,7 @@ async function generateTestCases(
 ): Promise<TestCase[]> {
   if (canUseLLM()) {
     try {
-    const response = await testCaseAgent.generate(`
+      const response = await testCaseAgent.generate(`
 请根据下面的Python源码和AST解析结果生成测试用例。只输出JSON数组，不要输出Markdown。
 
 需求文本：
@@ -169,11 +434,11 @@ ${sourceCode}
 AST：
 ${JSON.stringify(parseResult, null, 2)}
 `)
-    const parsed = parseJsonArray(response.text)
-    const cases = z.array(testCaseSchema).safeParse(parsed)
-    if (cases.success && cases.data.length > 0) {
-      return cases.data
-    }
+      const parsed = parseJsonArray(response.text)
+      const cases = z.array(testCaseSchema).safeParse(parsed)
+      if (cases.success && cases.data.length > 0) {
+        return cases.data
+      }
     } catch {
       // 没有配置LLM或LLM返回不稳定时，使用确定性兜底用例。
     }
@@ -184,16 +449,15 @@ ${JSON.stringify(parseResult, null, 2)}
 
 /**
  * 生成pytest测试代码（核心生成步骤之二）
- * 优先调用LLM Agent生成可执行的pytest测试代码；
- * 若未配置API Key或LLM返回不稳定，则构造确定性兜底测试代码。
- * 每次自愈重试时都会向LLM传入上一次的诊断信息，帮助修正。
+ * 首次用 deepseek-chat 快速生成，重试时换用 deepseek-v4-pro 深度推理。
+ * 每次重试传入上一次的诊断信息帮助精准修复。
  *
  * @param input.sourceCode - Python源代码全文
  * @param input.filename - 源文件名，用于生成import语句
  * @param input.parseResult - AST解析结果
  * @param input.testCases - 已生成的测试用例列表
- * @param input.attempt - 当前尝试次数（第1次生成或第N次自愈）
- * @param input.previousDiagnosis - 上一轮失败诊断（自愈时传入）
+ * @param input.attempt - 当前尝试次数（1=chat, >1=v4-pro）
+ * @param input.previousDiagnosis - 上一轮失败诊断（重试时传入）
  * @returns 完整的pytest测试代码字符串
  */
 async function generateTestCode(input: {
@@ -208,7 +472,8 @@ async function generateTestCode(input: {
 
   if (canUseLLM()) {
     try {
-    const response = await testCodeAgent.generate(`
+      const agent = input.attempt > 1 ? testCodeAgentPro : testCodeAgent
+      const response = await agent.generate(`
 请为下面Python源码生成可执行pytest测试代码。只输出一个python代码块。
 
 模块名：${moduleName}
@@ -228,10 +493,10 @@ ${JSON.stringify(input.previousDiagnosis ?? null, null, 2)}
 3. 不要使用assert True或空断言。
 4. 当前是第 ${input.attempt} 次生成。
 `)
-    const code = extractPythonCode(response.text)
-    if (code.trim()) {
-      return code
-    }
+      const code = extractPythonCode(response.text)
+      if (code.trim()) {
+        return code
+      }
     } catch {
       // fallback below
     }
@@ -242,24 +507,34 @@ ${JSON.stringify(input.previousDiagnosis ?? null, null, 2)}
 
 /**
  * 诊断测试失败原因（核心生成步骤之三）
- * 优先调用LLM Agent分析pytest执行结果并输出结构化诊断；
- * 若未配置API Key或LLM返回不稳定，则基于规则（关键词匹配）给出粗粒度诊断。
- * 诊断类型包括：TEST_CODE_ERROR / SOURCE_RUNTIME_ERROR / BEHAVIOR_MISMATCH / UNKNOWN
+ * 首次用 chat 快速诊断，重试时换用 v4-pro 深度推理。
+ * 质量检查问题作为附加上下文传入 LLM，辅助判断失败根因，
+ * 避免因弱断言等质量问题误杀实际是源代码 Bug 的情况。
  *
  * @param sourceCode - Python源代码全文
  * @param testCode - 当前轮的测试代码
  * @param executionResult - pytest执行结果（stdout/stderr/exit_code等）
+ * @param attempt - 当前尝试次数，>1 时启用 v4-pro 深度推理模式
+ * @param qualityIssues - 可选的质量检查问题列表，作为诊断辅助上下文
  * @returns 结构化诊断结果（类型、置信度、证据、建议动作）
  */
 async function diagnoseFailure(
   sourceCode: string,
   testCode: string,
-  executionResult: ExecuteTestsOutput
+  executionResult: ExecuteTestsOutput,
+  attempt: number,
+  qualityIssues?: string[]
 ): Promise<Diagnosis> {
   if (canUseLLM()) {
     try {
-    const response = await diagnosisAgent.generate(`
+      const agent = attempt > 1 ? diagnosisAgentPro : diagnosisAgent
+      const qualityCtx = qualityIssues?.length
+        ? `\n质量检查发现问题（仅作参考，不代表根因就是测试代码错误）：\n${qualityIssues.join("\n")}`
+        : ""
+      const response = await agent.generate(`
 请诊断pytest失败原因，只输出JSON对象。
+
+重要提示：质量检查发现的问题不代表一定就是测试代码的错误。请仔细分析 traceback 和退出码，判断失败的真实根因——是源代码的 bug、运行时异常，还是测试代码确实写错了。
 
 源代码：
 ${sourceCode}
@@ -269,12 +544,13 @@ ${testCode}
 
 执行结果：
 ${JSON.stringify(executionResult, null, 2)}
+${qualityCtx}
 `)
-    const parsed = parseJsonObject(response.text)
-    const diagnosis = diagnosisSchema.safeParse(parsed)
-    if (diagnosis.success) {
-      return diagnosis.data
-    }
+      const parsed = parseJsonObject(response.text)
+      const diagnosis = diagnosisSchema.safeParse(parsed)
+      if (diagnosis.success) {
+        return diagnosis.data
+      }
     } catch {
       // fallback below
     }
@@ -313,7 +589,7 @@ ${JSON.stringify(executionResult, null, 2)}
  * @returns true表示可以调用LLM，false则走确定性兜底逻辑
  */
 function canUseLLM(): boolean {
-  const key = process.env.OPENAI_API_KEY || process.env.MASTRA_API_KEY || ""
+  const key = process.env.OPENAI_API_KEY || process.env.MASTRA_API_KEY || process.env.DEEPSEEK_API_KEY || ""
   return /^[\x20-\x7E]+$/.test(key) && !key.includes("你的") && key.length > 20
 }
 

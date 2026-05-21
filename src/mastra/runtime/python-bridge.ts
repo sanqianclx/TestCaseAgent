@@ -1,9 +1,39 @@
 import { spawnSync } from "child_process"
 import path from "path"
+import { fileURLToPath } from "url"
+
 import fs from "fs"
 
-/** Python运行时脚本所在目录 */
-const PYTHON_RUNTIME_DIR = path.resolve("python-runtime")
+/** 当前模块的文件路径，用于向上搜索python-runtime目录 */
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+/**
+ * 从指定目录向上逐级搜索python-runtime目录
+ * 编译产物（.mastra/output/）与源文件（src/mastra/runtime/）目录层级不同，
+ * 硬编码相对层级不可靠。此函数向上遍历直到找到python-runtime目录或到达文件系统根目录。
+ *
+ * @param startDir - 起始搜索目录
+ * @returns python-runtime目录的绝对路径
+ * @throws 若遍历到文件系统根目录仍未找到则抛出错误
+ */
+function findPythonRuntimeDir(startDir: string): string {
+  let dir = startDir
+  while (true) {
+    const candidate = path.join(dir, "python-runtime")
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      return candidate
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) {
+      throw new Error("无法找到python-runtime目录，请确认项目结构完整")
+    }
+    dir = parent
+  }
+}
+
+/** Python运行时脚本所在目录（向上搜索避免编译产物路径差异） */
+const PYTHON_RUNTIME_DIR = findPythonRuntimeDir(__dirname)
 
 export interface PythonCallResult<T = unknown> {
   ok: boolean
@@ -45,6 +75,11 @@ export function callPythonScript<T>(
       timeout: timeoutMs,
       windowsHide: true,
       maxBuffer: 10 * 1024 * 1024,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+        PYTHONUTF8: "1",
+      },
     })
 
     /* spawn失败（如python未安装） */

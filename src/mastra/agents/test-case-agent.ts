@@ -24,7 +24,7 @@ export const testCaseAgent = new Agent({
 输出格式要求：
 - 每个用例包含：编号、标题、优先级(P0-P3)、类型、前置条件、步骤、预期结果
 - 使用JSON数组格式输出，便于后续处理`,
-  model: "openai/gpt-4o-mini",
+  model: "deepseek/deepseek-chat",
   tools: {
     readFileTool,
     parseSourceCodeTool,

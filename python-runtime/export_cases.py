@@ -13,7 +13,7 @@ from datetime import datetime
 def read_input() -> dict:
     """
     读取stdin或命令行参数的JSON输入
-    优先从stdin读取（与Node.js spawnSync + input模式兼容），
+    优先从stdin读取，
     若stdin为空则回退到命令行参数。
     """
     raw = sys.stdin.read().strip()
