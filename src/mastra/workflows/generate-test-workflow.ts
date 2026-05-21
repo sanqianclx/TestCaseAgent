@@ -140,6 +140,16 @@ export const generateTestWorkflow = createWorkflow({
   .then(generateAllStep)
   .commit()
 
+/**
+ * 生成测试用例（核心生成步骤之一）
+ * 优先调用LLM Agent生成结构化测试用例JSON数组；
+ * 若未配置API Key或LLM返回不稳定，则使用确定性兜底逻辑。
+ *
+ * @param sourceCode - Python源代码全文
+ * @param parseResult - AST解析结果（函数/类/参数/行号）
+ * @param requirementsText - 可选需求文本，辅助LLM判断预期行为
+ * @returns 结构化的测试用例列表
+ */
 async function generateTestCases(
   sourceCode: string,
   parseResult: ParsedSource,
@@ -172,6 +182,20 @@ ${JSON.stringify(parseResult, null, 2)}
   return fallbackTestCases(parseResult)
 }
 
+/**
+ * 生成pytest测试代码（核心生成步骤之二）
+ * 优先调用LLM Agent生成可执行的pytest测试代码；
+ * 若未配置API Key或LLM返回不稳定，则构造确定性兜底测试代码。
+ * 每次自愈重试时都会向LLM传入上一次的诊断信息，帮助修正。
+ *
+ * @param input.sourceCode - Python源代码全文
+ * @param input.filename - 源文件名，用于生成import语句
+ * @param input.parseResult - AST解析结果
+ * @param input.testCases - 已生成的测试用例列表
+ * @param input.attempt - 当前尝试次数（第1次生成或第N次自愈）
+ * @param input.previousDiagnosis - 上一轮失败诊断（自愈时传入）
+ * @returns 完整的pytest测试代码字符串
+ */
 async function generateTestCode(input: {
   sourceCode: string
   filename: string
@@ -216,6 +240,17 @@ ${JSON.stringify(input.previousDiagnosis ?? null, null, 2)}
   return fallbackTestCode(moduleName, input.parseResult)
 }
 
+/**
+ * 诊断测试失败原因（核心生成步骤之三）
+ * 优先调用LLM Agent分析pytest执行结果并输出结构化诊断；
+ * 若未配置API Key或LLM返回不稳定，则基于规则（关键词匹配）给出粗粒度诊断。
+ * 诊断类型包括：TEST_CODE_ERROR / SOURCE_RUNTIME_ERROR / BEHAVIOR_MISMATCH / UNKNOWN
+ *
+ * @param sourceCode - Python源代码全文
+ * @param testCode - 当前轮的测试代码
+ * @param executionResult - pytest执行结果（stdout/stderr/exit_code等）
+ * @returns 结构化诊断结果（类型、置信度、证据、建议动作）
+ */
 async function diagnoseFailure(
   sourceCode: string,
   testCode: string,
@@ -270,11 +305,25 @@ ${JSON.stringify(executionResult, null, 2)}
   }
 }
 
+/**
+ * 判断是否已配置有效的LLM API Key
+ * 检测OPENAI_API_KEY或MASTRA_API_KEY环境变量；
+ * 排除示例占位Key（如"你的"、"sk-xxx"等）。
+ *
+ * @returns true表示可以调用LLM，false则走确定性兜底逻辑
+ */
 function canUseLLM(): boolean {
   const key = process.env.OPENAI_API_KEY || process.env.MASTRA_API_KEY || ""
   return /^[\x20-\x7E]+$/.test(key) && !key.includes("你的") && key.length > 20
 }
 
+/**
+ * 确定性兜底：当LLM不可用时，根据AST符号信息生成基础测试用例
+ * 为每个被测函数/方法生成3条用例（功能/边界/异常），确保永远有输出。
+ *
+ * @param parseResult - AST解析结果
+ * @returns 基础测试用例列表（每个符号3条）
+ */
 function fallbackTestCases(parseResult: ParsedSource): TestCase[] {
   const symbols = collectSymbols(parseResult)
   return symbols.flatMap((symbol, index) => {
@@ -314,6 +363,14 @@ function fallbackTestCases(parseResult: ParsedSource): TestCase[] {
   })
 }
 
+/**
+ * 确定性兜底：当LLM不可用时，根据AST符号信息生成基础pytest测试代码
+ * 为每个函数生成callable检查+调用验证，为每个方法生成hasattr+callable检查。
+ *
+ * @param moduleName - 模块名，用于生成from...import语句
+ * @param parseResult - AST解析结果
+ * @returns 可用的pytest测试代码字符串
+ */
 function fallbackTestCode(moduleName: string, parseResult: ParsedSource): string {
   const symbols = collectSymbols(parseResult)
   const importNames = new Set<string>()
@@ -349,6 +406,13 @@ function fallbackTestCode(moduleName: string, parseResult: ParsedSource): string
   return lines.join("\n")
 }
 
+/**
+ * 从AST解析结果中提取所有可测试的符号（函数/类方法）
+ * 将独立函数和类方法展平为统一结构，类方法自动过滤self参数。
+ *
+ * @param parseResult - AST解析结果
+ * @returns 统一的符号列表，包含名称、类型、参数、所属类
+ */
 function collectSymbols(parseResult: ParsedSource): Array<{
   name: string
   kind: string
@@ -377,6 +441,14 @@ function collectSymbols(parseResult: ParsedSource): Array<{
   return [...functions, ...methods]
 }
 
+/**
+ * 根据参数类型名称生成对应的Python示例值
+ * 用于兜底测试代码中构造函数调用参数。
+ * 支持：int/float/bool/list/dict/str，其他返回None。
+ *
+ * @param typeName - 类型名称字符串（忽略大小写）
+ * @returns 对应类型的Python字面值字符串
+ */
 function sampleValue(typeName = "Any"): string {
   const normalized = typeName.toLowerCase()
   if (normalized.includes("int")) return "1"
@@ -388,21 +460,48 @@ function sampleValue(typeName = "Any"): string {
   return "None"
 }
 
+/**
+ * 从LLM返回的文本中提取JSON数组
+ * 匹配第一个被方括号包裹的JSON结构并解析。
+ *
+ * @param text - LLM返回的原始文本（可能包含Markdown或额外说明）
+ * @returns 解析后的数组，若失败则返回空数组
+ */
 function parseJsonArray(text: string): unknown {
   const match = text.match(/\[[\s\S]*\]/)
   return match ? JSON.parse(match[0]) : []
 }
 
+/**
+ * 从LLM返回的文本中提取JSON对象
+ * 匹配第一个被花括号包裹的JSON结构并解析。
+ *
+ * @param text - LLM返回的原始文本
+ * @returns 解析后的对象，若失败则返回空对象
+ */
 function parseJsonObject(text: string): unknown {
   const match = text.match(/\{[\s\S]*\}/)
   return match ? JSON.parse(match[0]) : {}
 }
 
+/**
+ * 从LLM返回的文本中提取Python代码块
+ * 匹配三个反引号包裹的python代码块，若未找到则返回原文。
+ *
+ * @param text - LLM返回的原始文本
+ * @returns 提取的纯代码字符串
+ */
 function extractPythonCode(text: string): string {
   const match = text.match(/```(?:python)?\s*([\s\S]*?)```/)
   return match ? match[1] : text
 }
 
+/**
+ * 构造空的执行结果对象
+ * 在自愈循环开始前初始化占位结果，避免undefined引用。
+ *
+ * @returns 状态为not_run的空执行结果
+ */
 function emptyExecutionResult(): ExecuteTestsOutput {
   return {
     status: "not_run",
