@@ -26,6 +26,9 @@ export function exportCases(inputData: {
   output_dir: string
   execution_result?: unknown
   diagnosis?: unknown
+  quality?: unknown
+  versions?: unknown[]
+  artifact_prefix?: string
 }): ExportCasesOutput {
   const result = callPythonScript<ExportCasesOutput>("export_cases.py", inputData, 30_000)
   if (!result.ok || !result.data) {
@@ -47,6 +50,9 @@ export const exportCasesTool = createTool({
     output_dir: z.string().describe("输出目录的绝对或相对路径，目录不存在时会自动创建"),
     execution_result: z.any().optional().describe("pytest执行结果对象（status/passed/failed/errors/stdout/stderr/exit_code/duration_ms/timeout）"),
     diagnosis: z.any().optional().describe("失败诊断结果对象（diagnosis_type/confidence/evidence/next_action）"),
+    quality: z.any().optional().describe("质量检查结果对象（ok/issues/checked_tests）"),
+    versions: z.array(z.any()).optional().describe("测试代码版本记录，用于在报告中展示自愈过程"),
+    artifact_prefix: z.string().optional().describe("可选导出文件后缀，如plan会生成test_cases_plan.md"),
   }),
   outputSchema: z.object({
     exported_files: z.array(z.string()).describe("生成的文件绝对路径列表"),

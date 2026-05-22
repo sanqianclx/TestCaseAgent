@@ -28,6 +28,9 @@ def export_cases(
     output_dir: str,
     execution_result: dict | None = None,
     diagnosis: dict | None = None,
+    quality: dict | None = None,
+    versions: list | None = None,
+    artifact_prefix: str | None = None,
 ) -> dict:
     """
     导出测试用例文档和测试代码文件。
@@ -45,8 +48,12 @@ def export_cases(
     os.makedirs(output_dir, exist_ok=True)
     exported = []
 
+    suffix = _safe_suffix(artifact_prefix)
+    py_filename = f"test_generated_{suffix}.py" if suffix else "test_generated.py"
+    md_filename = f"test_cases_{suffix}.md" if suffix else "test_cases.md"
+
     # (1) 导出 .py 测试代码文件
-    py_path = os.path.join(output_dir, "test_generated.py")
+    py_path = os.path.join(output_dir, py_filename)
     with open(py_path, "w", encoding="utf-8") as f:
         f.write(test_code)
     exported.append(py_path)
@@ -89,7 +96,9 @@ def export_cases(
                 ]
             )
             for idx, tr in enumerate(test_results, 1):
-                name = f"{tr.get('test_class', '')}.{tr.get('test_name', '?')}"
+                test_class = tr.get("test_class", "")
+                test_name = tr.get("test_name", "?")
+                name = f"{test_class}.{test_name}" if test_class else test_name
                 result_label = tr.get("result", "?")
                 if result_label == "PASSED":
                     icon = "✅ 通过"
@@ -125,6 +134,24 @@ def export_cases(
             ]
         )
 
+    # 质量检查章节（仅在提供了质量检查结果时出现）
+    if quality:
+        ok = quality.get("ok", False)
+        md_lines.extend(
+            [
+                "",
+                "## 质量检查",
+                "",
+                f"- 结果：{'通过' if ok else '未通过'}",
+                f"- 检查到的测试函数数：{quality.get('checked_tests', '')}",
+            ]
+        )
+        issues = quality.get("issues", [])
+        if issues:
+            md_lines.append("- 问题：")
+            for item in issues:
+                md_lines.append(f"  - {clean_text(item)}")
+
     # 失败诊断章节（仅在提供了诊断结果时出现）
     if diagnosis:
         md_lines.extend(
@@ -143,7 +170,31 @@ def export_cases(
             for item in evidence:
                 md_lines.append(f"  - {clean_text(item)}")
 
-    md_path = os.path.join(output_dir, "test_cases.md")
+    # 版本记录章节（V2.0自愈循环使用）
+    if versions:
+        md_lines.extend(
+            [
+                "",
+                "## 测试代码版本记录",
+                "",
+                "| 版本 | 尝试轮次 | 执行状态 | 质量结果 | 诊断类型 | 说明 |",
+                "|------|----------|----------|----------|----------|------|",
+            ]
+        )
+        for version in versions:
+            exec_result = version.get("execution_result") or {}
+            quality_result = version.get("quality") or {}
+            diagnosis_result = version.get("diagnosis") or {}
+            md_lines.append(
+                f"| v{version.get('version_no', '?')} "
+                f"| {version.get('attempt', '?')} "
+                f"| {clean_text(exec_result.get('status', 'not_run'))} "
+                f"| {'通过' if quality_result.get('ok') else '未通过'} "
+                f"| {clean_text(diagnosis_result.get('diagnosis_type', '-'))} "
+                f"| {clean_text(version.get('note', '-'))} |"
+            )
+
+    md_path = os.path.join(output_dir, md_filename)
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(clean_text("\n".join(md_lines)))
     exported.append(md_path)
@@ -157,6 +208,14 @@ def _format_params(params: dict) -> str:
         return "-"
     items = [f"{k}={v!r}" for k, v in params.items()]
     return ", ".join(items)[:80]
+
+
+def _safe_suffix(value: str | None) -> str:
+    """将导出阶段名转换为安全文件名后缀。"""
+    if not value:
+        return ""
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value))
+    return safe.strip("_")[:40]
 
 
 def clean_text(value) -> str:
@@ -181,6 +240,9 @@ if __name__ == "__main__":
         input_data.get("output_dir", "./output"),
         input_data.get("execution_result"),
         input_data.get("diagnosis"),
+        input_data.get("quality"),
+        input_data.get("versions"),
+        input_data.get("artifact_prefix"),
     )
     output = {"ok": True, "data": result, "error": None}
     print(json.dumps(output, ensure_ascii=False))

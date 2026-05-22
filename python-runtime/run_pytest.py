@@ -123,21 +123,35 @@ def _parse_test_results(stdout: str) -> list[dict]:
     """
     import re
 
-    line_pattern = re.compile(
+    class_line_pattern = re.compile(
         r"^(test_temp\.py)::(\w+)::(\w+)\s+(PASSED|FAILED|ERROR)\b"
+    )
+    function_line_pattern = re.compile(
+        r"^(test_temp\.py)::(\w+)\s+(PASSED|FAILED|ERROR)\b"
     )
     lines = stdout.split("\n")
 
     # 第一遍：收集逐用例状态
     results: list[dict] = []
     for line in lines:
-        m = line_pattern.match(line)
+        m = class_line_pattern.match(line)
         if m:
             results.append({
                 "test_file": m.group(1),
                 "test_class": m.group(2),
                 "test_name": m.group(3),
                 "result": m.group(4),
+                "failure_reason": "",
+            })
+            continue
+
+        fm = function_line_pattern.match(line)
+        if fm:
+            results.append({
+                "test_file": fm.group(1),
+                "test_class": "",
+                "test_name": fm.group(2),
+                "result": fm.group(3),
                 "failure_reason": "",
             })
 
@@ -147,7 +161,7 @@ def _parse_test_results(stdout: str) -> list[dict]:
     # 合并：为每个 FAILED 用例查找详细原因
     for r in results:
         if r["result"] == "FAILED":
-            key = f"{r['test_class']}.{r['test_name']}"
+            key = _result_key(r["test_class"], r["test_name"])
             r["failure_reason"] = failure_details.get(key, "断言失败，无详细信息")
 
     return results
@@ -177,8 +191,10 @@ def _parse_failure_details(lines: list[str]) -> dict[str, str]:
     """
     import re
 
-    # 匹配测试函数标题行
-    title_pattern = re.compile(r"^_+\s+(\w+)\.(\w+)\s+_+$")
+    # 匹配测试函数标题行，兼容类方法和模块级函数：
+    #   ______________________ TestBadMath.test_basic ______________________
+    #   ______________________ test_basic ______________________
+    title_pattern = re.compile(r"^_+\s+(?:(\w+)\.)?(\w+)\s+_+$")
     # 匹配 assert 行
     assert_pattern = re.compile(r"^\s*assert\s+(.+)$")
     # 匹配 E assert 行（兼容 E assert ... 和 E AssertionError: assert ... 两种格式）
@@ -189,7 +205,7 @@ def _parse_failure_details(lines: list[str]) -> dict[str, str]:
     while i < len(lines):
         tm = title_pattern.match(lines[i])
         if tm:
-            key = f"{tm.group(1)}.{tm.group(2)}"
+            key = _result_key(tm.group(1) or "", tm.group(2))
             j = i + 1
             assert_call = ""
             actual_vs_expected = ""
@@ -215,6 +231,11 @@ def _parse_failure_details(lines: list[str]) -> dict[str, str]:
             i += 1
 
     return details
+
+
+def _result_key(test_class: str, test_name: str) -> str:
+    """统一类方法测试和模块级测试函数的结果索引键。"""
+    return f"{test_class}.{test_name}" if test_class else test_name
 
 
 def _format_failure(assert_line: str, e_line: str) -> str:

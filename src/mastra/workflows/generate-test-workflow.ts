@@ -5,7 +5,7 @@ import { readPythonFile } from "../tools/read-file-tool.js"
 import { parseSourceCode, type ParsedSource } from "../tools/parse-source-code-tool.js"
 import { executePytest, type ExecuteTestsOutput } from "../tools/execute-tests-tool.js"
 import { exportCases } from "../tools/export-cases-tool.js"
-import { checkTestQuality } from "../tools/check-quality-tool.js"
+import { checkTestQuality, type QualityCheckResult } from "../tools/check-quality-tool.js"
 import { testCaseAgent } from "../agents/test-case-agent.js"
 import { testCodeAgent, testCodeAgentPro } from "../agents/test-code-agent.js"
 import { diagnosisAgent, diagnosisAgentPro } from "../agents/diagnosis-agent.js"
@@ -32,6 +32,19 @@ const diagnosisSchema = z.object({
 
 type Diagnosis = z.infer<typeof diagnosisSchema>
 
+const testCodeVersionSchema = z.object({
+  version_no: z.number(),
+  attempt: z.number(),
+  test_code: z.string(),
+  execution_result: z.any().optional(),
+  quality: z.any().optional(),
+  diagnosis: diagnosisSchema.optional(),
+  note: z.string().optional(),
+  created_at: z.string(),
+})
+
+type TestCodeVersion = z.infer<typeof testCodeVersionSchema>
+
 const workflowInputSchema = z.object({
   file_path: z.string().describe("源代码文件路径"),
   output_dir: z.string().default("./output/exports").describe("输出目录，仅导出 .py 和 .md"),
@@ -47,6 +60,8 @@ const workflowOutputSchema = z.object({
   exported_files: z.array(z.string()),
   execution_detail: z.any(),
   diagnosis: z.any().optional(),
+  quality: z.any().optional(),
+  versions: z.array(testCodeVersionSchema).optional(),
 })
 
 /* ================================================================
@@ -161,6 +176,9 @@ const exportCasesPlanStep = createStep({
       output_dir: path.resolve(inputData.output_dir),
       execution_result: undefined,
       diagnosis: undefined,
+      quality: undefined,
+      versions: undefined,
+      artifact_prefix: "plan",
     })
 
     return {
@@ -224,7 +242,7 @@ const executeVerifyStep = createStep({
     const executionResult = executePytest({
       test_code: inputData.test_code,
       source_code: inputData.source_code,
-      filename: inputData.filename,
+      filename: runtimeFilename(inputData.filename),
       timeout: 60,
     })
 
@@ -261,6 +279,16 @@ const selfHealingStep = createStep({
     let diagnosis: Diagnosis | undefined
 
     let quality = checkTestQuality({ test_code: inputData.test_code })
+    const versions: TestCodeVersion[] = [
+      createVersionRecord({
+        versionNo: 1,
+        attempt: inputData.attempt,
+        testCode,
+        executionResult,
+        quality,
+        note: "首次生成",
+      }),
+    ]
 
     const passed =
       executionResult.status === "passed" &&
@@ -269,23 +297,30 @@ const selfHealingStep = createStep({
       quality.ok
 
     if (passed) {
-      return finalizeOutput(inputData, testCode, executionResult, undefined)
+      return finalizeOutput(inputData, testCode, executionResult, undefined, quality, versions)
     }
 
     for (let attempt = 2; attempt <= inputData.max_attempts; attempt += 1) {
-      diagnosis = await diagnoseFailure(
-        inputData.source_code,
-        testCode,
-        executionResult,
-        attempt,
-        quality.ok ? undefined : quality.issues
-      )
+      diagnosis = isExecutionPassed(executionResult) && !quality.ok
+        ? qualityFailureDiagnosis(quality)
+        : await diagnoseFailure(
+          inputData.source_code,
+          testCode,
+          executionResult,
+          attempt,
+          quality.ok ? undefined : quality.issues
+        )
+
+      versions[versions.length - 1] = {
+        ...versions[versions.length - 1],
+        diagnosis,
+      }
 
       if (
         diagnosis.diagnosis_type !== "TEST_CODE_ERROR" ||
         diagnosis.confidence < 0.7
       ) {
-        return finalizeOutput(inputData, testCode, executionResult, diagnosis)
+        return finalizeOutput(inputData, testCode, executionResult, diagnosis, quality, versions)
       }
 
       testCode = await generateTestCode({
@@ -300,11 +335,19 @@ const selfHealingStep = createStep({
       executionResult = executePytest({
         test_code: testCode,
         source_code: inputData.source_code,
-        filename: inputData.filename,
+        filename: runtimeFilename(inputData.filename),
         timeout: 60,
       })
 
       quality = checkTestQuality({ test_code: testCode })
+      versions.push(createVersionRecord({
+        versionNo: versions.length + 1,
+        attempt,
+        testCode,
+        executionResult,
+        quality,
+        note: "自愈重生成",
+      }))
 
       if (
         executionResult.status === "passed" &&
@@ -313,11 +356,11 @@ const selfHealingStep = createStep({
         quality.ok
       ) {
         diagnosis = undefined
-        return finalizeOutput(inputData, testCode, executionResult, undefined)
+        return finalizeOutput(inputData, testCode, executionResult, undefined, quality, versions)
       }
     }
 
-    return finalizeOutput(inputData, testCode, executionResult, diagnosis)
+    return finalizeOutput(inputData, testCode, executionResult, diagnosis, quality, versions)
   },
 })
 
@@ -336,6 +379,8 @@ const exportResultsStep = createStep({
       output_dir: path.resolve(inputData.output_dir),
       execution_result: inputData.execution_detail,
       diagnosis: inputData.diagnosis,
+      quality: inputData.quality,
+      versions: inputData.versions,
     })
 
     return {
@@ -346,6 +391,8 @@ const exportResultsStep = createStep({
       exported_files: exportResult.exported_files,
       execution_detail: inputData.execution_detail,
       diagnosis: inputData.diagnosis,
+      quality: inputData.quality,
+      versions: inputData.versions,
     }
   },
 })
@@ -385,12 +432,15 @@ function finalizeOutput(
   },
   finalTestCode: string,
   finalExec: ExecuteTestsOutput,
-  finalDiagnosis?: Diagnosis
+  finalDiagnosis?: Diagnosis,
+  finalQuality?: QualityCheckResult,
+  versions: TestCodeVersion[] = []
 ) {
   const passed =
     finalExec.status === "passed" &&
     finalExec.failed === 0 &&
-    finalExec.errors === 0
+    finalExec.errors === 0 &&
+    finalQuality?.ok !== false
 
   return {
     source_file: runPayload.source_file,
@@ -400,8 +450,51 @@ function finalizeOutput(
     exported_files: [],
     execution_detail: finalExec,
     diagnosis: finalDiagnosis,
+    quality: finalQuality,
+    versions,
     output_dir: runPayload.output_dir,
     test_cases: runPayload.test_cases,
+  }
+}
+
+function createVersionRecord(input: {
+  versionNo: number
+  attempt: number
+  testCode: string
+  executionResult?: ExecuteTestsOutput
+  quality?: QualityCheckResult
+  diagnosis?: Diagnosis
+  note?: string
+}): TestCodeVersion {
+  return {
+    version_no: input.versionNo,
+    attempt: input.attempt,
+    test_code: input.testCode,
+    execution_result: input.executionResult,
+    quality: input.quality,
+    diagnosis: input.diagnosis,
+    note: input.note,
+    created_at: new Date().toISOString(),
+  }
+}
+
+function isExecutionPassed(executionResult: ExecuteTestsOutput): boolean {
+  return (
+    executionResult.status === "passed" &&
+    executionResult.failed === 0 &&
+    executionResult.errors === 0
+  )
+}
+
+function qualityFailureDiagnosis(quality: QualityCheckResult): Diagnosis {
+  return {
+    diagnosis_type: "TEST_CODE_ERROR",
+    confidence: 0.86,
+    evidence: [
+      "pytest已经通过，但静态质量检查未通过，说明测试代码可能存在弱断言或空测试",
+      ...quality.issues,
+    ],
+    next_action: "REGENERATE_TEST_CODE",
   }
 }
 
@@ -505,7 +598,7 @@ async function generateTestCode(input: {
   attempt: number
   previousDiagnosis?: Diagnosis
 }): Promise<string> {
-  const moduleName = path.basename(input.filename, ".py")
+  const moduleName = toPythonModuleName(input.filename)
 
   if (canUseLLM()) {
     try {
@@ -594,19 +687,43 @@ ${qualityCtx}
   }
 
   const combined = `${executionResult.stdout}\n${executionResult.stderr}`
-  if (combined.includes("test_temp.py") || combined.includes("fixture") || combined.includes("ImportError")) {
+  if (executionResult.timeout) {
+    return {
+      diagnosis_type: "UNKNOWN",
+      confidence: 0.6,
+      evidence: ["pytest执行超时，可能是源代码死循环、测试输入不当或环境阻塞"],
+      next_action: "ASK_USER_CONFIRMATION",
+    }
+  }
+
+  if (
+    /fixture .* not found/i.test(combined) ||
+    /ImportError|ModuleNotFoundError/.test(combined) ||
+    (/NameError/.test(combined) && combined.includes("test_temp.py")) ||
+    (/SyntaxError/.test(combined) && combined.includes("test_temp.py"))
+  ) {
     return {
       diagnosis_type: "TEST_CODE_ERROR",
-      confidence: 0.8,
-      evidence: ["pytest输出显示失败位置或导入问题来自生成的测试代码"],
+      confidence: 0.82,
+      evidence: ["pytest输出显示导入、fixture、名称或语法问题来自生成的测试代码"],
       next_action: "REGENERATE_TEST_CODE",
     }
   }
-  if (combined.includes(".py") && executionResult.errors > 0) {
+
+  if (/AssertionError|E\s+assert\b/.test(combined) || executionResult.failed > 0) {
+    return {
+      diagnosis_type: "BEHAVIOR_MISMATCH",
+      confidence: 0.66,
+      evidence: ["pytest断言失败，说明实际行为与测试预期不一致，需要结合需求或docstring确认"],
+      next_action: "ASK_USER_CONFIRMATION",
+    }
+  }
+
+  if (executionResult.errors > 0) {
     return {
       diagnosis_type: "SOURCE_RUNTIME_ERROR",
       confidence: 0.7,
-      evidence: ["pytest执行出现运行时错误，需要查看traceback确认源代码行为"],
+      evidence: ["pytest执行出现运行时错误，需要查看traceback确认是否源代码异常或依赖缺失"],
       next_action: "REPORT_TO_USER",
     }
   }
@@ -717,6 +834,17 @@ function fallbackTestCode(moduleName: string, parseResult: ParsedSource): string
     lines.push("")
   }
   return lines.join("\n")
+}
+
+function runtimeFilename(filename: string): string {
+  return `${toPythonModuleName(filename)}.py`
+}
+
+function toPythonModuleName(filename: string): string {
+  const baseName = path.basename(filename, ".py")
+  const sanitized = baseName.replace(/[^A-Za-z0-9_]/g, "_")
+  if (!sanitized) return "source_temp"
+  return /^[A-Za-z_]/.test(sanitized) ? sanitized : `m_${sanitized}`
 }
 
 /**
