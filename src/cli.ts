@@ -68,7 +68,13 @@ function loadDotEnv(): void {
     }
 
     const key = trimmed.slice(0, separator).trim()
-    const value = trimmed.slice(separator + 1).trim().replace(/^["']|["']$/g, "")
+    let value = trimmed.slice(separator + 1).trim().replace(/^["']|["']$/g, "")
+
+    // 展开 ${VAR} 引用，从系统环境变量取值
+    value = value.replace(/\$\{([^}]+)\}/g, (_match, varName: string) => {
+      return process.env[varName] ?? ""
+    })
+
     process.env[key] ??= value
   }
 }
