@@ -13,10 +13,10 @@ import { diagnosisAgent, diagnosisAgentPro } from "../agents/diagnosis-agent.js"
 const testCaseSchema = z.object({
   case_number: z.string(),
   title: z.string(),
-  priority: z.string(),
   case_type: z.string(),
   preconditions: z.string(),
-  steps: z.array(z.string()),
+  steps: z.union([z.string(), z.array(z.string())]),
+  input_params: z.record(z.unknown()).optional().describe("条用例的输入参数，键名为形参名，值为测试输入值"),
   expected_result: z.string(),
   related_symbol: z.string(),
 })
@@ -423,7 +423,28 @@ async function generateTestCases(
   if (canUseLLM()) {
     try {
       const response = await testCaseAgent.generate(`
-请根据下面的Python源码和AST解析结果生成测试用例。只输出JSON数组，不要输出Markdown。
+请分析下面的Python源码和AST解析结果，为每个函数/方法设计针对性的测试用例。
+
+必须输出纯JSON数组，不要任何Markdown标记、不要代码块、不要额外解释。
+
+每一条测试用例的JSON格式如下：
+{
+  "case_number": "TC-001",
+  "title": "用一句话描述这个测试验证什么（如"传入正常参数应返回正确和"或"除数为0时应抛出ZeroDivisionError"）",
+  "case_type": "功能/边界/异常",
+  "preconditions": "测试执行的前提条件（如"被测函数可导入"或"被测类已实例化"）",
+  "steps": ["具体的测试步骤1", "步骤2"],
+  "input_params": {"a": 3, "b": 5},
+  "expected_result": "具体的预期结果，必须包含具体数值或异常信息。例如：'返回 8' 或 '抛出 ZeroDivisionError'",
+  "related_symbol": "被测的函数名或类名"
+}
+
+设计策略（非常重要）：
+- 仔细阅读每个函数的 docstring 和参数类型，生成贴合实际逻辑的用例
+- 例如 divide_zero(a,b) 应该设计"b=0时抛出ZeroDivisionError"的异常用例，而不是笼统的"异常输入验证"
+- 例如 faulty_logic 的 docstring 说>=60返回"通过"，应设计"score=60时返回'通过'"的功能用例
+- 每个函数/方法至少3条用例，复杂函数可适当增加
+- 用例之间要有区分度，不要三件套模板
 
 需求文本：
 ${requirementsText || "无"}
@@ -434,12 +455,28 @@ ${sourceCode}
 AST：
 ${JSON.stringify(parseResult, null, 2)}
 `)
+      console.error("[generateTestCases] LLM raw response length:", response.text?.length ?? 0)
       const parsed = parseJsonArray(response.text)
-      const cases = z.array(testCaseSchema).safeParse(parsed)
-      if (cases.success && cases.data.length > 0) {
-        return cases.data
+      if (!parsed || !Array.isArray(parsed) || parsed.length === 0) {
+        console.error("[generateTestCases] parseJsonArray failed or empty, raw:", response.text?.slice(0, 200))
+        return fallbackTestCases(parseResult)
       }
-    } catch {
+      const casesResult = z.array(testCaseSchema).safeParse(parsed)
+      if (casesResult.success && casesResult.data.length > 0) {
+        return casesResult.data
+      }
+      console.error("[generateTestCases] zod validation failed:", JSON.stringify(casesResult.error?.issues?.slice(0, 5)))
+      // Zod 校验失败时，逐条保留合法的用例
+      const validCases: TestCase[] = []
+      for (const item of parsed) {
+        if (typeof item === "object" && item !== null) {
+          const single = testCaseSchema.safeParse(item)
+          if (single.success) validCases.push(single.data)
+        }
+      }
+      if (validCases.length > 0) return validCases
+    } catch (err) {
+      console.error("[generateTestCases] exception:", err)
       // 没有配置LLM或LLM返回不稳定时，使用确定性兜底用例。
     }
   }
@@ -608,30 +645,30 @@ function fallbackTestCases(parseResult: ParsedSource): TestCase[] {
       {
         case_number: `TC-${String(caseNo + 1).padStart(3, "0")}`,
         title: `${symbol.name} 正常调用验证`,
-        priority: "P0",
         case_type: "功能",
         preconditions: "被测函数可导入",
         steps: [`调用 ${symbol.name}`],
+        input_params: undefined,
         expected_result: "函数可正常执行，并返回可观察结果",
         related_symbol: symbol.name,
       },
       {
         case_number: `TC-${String(caseNo + 2).padStart(3, "0")}`,
-        title: `${symbol.name} 空值或边界输入验证`,
-        priority: "P1",
+        title: `${symbol.name} 边界输入验证`,
         case_type: "边界",
         preconditions: "被测函数可导入",
         steps: [`使用边界参数调用 ${symbol.name}`],
+        input_params: undefined,
         expected_result: "函数返回合理结果或抛出明确异常",
         related_symbol: symbol.name,
       },
       {
         case_number: `TC-${String(caseNo + 3).padStart(3, "0")}`,
         title: `${symbol.name} 异常输入验证`,
-        priority: "P1",
         case_type: "异常",
         preconditions: "被测函数可导入",
         steps: [`使用异常参数调用 ${symbol.name}`],
+        input_params: undefined,
         expected_result: "函数不应静默产生错误结果",
         related_symbol: symbol.name,
       },
@@ -738,14 +775,26 @@ function sampleValue(typeName = "Any"): string {
 
 /**
  * 从LLM返回的文本中提取JSON数组
- * 匹配第一个被方括号包裹的JSON结构并解析。
+ * 兼容多种LLM常见输出格式：纯JSON、Markdown代码块包裹、文字前后缀。
  *
  * @param text - LLM返回的原始文本（可能包含Markdown或额外说明）
  * @returns 解析后的数组，若失败则返回空数组
  */
 function parseJsonArray(text: string): unknown {
+  // 1. 优先从 ```json ... ``` 代码块提取
+  const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (codeBlock) {
+    try { return JSON.parse(codeBlock[1]) } catch { /* ignore */ }
+  }
+  // 2. 从第一个 [ 到最后一个 ] 提取
+  const firstBracket = text.indexOf("[")
+  const lastBracket = text.lastIndexOf("]")
+  if (firstBracket !== -1 && lastBracket > firstBracket) {
+    try { return JSON.parse(text.slice(firstBracket, lastBracket + 1)) } catch { /* ignore */ }
+  }
+  // 3. 兜底：贪婪正则
   const match = text.match(/\[[\s\S]*\]/)
-  return match ? JSON.parse(match[0]) : []
+  try { return match ? JSON.parse(match[0]) : [] } catch { return [] }
 }
 
 /**

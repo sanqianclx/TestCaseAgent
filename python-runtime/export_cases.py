@@ -59,18 +59,54 @@ def export_cases(
         "",
         "## 测试用例",
         "",
-        "| 编号 | 标题 | 优先级 | 类型 | 前置条件 | 预期结果 |",
-        "|------|------|--------|------|----------|----------|",
+        "| 编号 | 标题 | 类型 | 输入参数 | 前置条件 | 预期结果 |",
+        "|------|------|------|----------|----------|----------|",
     ]
     for tc in test_cases:
+        params = tc.get("input_params")
+        params_str = _format_params(params) if params else "-"
         md_lines.append(
             f"| {clean_text(tc.get('case_number', 'N/A'))} "
             f"| {clean_text(tc.get('title', ''))} "
-            f"| {clean_text(tc.get('priority', 'P3'))} "
             f"| {clean_text(tc.get('case_type', '功能'))} "
+            f"| {clean_text(params_str)} "
             f"| {clean_text(tc.get('preconditions', ''))} "
             f"| {clean_text(tc.get('expected_result', ''))} |"
         )
+
+    # 逐用例执行结果章节（仅在提供了执行结果时出现）
+    # 以一目了然的表格展示每个测试函数的通过/失败状态和失败原因
+    if execution_result:
+        test_results = execution_result.get("test_results", [])
+        if test_results:
+            md_lines.extend(
+                [
+                    "",
+                    "## 逐用例执行结果",
+                    "",
+                    "| 序号 | 测试函数 | 结果 | 失败原因 |",
+                    "|------|----------|------|----------|",
+                ]
+            )
+            for idx, tr in enumerate(test_results, 1):
+                name = f"{tr.get('test_class', '')}.{tr.get('test_name', '?')}"
+                result_label = tr.get("result", "?")
+                if result_label == "PASSED":
+                    icon = "✅ 通过"
+                    reason = "-"
+                elif result_label == "FAILED":
+                    icon = "❌ 失败"
+                    reason = clean_text(tr.get("failure_reason", "")) or "断言不通过"
+                else:
+                    icon = "⚠️ 错误"
+                    reason = clean_text(tr.get("failure_reason", "")) or "执行异常"
+
+                md_lines.append(
+                    f"| {idx} "
+                    f"| {clean_text(name)} "
+                    f"| {icon} "
+                    f"| {clean_text(reason)} |"
+                )
 
     # 执行摘要章节（仅在提供了执行结果时出现）
     if execution_result:
@@ -113,6 +149,14 @@ def export_cases(
     exported.append(md_path)
 
     return {"exported_files": exported}
+
+
+def _format_params(params: dict) -> str:
+    """将输入参数字典格式化为简洁可读的字符串，如 a=3, b=5。"""
+    if not params or not isinstance(params, dict):
+        return "-"
+    items = [f"{k}={v!r}" for k, v in params.items()]
+    return ", ".join(items)[:80]
 
 
 def clean_text(value) -> str:

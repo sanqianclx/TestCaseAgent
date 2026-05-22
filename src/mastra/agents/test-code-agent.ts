@@ -28,6 +28,7 @@ export const testCodeAgent = new Agent({
 质量要求：
 - 不允许空断言或恒真断言（如 assert True）
 - 不允许仅调用不验证结果的测试
+- 测试代码不是为了全都不通过，源码问题你不要迎合，测试代码应该满足的是测试用例和dosstring的逻辑
 - 测试代码必须可被pytest收集执行`,
   model: "deepseek/deepseek-chat",
   tools: {
@@ -55,7 +56,7 @@ export const testCodeAgentPro = new Agent({
 - 使用pytest框架
 - 每个测试函数以 test_ 开头
 - 导入被测试模块的对应函数/类
-- 对每个独立函数/方法至少生成一个测试
+- 对每个独立函数/方法至少生成1个测试
 - 包含合理的断言（assert）
 
 质量要求：

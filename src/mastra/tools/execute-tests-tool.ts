@@ -12,6 +12,13 @@ export interface ExecuteTestsOutput {
   exit_code: number
   duration_ms: number
   timeout: boolean
+  test_results?: Array<{
+    test_file: string
+    test_class: string
+    test_name: string
+    result: string
+    failure_reason: string
+  }>
 }
 
 /**

@@ -1,9 +1,11 @@
 import { Agent } from "@mastra/core/agent"
-import { parseSourceCodeTool } from "../tools/parse-source-code-tool.js"
-import { readFileTool } from "../tools/read-file-tool.js"
 
 /*
  * 测试用例生成Agent：负责理解代码逻辑、规划测试策略、生成测试用例描述
+ * 使用 deepseek-v4-flash 模型，适合代码理解与用例设计任务
+ *
+ * 注意：此 Agent 不配置 tools，因为在 workflow 中源代码和 AST 已通过用户消息内联传入。
+ * tools 会导致 LLM 尝试调用 readFile/parseSourceCode 工具，而不是直接用已提供的数据生成用例。
  */
 export const testCaseAgent = new Agent({
   id: "test-case-agent",
@@ -11,22 +13,19 @@ export const testCaseAgent = new Agent({
   instructions: `你是一个专业的测试用例设计专家。
 
 你的职责：
-1. 使用 readFile 工具读取用户上传的源代码
-2. 使用 parseSourceCodeTool 解析代码结构（类、函数、参数、行号）
-3. 根据解析结果，为每个函数/方法设计测试用例
-4. 输出结构化的测试用例集，覆盖功能、边界、异常三种类型
+根据用户消息中提供的 Python 源代码和 AST 解析结果，为每个可测试的函数/方法设计结构化测试用例。
 
-生成策略：
-- 功能测试：正常流程和分支路径
-- 边界测试：等价类划分和边界值分析
-- 异常测试：空值、超长输入、特殊字符、类型错误
+设计策略（必须严格遵循）：
+功能测试：验证正常流程、主要分支路径及典型业务逻辑。不要写笼统的"正常调用验证"，要结合函数实际逻辑设计具体场景——例如 divide_zero(a,b) 应设计"b=0 时抛出 ZeroDivisionError"，add_positive(a,b) 应设计"传入 3 和 5 应返回 8"。
+边界测试：运用等价类划分和边界值分析，覆盖零值、负数、空集合、单元素、极大值、临界值等。
+异常测试：根据函数可能失败的点设计用例，如除零、参数为 None、类型错误、索引越界等。
 
-输出格式要求：
-- 每个用例包含：编号、标题、优先级(P0-P3)、类型、前置条件、步骤、预期结果
-- 使用JSON数组格式输出，便于后续处理`,
-  model: "deepseek/deepseek-chat",
-  tools: {
-    readFileTool,
-    parseSourceCodeTool,
-  },
+关键原则：
+- 仔细阅读每个函数的 docstring 和参数类型，生成贴合实际逻辑的用例
+- 不允许迎合源代码的实现，严格按照 docstring 来判断预期行为
+- 每个函数/方法至少 3 条用例，复杂函数可增加
+- 用例之间要有区分度，不要千篇一律的模板
+- 输出纯 JSON 数组（无 Markdown、无代码块、无额外解释）
+- 严格遵循用户消息中给出的 JSON 字段格式，字段名和类型不可任意变更`,
+  model: "deepseek/deepseek-v4-flash",
 })
