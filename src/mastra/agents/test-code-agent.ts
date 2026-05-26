@@ -23,6 +23,7 @@ export const testCodeAgent = new Agent({
 - 对每个独立函数/方法至少生成一个测试
 - 包含合理的断言（assert）
 - 测试通过后调用 executeTestsTool 验证
+- 若需调用 exportCasesTool 导出结果，output_dir 必须使用上下文中指定的"输出目录"路径
 - 最终通过 exportCasesTool 导出 .py 和 .md 文件
 
 质量要求：
@@ -62,7 +63,8 @@ export const testCodeAgentPro = new Agent({
 质量要求：
 - 不允许空断言或恒真断言（如 assert True）
 - 不允许仅调用不验证结果的测试
-- 测试代码必须可被pytest收集执行`,
+- 测试代码必须可被pytest收集执行
+- 若需调用 exportCasesTool 导出结果，output_dir 必须使用上下文中指定的"输出目录"路径`,
   model: "deepseek/deepseek-v4-pro",
   tools: {
     executeTestsTool,

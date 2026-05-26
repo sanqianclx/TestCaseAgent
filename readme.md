@@ -129,7 +129,7 @@ npm run generate -- .\testdata\example.py .\output\demos 3
 
 ## Studio 使用指南
 
-Mastra Studio 是开发调试利器：
+Mastra Studio 是开发调试利器： npx mastra dev
 
 | 面板            | 功能                             |
 | ------------- | ------------------------------ |

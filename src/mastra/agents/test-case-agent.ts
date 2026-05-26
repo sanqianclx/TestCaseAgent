@@ -4,8 +4,6 @@ import { Agent } from "@mastra/core/agent"
  * 测试用例生成Agent：负责理解代码逻辑、规划测试策略、生成测试用例描述
  * 使用 deepseek-v4-flash 模型，适合代码理解与用例设计任务
  *
- * 注意：此 Agent 不配置 tools，因为在 workflow 中源代码和 AST 已通过用户消息内联传入。
- * tools 会导致 LLM 尝试调用 readFile/parseSourceCode 工具，而不是直接用已提供的数据生成用例。
  */
 export const testCaseAgent = new Agent({
   id: "test-case-agent",

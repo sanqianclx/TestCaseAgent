@@ -99,6 +99,10 @@ function extractTestFunctions(code: string): Array<{ name: string; body: string 
   return tests
 }
 
+/**
+ * 检查代码中是否存在对相同字面量的断言（如 assert "foo" == "foo"）
+ * 这类断言是恒真断言，属于无意义的测试
+ */
 function hasSameLiteralAssertion(code: string): boolean {
   const literalPattern = /\bassert\s+(['"])([^'"]*)\1\s*==\s*(['"])([^'"]*)\3/g
   for (const match of code.matchAll(literalPattern)) {
@@ -107,6 +111,10 @@ function hasSameLiteralAssertion(code: string): boolean {
   return false
 }
 
+/**
+ * 检查断言是否为弱断言（仅检查callable/hasattr/locals/is not None）
+ * 这类断言未验证核心行为，仅用于检查函数是否存在
+ */
 function isWeakAssertion(line: string): boolean {
   return (
     /\bassert\s+callable\(/.test(line) ||

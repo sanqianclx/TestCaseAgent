@@ -29,6 +29,7 @@ export function exportCases(inputData: {
   quality?: unknown
   versions?: unknown[]
   artifact_prefix?: string
+  skip_py?: boolean
 }): ExportCasesOutput {
   const result = callPythonScript<ExportCasesOutput>("export_cases.py", inputData, 30_000)
   if (!result.ok || !result.data) {

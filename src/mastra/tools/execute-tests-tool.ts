@@ -3,21 +3,21 @@ import { z } from "zod"
 import { callPythonScript } from "../runtime/python-bridge.js"
 
 export interface ExecuteTestsOutput {
-  status: string
-  passed: number
-  failed: number
-  errors: number
-  stdout: string
-  stderr: string
-  exit_code: number
-  duration_ms: number
-  timeout: boolean
+  status: string // 执行状态：passed（全部通过）/ failed（有失败）/ error（执行出错）/ timeout（超时）
+  passed: number // 通过的测试用例数
+  failed: number // 失败的测试用例数
+  errors: number // 执行出错的测试用例数
+  stdout: string // pytest标准输出（含测试结果详情）
+  stderr: string // pytest标准错误输出（含异常堆栈）
+  exit_code: number // pytest进程退出码，0表示全部通过
+  duration_ms: number // 执行耗时（毫秒）
+  timeout: boolean // 是否因超时被终止
   test_results?: Array<{
-    test_file: string
-    test_class: string
-    test_name: string
-    result: string
-    failure_reason: string
+    test_file: string // 测试文件路径
+    test_class: string // 测试类名
+    test_name: string // 测试方法名
+    result: string // 测试结果：passed / failed / error
+    failure_reason: string // 失败原因
   }>
 }
 

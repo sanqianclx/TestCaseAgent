@@ -1,7 +1,8 @@
 """
 结果导出模块
 将测试用例列表、测试代码、执行结果和诊断信息导出为文件。
-生成两个文件：(1) test_generated.py 可执行pytest测试文件；
+生成两个文件：
+(1) test_generated.py 可执行pytest测试文件；
 (2) test_cases.md 包含用例表格、执行摘要和诊断信息的Markdown文档。
 """
 import json
@@ -22,15 +23,16 @@ def read_input() -> dict:
     return json.loads(raw or "{}")
 
 
-def export_cases(
-    test_cases: list,
-    test_code: str,
-    output_dir: str,
-    execution_result: dict | None = None,
-    diagnosis: dict | None = None,
-    quality: dict | None = None,
-    versions: list | None = None,
-    artifact_prefix: str | None = None,
+def export_cases( 
+    test_cases: list,  # 测试用例列表
+    test_code: str,  # 生成的测试代码字符串
+    output_dir: str,  # 输出目录路径
+    execution_result: dict | None = None,  # 执行结果字典，可选
+    diagnosis: dict | None = None,  # 失败诊断信息，可选
+    quality: dict | None = None,  # 质量检查结果，可选
+    versions: list | None = None,  # 版本记录列表，可选
+    artifact_prefix: str | None = None,  # 文件名前缀，可选
+    skip_py: bool = False,  # 为 True 时不导出 .py 文件（预案阶段用）
 ) -> dict:
     """
     导出测试用例文档和测试代码文件。
@@ -52,11 +54,12 @@ def export_cases(
     py_filename = f"test_generated_{suffix}.py" if suffix else "test_generated.py"
     md_filename = f"test_cases_{suffix}.md" if suffix else "test_cases.md"
 
-    # (1) 导出 .py 测试代码文件
-    py_path = os.path.join(output_dir, py_filename)
-    with open(py_path, "w", encoding="utf-8") as f:
-        f.write(test_code)
-    exported.append(py_path)
+    # (1) 导出 .py 测试代码文件（skip_py=True 时跳过，预案阶段不需要空壳文件）
+    if not skip_py:
+        py_path = os.path.join(output_dir, py_filename)
+        with open(py_path, "w", encoding="utf-8") as f:
+            f.write(test_code)
+        exported.append(py_path)
 
     # (2) 构建 .md 测试用例文档
     md_lines = [
@@ -101,13 +104,13 @@ def export_cases(
                 name = f"{test_class}.{test_name}" if test_class else test_name
                 result_label = tr.get("result", "?")
                 if result_label == "PASSED":
-                    icon = "✅ 通过"
+                    icon = "通过"
                     reason = "-"
                 elif result_label == "FAILED":
-                    icon = "❌ 失败"
+                    icon = "失败"
                     reason = clean_text(tr.get("failure_reason", "")) or "断言不通过"
                 else:
-                    icon = "⚠️ 错误"
+                    icon = "错误"
                     reason = clean_text(tr.get("failure_reason", "")) or "执行异常"
 
                 md_lines.append(
@@ -243,6 +246,7 @@ if __name__ == "__main__":
         input_data.get("quality"),
         input_data.get("versions"),
         input_data.get("artifact_prefix"),
+        input_data.get("skip_py", False),
     )
     output = {"ok": True, "data": result, "error": None}
     print(json.dumps(output, ensure_ascii=False))

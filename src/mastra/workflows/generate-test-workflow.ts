@@ -1,3 +1,4 @@
+import { copyFileSync, mkdirSync } from "fs"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
 import path from "path"
@@ -114,7 +115,7 @@ const readParseStep = createStep({
 
     return {
       file_path: inputData.file_path,
-      output_dir: inputData.output_dir,
+      output_dir: path.resolve(inputData.output_dir),
       max_attempts: inputData.max_attempts,
       requirements_text: inputData.requirements_text,
       source_file: source.file_path,
@@ -162,8 +163,6 @@ const designCasesStep = createStep({
  *   2. 用户无需等待全流程结束即可预览用例计划
  *
  * 导出耗时 < 100ms（纯文件 I/O），不显著影响主流程。
- * Mastra 的 .then() 为顺序链，无原生分支语法，
- * 但此步骤作为透传节点，效果等价于旁路导出。
  * ================================================================ */
 const exportCasesPlanStep = createStep({
   id: "export-cases-plan",
@@ -172,13 +171,14 @@ const exportCasesPlanStep = createStep({
   execute: async ({ inputData }) => {
     exportCases({
       test_cases: inputData.test_cases,
-      test_code: "# 测试代码尚未生成 —— 此文件为测试用例预案导出版本\n",
+      test_code: "",
       output_dir: path.resolve(inputData.output_dir),
       execution_result: undefined,
       diagnosis: undefined,
       quality: undefined,
       versions: undefined,
       artifact_prefix: "plan",
+      skip_py: true,
     })
 
     return {
@@ -211,6 +211,7 @@ const generateCodeStep = createStep({
       testCases: inputData.test_cases,
       attempt: 1,
       previousDiagnosis: undefined,
+      outputDir: inputData.output_dir,
     })
 
     return {
@@ -330,6 +331,7 @@ const selfHealingStep = createStep({
         testCases: inputData.test_cases,
         attempt,
         previousDiagnosis: diagnosis,
+        outputDir: inputData.output_dir,
       })
 
       executionResult = executePytest({
@@ -366,22 +368,34 @@ const selfHealingStep = createStep({
 
 /* ================================================================
  * Step 7: 导出最终完整结果
- * 将最终的测试代码、用例和执行结果导出为 .py / .md。
+ * 将最终的测试代码、用例和执行结果导出为 .py / .md，
+ * 同时将源代码文件复制到输出目录，便于用户直接运行 pytest。
  * ================================================================ */
 const exportResultsStep = createStep({
   id: "export-results",
   inputSchema: step5OutputSchema,
   outputSchema: workflowOutputSchema,
   execute: async ({ inputData }) => {
+    const resolvedOutputDir = path.resolve(inputData.output_dir)
+
     const exportResult = exportCases({
       test_cases: inputData.test_cases,
       test_code: inputData.test_code,
-      output_dir: path.resolve(inputData.output_dir),
+      output_dir: resolvedOutputDir,
       execution_result: inputData.execution_detail,
       diagnosis: inputData.diagnosis,
       quality: inputData.quality,
       versions: inputData.versions,
     })
+
+    /* 将源代码复制到输出目录，方便用户直接 cd 进去跑 pytest */
+    try {
+      mkdirSync(resolvedOutputDir, { recursive: true })
+      const sourceFilename = path.basename(inputData.source_file)
+      copyFileSync(inputData.source_file, path.join(resolvedOutputDir, sourceFilename))
+    } catch (copyErr) {
+      console.error("[export-results] 复制源文件失败:", copyErr)
+    }
 
     return {
       source_file: inputData.source_file,
@@ -588,6 +602,7 @@ ${JSON.stringify(parseResult, null, 2)}
  * @param input.testCases - 已生成的测试用例列表
  * @param input.attempt - 当前尝试次数（1=chat, >1=v4-pro）
  * @param input.previousDiagnosis - 上一轮失败诊断（重试时传入）
+ * @param input.outputDir - 用户指定的输出目录，Agent 调用 exportCasesTool 时需使用此路径
  * @returns 完整的pytest测试代码字符串
  */
 async function generateTestCode(input: {
@@ -597,6 +612,7 @@ async function generateTestCode(input: {
   testCases: TestCase[]
   attempt: number
   previousDiagnosis?: Diagnosis
+  outputDir: string
 }): Promise<string> {
   const moduleName = toPythonModuleName(input.filename)
 
@@ -605,6 +621,8 @@ async function generateTestCode(input: {
       const agent = input.attempt > 1 ? testCodeAgentPro : testCodeAgent
       const response = await agent.generate(`
 请为下面Python源码生成可执行pytest测试代码。只输出一个python代码块。
+
+输出目录：${path.resolve(input.outputDir)}
 
 模块名：${moduleName}
 
@@ -622,6 +640,7 @@ ${JSON.stringify(input.previousDiagnosis ?? null, null, 2)}
 2. 不要使用未定义fixture。
 3. 不要使用assert True或空断言。
 4. 当前是第 ${input.attempt} 次生成。
+5. 若需调用 exportCasesTool 导出结果，output_dir 必须使用"${path.resolve(input.outputDir)}"。
 `)
       const code = extractPythonCode(response.text)
       if (code.trim()) {
