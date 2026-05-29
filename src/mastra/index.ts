@@ -3,6 +3,7 @@ import { generateTestWorkflow } from "./workflows/generate-test-workflow.js"
 import { testCaseAgent } from "./agents/test-case-agent.js"
 import { testCodeAgent, testCodeAgentPro } from "./agents/test-code-agent.js"
 import { diagnosisAgent, diagnosisAgentPro } from "./agents/diagnosis-agent.js"
+import { cliConversationAgent } from "./agents/cli-conversation-agent.js"
 
 /*
  * Mastra 入口文件
@@ -16,6 +17,7 @@ export const mastra = new Mastra({
     testCodeAgentPro,
     diagnosisAgent,
     diagnosisAgentPro,
+    cliConversationAgent,
   },
   workflows: {
     generateTestWorkflow,

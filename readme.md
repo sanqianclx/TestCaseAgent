@@ -102,7 +102,7 @@ OPENAI_API_KEY=sk-你的Key
 ### 4. 启动 Mastra Studio
 
 ```bash
-npm run dev
+npx mastra dev
 ```
 
 浏览器打开 \*\*<http://localhost:4111**，在可视化控制台调试> Agent。
@@ -111,19 +111,13 @@ npm run dev
 
 ```bash
 npm run build
-npm run generate -- 源代码文件.py 输出目录 [最大自愈轮次]
 ```
 
-**示例**：
-
+n交互模式：
 ```bash
-npm run generate -- .\testdata\example.py .\output\demos 3
+npm run generate -- --interactive
 ```
 
-输出目录会生成：
-
-- `test_generated.py`：可执行的 pytest 测试代码
-- `test_cases.md`：测试用例文档 + 执行摘要 + 诊断说明
 
 ***
 
@@ -162,4 +156,6 @@ Mastra Studio 是开发调试利器： npx mastra dev
 |  **V3.0** 待开始 | Web 账户 + 历史记录 + MySQL/Redis 持久化             |
 
 ***
+
+
 

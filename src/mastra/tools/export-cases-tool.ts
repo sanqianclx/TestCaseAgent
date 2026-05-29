@@ -27,6 +27,7 @@ export function exportCases(inputData: {
   execution_result?: unknown
   diagnosis?: unknown
   quality?: unknown
+  coverage?: unknown
   versions?: unknown[]
   artifact_prefix?: string
   skip_py?: boolean

@@ -1,15 +1,26 @@
-import { copyFileSync, mkdirSync } from "fs"
+import fs from "fs"
+import fsp from "fs/promises"
+import path from "path"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
-import path from "path"
-import { readPythonFile } from "../tools/read-file-tool.js"
-import { parseSourceCode, type ParsedSource } from "../tools/parse-source-code-tool.js"
-import { executePytest, type ExecuteTestsOutput } from "../tools/execute-tests-tool.js"
-import { exportCases } from "../tools/export-cases-tool.js"
-import { checkTestQuality, type QualityCheckResult } from "../tools/check-quality-tool.js"
+import { diagnosisAgent, diagnosisAgentPro } from "../agents/diagnosis-agent.js"
 import { testCaseAgent } from "../agents/test-case-agent.js"
 import { testCodeAgent, testCodeAgentPro } from "../agents/test-code-agent.js"
-import { diagnosisAgent, diagnosisAgentPro } from "../agents/diagnosis-agent.js"
+import { detectLanguage, getLanguageAdapter } from "../languages/registry.js"
+import { assertLlmAvailable, formatError } from "../runtime/env.js"
+import type {
+  Diagnosis,
+  CoverageResult,
+  ExecutionResult,
+  LanguageAdapter,
+  QualityResult,
+  SourceAnalysis,
+  SupportedLanguage,
+  TestCase,
+  TestCodeVersion,
+} from "../languages/types.js"
+
+const supportedLanguageSchema = z.enum(["python", "java", "cpp"])
 
 const testCaseSchema = z.object({
   case_number: z.string(),
@@ -17,269 +28,251 @@ const testCaseSchema = z.object({
   case_type: z.string(),
   preconditions: z.string(),
   steps: z.union([z.string(), z.array(z.string())]),
-  input_params: z.record(z.unknown()).optional().describe("条用例的输入参数，键名为形参名，值为测试输入值"),
-  expected_result: z.string(),
+  input_params: z.record(z.unknown()).optional(),
+  expected_result: z.unknown().transform(toText),
   related_symbol: z.string(),
 })
 
-type TestCase = z.infer<typeof testCaseSchema>
-
-const diagnosisSchema = z.object({
-  diagnosis_type: z.enum(["TEST_CODE_ERROR", "SOURCE_RUNTIME_ERROR", "BEHAVIOR_MISMATCH", "UNKNOWN"]),
-  confidence: z.number(),
-  evidence: z.array(z.string()),
-  next_action: z.string(),
+const testCaseBatchSchema = z.object({
+  cases: z.array(testCaseSchema),
 })
 
-type Diagnosis = z.infer<typeof diagnosisSchema>
+const perErrorDiagnosisSchema = z.object({
+  id: z.string().optional(),
+  failing_test: z.string().optional(),
+  related_symbol: z.string().optional(),
+  diagnosis_type: z.enum(["TEST_CODE_ERROR", "SOURCE_RUNTIME_ERROR", "BEHAVIOR_MISMATCH", "ENVIRONMENT_ERROR", "UNKNOWN"]),
+  summary: z.string(),
+  evidence: z.array(z.string()),
+  recommendation: z.string(),
+})
 
-const testCodeVersionSchema = z.object({
+const diagnosisSchema = z.object({
+  diagnosis_type: z.enum(["TEST_CODE_ERROR", "SOURCE_RUNTIME_ERROR", "BEHAVIOR_MISMATCH", "ENVIRONMENT_ERROR", "UNKNOWN"]),
+  confidence: z.number(),
+  summary: z.string().optional(),
+  evidence: z.array(z.string()),
+  report_text: z.string().optional(),
+  next_action: z.enum(["REGENERATE_TEST_CODE", "ASK_USER_CONFIRMATION", "INSTALL_DEPENDENCY", "REPORT_TO_USER"]),
+  suggested_commands: z.array(z.string()).optional(),
+  per_error_diagnoses: z.array(perErrorDiagnosisSchema).optional(),
+})
+
+const coverageSchema = z.object({
+  symbol_coverage: z.number(),
+  covered_symbols: z.array(z.string()),
+  uncovered_symbols: z.array(z.string()),
+  case_type_coverage: z.record(z.number()),
+  total_symbols: z.number(),
+  total_cases: z.number(),
+})
+
+const executionSchema = z.object({
+  status: z.enum(["passed", "failed", "error", "timeout", "not_run"]),
+  passed: z.number(),
+  failed: z.number(),
+  errors: z.number(),
+  stdout: z.string(),
+  stderr: z.string(),
+  exit_code: z.number(),
+  duration_ms: z.number(),
+  timeout: z.boolean(),
+  command: z.string().optional(),
+  cwd: z.string().optional(),
+  test_results: z.array(z.unknown()).optional(),
+  missing_dependencies: z.array(z.string()).optional(),
+})
+
+const qualitySchema = z.object({
+  ok: z.boolean(),
+  issues: z.array(z.string()),
+  checked_tests: z.number(),
+})
+
+const versionSchema = z.object({
   version_no: z.number(),
   attempt: z.number(),
   test_code: z.string(),
-  execution_result: z.any().optional(),
-  quality: z.any().optional(),
+  execution_result: executionSchema.optional(),
+  quality: qualitySchema.optional(),
   diagnosis: diagnosisSchema.optional(),
   note: z.string().optional(),
   created_at: z.string(),
 })
 
-type TestCodeVersion = z.infer<typeof testCodeVersionSchema>
-
 const workflowInputSchema = z.object({
-  file_path: z.string().describe("源代码文件路径"),
-  output_dir: z.string().default("./output/exports").describe("输出目录，仅导出 .py 和 .md"),
-  max_attempts: z.number().default(3).describe("最大自愈尝试次数"),
-  requirements_text: z.string().optional().describe("可选需求文本，用于辅助判断预期行为"),
+  file_path: z.string(),
+  output_dir: z.string().default("./output/exports"),
+  max_attempts: z.number().default(3),
+  llm_retries: z.number().default(2),
+  requirements_text: z.string().optional(),
+  language: z.union([supportedLanguageSchema, z.literal("auto")]).default("auto"),
 })
 
 const workflowOutputSchema = z.object({
   source_file: z.string(),
+  language: supportedLanguageSchema,
   test_code: z.string(),
   test_cases_count: z.number(),
   passed: z.boolean(),
   exported_files: z.array(z.string()),
-  execution_detail: z.any(),
-  diagnosis: z.any().optional(),
-  quality: z.any().optional(),
-  versions: z.array(testCodeVersionSchema).optional(),
+  execution_detail: executionSchema,
+  diagnosis: diagnosisSchema.optional(),
+  quality: qualitySchema.optional(),
+  coverage: coverageSchema.optional(),
+  versions: z.array(versionSchema).optional(),
 })
 
-/* ================================================================
- * 逐步递进的 Schema 定义
- * ================================================================ */
-
-/** Step 1：源码 + AST */
-const step1OutputSchema = workflowInputSchema.extend({
+const sourceStepOutputSchema = workflowInputSchema.extend({
   source_file: z.string(),
   source_code: z.string(),
   filename: z.string(),
-  parsed: z.any(),
+  language: supportedLanguageSchema,
+  analysis: z.any(),
 })
 
-/** Step 2：+ 测试用例 */
-const step2OutputSchema = step1OutputSchema.extend({
+const casesStepOutputSchema = sourceStepOutputSchema.extend({
   test_cases: z.array(testCaseSchema),
 })
 
-/** Step 3：+ 生成的首版测试代码 + 当前尝试次数 */
-const step3OutputSchema = step2OutputSchema.extend({
+const codeStepOutputSchema = casesStepOutputSchema.extend({
   test_code: z.string(),
-  attempt: z.number().default(1),
+  attempt: z.number(),
 })
 
-/** Step 4：+ pytest 执行结果 */
-const step4OutputSchema = step3OutputSchema.extend({
-  execution_result: z.any(),
+const executionStepOutputSchema = codeStepOutputSchema.extend({
+  execution_result: executionSchema,
 })
 
-/** Step 5：自愈后输出中间结构，携带 output_dir 和 test_cases 供导出步骤使用 */
-const step5OutputSchema = workflowOutputSchema.extend({
+const finalStepOutputSchema = workflowOutputSchema.extend({
   output_dir: z.string(),
   test_cases: z.array(testCaseSchema),
+  analysis: z.any(),
+  coverage: coverageSchema.optional(),
 })
 
-/* ================================================================
- * Step 1: 读取源代码 & AST 解析
- * ================================================================ */
 const readParseStep = createStep({
   id: "read-parse-source",
   inputSchema: workflowInputSchema,
-  outputSchema: step1OutputSchema,
+  outputSchema: sourceStepOutputSchema,
   execute: async ({ inputData }) => {
-    const source = await readPythonFile({ path: inputData.file_path, encoding: "utf-8" })
-    const parseResult = parseSourceCode({
-      source_code: source.content,
-      filename: source.filename,
-    })
+    logProgress("Reading source code and detecting language")
+    const sourceFile = path.resolve(inputData.file_path)
+    const sourceCode = await fsp.readFile(sourceFile, "utf-8")
+    const language = detectLanguage(sourceFile, inputData.language)
+    const adapter = getLanguageAdapter(language)
+    const filename = path.basename(sourceFile)
+    logProgress(`Parsing source structure with ${adapter.displayName} adapter`)
+    const analysis = adapter.parseSource({ sourceCode, filename, sourceFile })
 
     return {
       file_path: inputData.file_path,
       output_dir: path.resolve(inputData.output_dir),
       max_attempts: inputData.max_attempts,
+      llm_retries: inputData.llm_retries,
       requirements_text: inputData.requirements_text,
-      source_file: source.file_path,
-      source_code: source.content,
-      filename: source.filename,
-      parsed: parseResult,
+      language,
+      source_file: sourceFile,
+      source_code: sourceCode,
+      filename,
+      analysis,
     }
   },
 })
 
-/* ================================================================
- * Step 2: 设计测试用例
- * ================================================================ */
 const designCasesStep = createStep({
   id: "design-test-cases",
-  inputSchema: step1OutputSchema,
-  outputSchema: step2OutputSchema,
+  inputSchema: sourceStepOutputSchema,
+  outputSchema: casesStepOutputSchema,
   execute: async ({ inputData }) => {
-    const testCases = await generateTestCases(
-      inputData.source_code,
-      inputData.parsed,
-      inputData.requirements_text
-    )
-
-    return {
-      file_path: inputData.file_path,
-      output_dir: inputData.output_dir,
-      max_attempts: inputData.max_attempts,
-      requirements_text: inputData.requirements_text,
-      source_file: inputData.source_file,
-      source_code: inputData.source_code,
-      filename: inputData.filename,
-      parsed: inputData.parsed,
-      test_cases: testCases,
-    }
-  },
-})
-
-/* ================================================================
- * Step 3: 导出测试用例预案
- * 生成测试代码与执行测试的耗时不可控（LLM调用 + pytest超时），
- * 而测试用例本身在 Step 2 完成后已是稳定的交付物。
- * 此步骤在进入代码生成前立即将测试用例落盘，确保：
- *   1. 即使后续步骤失败，用户已拥有可查阅的测试用例文档
- *   2. 用户无需等待全流程结束即可预览用例计划
- *
- * 导出耗时 < 100ms（纯文件 I/O），不显著影响主流程。
- * ================================================================ */
-const exportCasesPlanStep = createStep({
-  id: "export-cases-plan",
-  inputSchema: step2OutputSchema,
-  outputSchema: step2OutputSchema,
-  execute: async ({ inputData }) => {
-    exportCases({
-      test_cases: inputData.test_cases,
-      test_code: "",
-      output_dir: path.resolve(inputData.output_dir),
-      execution_result: undefined,
-      diagnosis: undefined,
-      quality: undefined,
-      versions: undefined,
-      artifact_prefix: "plan",
-      skip_py: true,
+    const adapter = adapterFor(inputData.language)
+    logProgress(`Calling LLM test-case agent for ${adapter.displayName}`)
+    const testCases = await generateTestCases({
+      adapter,
+      sourceCode: inputData.source_code,
+      sourceFile: inputData.source_file,
+      analysis: inputData.analysis as SourceAnalysis,
+      requirementsText: inputData.requirements_text,
+      llmRetries: inputData.llm_retries,
     })
-
-    return {
-      file_path: inputData.file_path,
-      output_dir: inputData.output_dir,
-      max_attempts: inputData.max_attempts,
-      requirements_text: inputData.requirements_text,
-      source_file: inputData.source_file,
-      source_code: inputData.source_code,
-      filename: inputData.filename,
-      parsed: inputData.parsed,
-      test_cases: inputData.test_cases,
-    }
+    return { ...inputData, test_cases: testCases }
   },
 })
 
-/* ================================================================
- * Step 4: 生成测试代码（首次，使用 deepseek-chat 快速生成）
- * 纯 LLM 调用，不涉及执行或诊断，返回生成的首版 pytest 代码。
- * ================================================================ */
+const exportPlanStep = createStep({
+  id: "export-cases-plan",
+  inputSchema: casesStepOutputSchema,
+  outputSchema: casesStepOutputSchema,
+  execute: async ({ inputData }) => {
+    const adapter = adapterFor(inputData.language)
+    logProgress("Exporting test-case plan")
+    adapter.exportArtifacts({
+      testCases: inputData.test_cases,
+      testCode: "",
+      outputDir: inputData.output_dir,
+      sourceFile: inputData.source_file,
+      analysis: inputData.analysis as SourceAnalysis,
+      artifactPrefix: "plan",
+      skipTestCode: true,
+    })
+    return inputData
+  },
+})
+
 const generateCodeStep = createStep({
   id: "generate-test-code",
-  inputSchema: step2OutputSchema,
-  outputSchema: step3OutputSchema,
+  inputSchema: casesStepOutputSchema,
+  outputSchema: codeStepOutputSchema,
   execute: async ({ inputData }) => {
+    const adapter = adapterFor(inputData.language)
+    logProgress(`Calling LLM test-code agent to generate ${adapter.testFramework} tests`)
     const testCode = await generateTestCode({
+      adapter,
       sourceCode: inputData.source_code,
+      sourceFile: inputData.source_file,
       filename: inputData.filename,
-      parseResult: inputData.parsed,
+      outputDir: inputData.output_dir,
+      analysis: inputData.analysis as SourceAnalysis,
       testCases: inputData.test_cases,
       attempt: 1,
-      previousDiagnosis: undefined,
-      outputDir: inputData.output_dir,
+      llmRetries: inputData.llm_retries,
     })
-
-    return {
-      file_path: inputData.file_path,
-      output_dir: inputData.output_dir,
-      max_attempts: inputData.max_attempts,
-      requirements_text: inputData.requirements_text,
-      source_file: inputData.source_file,
-      source_code: inputData.source_code,
-      filename: inputData.filename,
-      parsed: inputData.parsed,
-      test_cases: inputData.test_cases,
-      test_code: testCode,
-      attempt: 1,
-    }
+    return { ...inputData, test_code: testCode, attempt: 1 }
   },
 })
 
-/* ================================================================
- * Step 5: 执行 pytest & 质量检查
- * 纯 Python 运行时调用，无 LLM 依赖。执行快（~3-5秒），
- * 失败时进入下一步自愈修复。
- * ================================================================ */
-const executeVerifyStep = createStep({
-  id: "execute-verify",
-  inputSchema: step3OutputSchema,
-  outputSchema: step4OutputSchema,
+const executeStep = createStep({
+  id: "execute-tests",
+  inputSchema: codeStepOutputSchema,
+  outputSchema: executionStepOutputSchema,
   execute: async ({ inputData }) => {
-    const executionResult = executePytest({
-      test_code: inputData.test_code,
-      source_code: inputData.source_code,
-      filename: runtimeFilename(inputData.filename),
-      timeout: 60,
-    })
-
-    return {
-      file_path: inputData.file_path,
-      output_dir: inputData.output_dir,
-      max_attempts: inputData.max_attempts,
-      requirements_text: inputData.requirements_text,
-      source_file: inputData.source_file,
-      source_code: inputData.source_code,
+    const adapter = adapterFor(inputData.language)
+    logProgress(`Executing tests with ${adapter.displayName} adapter`)
+    const executionResult = adapter.executeTests({
+      sourceCode: inputData.source_code,
+      sourceFile: inputData.source_file,
       filename: inputData.filename,
-      parsed: inputData.parsed,
-      test_cases: inputData.test_cases,
-      test_code: inputData.test_code,
-      attempt: inputData.attempt,
-      execution_result: executionResult,
-    }
+      testCode: inputData.test_code,
+      outputDir: inputData.output_dir,
+      timeoutSeconds: 60,
+      analysis: inputData.analysis as SourceAnalysis,
+    })
+    return { ...inputData, execution_result: executionResult }
   },
 })
 
-/* ================================================================
- * Step 6: 自愈修复
- * 仅在上一步失败时执行。先诊断失败原因，再用 v4-pro 深度推理
- * 重新生成代码 → 再执行，最多重试 max_attempts-1 次。
- * 首次诊断用 chat 快速判断，若仍不明确则换 v4-pro 深度诊断。
- * ================================================================ */
 const selfHealingStep = createStep({
   id: "self-healing",
-  inputSchema: step4OutputSchema,
-  outputSchema: step5OutputSchema,
+  inputSchema: executionStepOutputSchema,
+  outputSchema: finalStepOutputSchema,
   execute: async ({ inputData }) => {
+    const adapter = adapterFor(inputData.language)
+    logProgress("Running quality check, AI diagnosis, and self-healing decision")
     let testCode = inputData.test_code
-    let executionResult = inputData.execution_result
+    let executionResult = inputData.execution_result as ExecutionResult
+    let quality = adapter.checkQuality({ testCode, analysis: inputData.analysis as SourceAnalysis })
+    const coverage = calculateCoverage(inputData.test_cases, inputData.analysis as SourceAnalysis)
     let diagnosis: Diagnosis | undefined
-
-    let quality = checkTestQuality({ test_code: inputData.test_code })
     const versions: TestCodeVersion[] = [
       createVersionRecord({
         versionNo: 1,
@@ -287,134 +280,124 @@ const selfHealingStep = createStep({
         testCode,
         executionResult,
         quality,
-        note: "首次生成",
+        note: "initial generation",
       }),
     ]
 
-    const passed =
-      executionResult.status === "passed" &&
-      executionResult.failed === 0 &&
-      executionResult.errors === 0 &&
-      quality.ok
-
-    if (passed) {
-      return finalizeOutput(inputData, testCode, executionResult, undefined, quality, versions)
+    if (isPassed(executionResult, quality)) {
+      return finalize(inputData, testCode, executionResult, undefined, quality, coverage, versions)
     }
 
     for (let attempt = 2; attempt <= inputData.max_attempts; attempt += 1) {
-      diagnosis = isExecutionPassed(executionResult) && !quality.ok
-        ? qualityFailureDiagnosis(quality)
-        : await diagnoseFailure(
-          inputData.source_code,
-          testCode,
-          executionResult,
-          attempt,
-          quality.ok ? undefined : quality.issues
-        )
-
-      versions[versions.length - 1] = {
-        ...versions[versions.length - 1],
-        diagnosis,
-      }
-
-      if (
-        diagnosis.diagnosis_type !== "TEST_CODE_ERROR" ||
-        diagnosis.confidence < 0.7
-      ) {
-        return finalizeOutput(inputData, testCode, executionResult, diagnosis, quality, versions)
-      }
-
-      testCode = await generateTestCode({
+      diagnosis = await diagnoseFailure({
+        adapter,
         sourceCode: inputData.source_code,
+        testCode,
+        testCases: inputData.test_cases,
+        executionResult,
+        quality,
+        analysis: inputData.analysis as SourceAnalysis,
+        sourceFile: inputData.source_file,
+        attempt,
+        llmRetries: inputData.llm_retries,
+      })
+
+      versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
+      if (diagnosis.diagnosis_type !== "TEST_CODE_ERROR" || diagnosis.confidence < 0.7) {
+        return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
+      }
+
+      logProgress(`Self-healing attempt ${attempt}: regenerating test code from AI diagnosis`)
+      testCode = await generateTestCode({
+        adapter,
+        sourceCode: inputData.source_code,
+        sourceFile: inputData.source_file,
         filename: inputData.filename,
-        parseResult: inputData.parsed,
+        outputDir: inputData.output_dir,
+        analysis: inputData.analysis as SourceAnalysis,
         testCases: inputData.test_cases,
         attempt,
         previousDiagnosis: diagnosis,
+        llmRetries: inputData.llm_retries,
+      })
+
+      executionResult = adapter.executeTests({
+        sourceCode: inputData.source_code,
+        sourceFile: inputData.source_file,
+        filename: inputData.filename,
+        testCode,
         outputDir: inputData.output_dir,
+        timeoutSeconds: 60,
+        analysis: inputData.analysis as SourceAnalysis,
       })
-
-      executionResult = executePytest({
-        test_code: testCode,
-        source_code: inputData.source_code,
-        filename: runtimeFilename(inputData.filename),
-        timeout: 60,
-      })
-
-      quality = checkTestQuality({ test_code: testCode })
+      quality = adapter.checkQuality({ testCode, analysis: inputData.analysis as SourceAnalysis })
       versions.push(createVersionRecord({
         versionNo: versions.length + 1,
         attempt,
         testCode,
         executionResult,
         quality,
-        note: "自愈重生成",
+        note: "self-healing regeneration",
       }))
 
-      if (
-        executionResult.status === "passed" &&
-        executionResult.failed === 0 &&
-        executionResult.errors === 0 &&
-        quality.ok
-      ) {
-        diagnosis = undefined
-        return finalizeOutput(inputData, testCode, executionResult, undefined, quality, versions)
+      if (isPassed(executionResult, quality)) {
+        return finalize(inputData, testCode, executionResult, undefined, quality, coverage, versions)
       }
     }
 
-    return finalizeOutput(inputData, testCode, executionResult, diagnosis, quality, versions)
+    diagnosis ??= await diagnoseFailure({
+      adapter,
+      sourceCode: inputData.source_code,
+      testCode,
+      testCases: inputData.test_cases,
+      executionResult,
+      quality,
+      analysis: inputData.analysis as SourceAnalysis,
+      sourceFile: inputData.source_file,
+      attempt: inputData.max_attempts,
+      llmRetries: inputData.llm_retries,
+    })
+    versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
+    return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
   },
 })
 
-/* ================================================================
- * Step 7: 导出最终完整结果
- * 将最终的测试代码、用例和执行结果导出为 .py / .md，
- * 同时将源代码文件复制到输出目录，便于用户直接运行 pytest。
- * ================================================================ */
 const exportResultsStep = createStep({
   id: "export-results",
-  inputSchema: step5OutputSchema,
+  inputSchema: finalStepOutputSchema,
   outputSchema: workflowOutputSchema,
   execute: async ({ inputData }) => {
-    const resolvedOutputDir = path.resolve(inputData.output_dir)
-
-    const exportResult = exportCases({
-      test_cases: inputData.test_cases,
-      test_code: inputData.test_code,
-      output_dir: resolvedOutputDir,
-      execution_result: inputData.execution_detail,
-      diagnosis: inputData.diagnosis,
-      quality: inputData.quality,
-      versions: inputData.versions,
+    const adapter = adapterFor(inputData.language)
+    logProgress("Exporting final test code, report, and version records")
+    const exportResult = adapter.exportArtifacts({
+      testCases: inputData.test_cases,
+      testCode: inputData.test_code,
+      outputDir: inputData.output_dir,
+      sourceFile: inputData.source_file,
+      executionResult: inputData.execution_detail as ExecutionResult,
+      diagnosis: inputData.diagnosis as Diagnosis | undefined,
+      quality: inputData.quality as QualityResult | undefined,
+      coverage: inputData.coverage as CoverageResult | undefined,
+      versions: inputData.versions as TestCodeVersion[] | undefined,
+      analysis: inputData.analysis as SourceAnalysis,
     })
-
-    /* 将源代码复制到输出目录，方便用户直接 cd 进去跑 pytest */
-    try {
-      mkdirSync(resolvedOutputDir, { recursive: true })
-      const sourceFilename = path.basename(inputData.source_file)
-      copyFileSync(inputData.source_file, path.join(resolvedOutputDir, sourceFilename))
-    } catch (copyErr) {
-      console.error("[export-results] 复制源文件失败:", copyErr)
-    }
-
+    copySourceToOutput(inputData.source_file, inputData.output_dir)
     return {
       source_file: inputData.source_file,
+      language: inputData.language,
       test_code: inputData.test_code,
       test_cases_count: inputData.test_cases_count,
       passed: inputData.passed,
-      exported_files: exportResult.exported_files,
+      exported_files: unique(exportResult.exported_files),
       execution_detail: inputData.execution_detail,
       diagnosis: inputData.diagnosis,
       quality: inputData.quality,
+      coverage: inputData.coverage,
       versions: inputData.versions,
     }
   },
 })
 
-/* ================================================================
- * 工作流串联
- * 读解析 → 设用例 → 导出预案 → 生成代码 → 执行验证 → 自愈修复 → 导出最终结果
- * ================================================================ */
 export const generateTestWorkflow = createWorkflow({
   id: "generate-test-workflow",
   inputSchema: workflowInputSchema,
@@ -422,52 +405,245 @@ export const generateTestWorkflow = createWorkflow({
 })
   .then(readParseStep)
   .then(designCasesStep)
-  .then(exportCasesPlanStep)
+  .then(exportPlanStep)
   .then(generateCodeStep)
-  .then(executeVerifyStep)
+  .then(executeStep)
   .then(selfHealingStep)
   .then(exportResultsStep)
   .commit()
 
-/* ================================================================
- * 辅助函数
- * ================================================================ */
+async function generateTestCases(input: {
+  adapter: LanguageAdapter
+  sourceCode: string
+  sourceFile: string
+  analysis: SourceAnalysis
+  requirementsText?: string
+  llmRetries: number
+}): Promise<TestCase[]> {
+  assertLlmAvailable("generate structured test cases")
+  try {
+    const batches = chunk(input.analysis.symbols, 1)
+    const effectiveBatches = batches.length > 0 ? batches : [input.analysis.symbols]
+    const allCases: TestCase[] = []
+    const requestedCaseLimit = extractRequestedCaseLimit(input.requirementsText)
 
-/**
- * 将中间状态转换为工作流最终输出结构
- * 提取 runPayload 中累积的字段，统一计算 passed 标记。
- */
-function finalizeOutput(
-  runPayload: {
-    source_file: string
-    output_dir: string
-    test_cases: TestCase[]
-    diagnosis?: Diagnosis
-  },
-  finalTestCode: string,
-  finalExec: ExecuteTestsOutput,
-  finalDiagnosis?: Diagnosis,
-  finalQuality?: QualityCheckResult,
-  versions: TestCodeVersion[] = []
+    for (const [batchIndex, symbols] of effectiveBatches.entries()) {
+      if (requestedCaseLimit !== undefined && allCases.length >= requestedCaseLimit) break
+      const batchAnalysis: SourceAnalysis = { ...input.analysis, symbols }
+      renderProgressBar("Designing test cases", batchIndex, effectiveBatches.length)
+      const batchCases = await withLlmRetries("test-case batch " + (batchIndex + 1) + "/" + effectiveBatches.length, input.llmRetries, async () => {
+        const fence = String.fromCharCode(96).repeat(3)
+        const prompt = [
+          "Generate concrete unit test cases for every listed symbol.",
+          "Return only valid JSON in this shape: { \"cases\": [...] }.",
+          "Use double quotes for all strings. Do not use Markdown.",
+          "",
+          "Rules:",
+          "- Prefer one functional case, boundary cases, and exception/error cases when useful.",
+          "- Boundary values should cover 0, empty strings/collections, negative values, None/null, and extreme values when relevant.",
+          "- Division/modulo code must include a zero divisor case.",
+          "- Recursive code must include base-case and invalid-input cases.",
+          "- A function name containing safe should be tested under unsafe/error inputs.",
+          "- Do not assume the source is correct only because it runs.",
+          "- input_params keys must exactly match parameter names.",
+          "- expected_result must be concrete.",
+          "- Omit optional fields instead of writing null.",
+          "- Global test case limit: " + (requestedCaseLimit ?? "none") + ".",
+          "",
+          "Expected JSON example:",
+          JSON.stringify({ cases: [{ case_number: "TC-001", title: "specific title", case_type: "functional|boundary|exception", preconditions: "setup", steps: ["step"], input_params: { param: "value" }, expected_result: "specific expected behavior", related_symbol: "symbol name" }] }, null, 2),
+          "",
+          "Symbol context:",
+          input.adapter.buildGenerationContext({ analysis: batchAnalysis, sourceFile: input.sourceFile }),
+          "",
+          "Extra requirements:",
+          input.requirementsText ?? "None",
+          "",
+          "Relevant source code:",
+          fence + input.adapter.codeFence,
+          sourceExcerptForSymbols(input.sourceCode, symbols),
+          fence,
+        ].join("\n")
+        const response = await testCaseAgent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 4096 } })
+
+        const parsed = parseJsonValue(response.text)
+        const result = testCaseBatchSchema.safeParse(parsed)
+        if (!result.success) {
+          throw new Error("Invalid test-case JSON: " + formatZodIssues(result.error.issues) + ". Preview: " + preview(response.text))
+        }
+        if (result.data.cases.length === 0) {
+          throw new Error("LLM returned an empty case list. Preview: " + preview(response.text))
+        }
+        return result.data.cases
+      })
+      const remaining = requestedCaseLimit === undefined ? batchCases.length : requestedCaseLimit - allCases.length
+      allCases.push(...batchCases.slice(0, Math.max(0, remaining)))
+      renderProgressBar("Designing test cases", batchIndex + 1, effectiveBatches.length)
+    }
+    finishProgressBar()
+
+    if (allCases.length === 0) {
+      throw new Error("LLM returned no test cases.")
+    }
+    return renumberCases(allCases)
+  } catch (error) {
+    finishProgressBar()
+    throw new Error("LLM test case generation failed; stopped instead of using fallback. " + formatError(error))
+  }
+}
+
+async function generateTestCode(input: {
+  adapter: LanguageAdapter
+  sourceCode: string
+  sourceFile: string
+  filename: string
+  outputDir: string
+  analysis: SourceAnalysis
+  testCases: TestCase[]
+  attempt: number
+  previousDiagnosis?: Diagnosis
+  llmRetries: number
+}): Promise<string> {
+  assertLlmAvailable("generate test code")
+  try {
+    const agent = input.attempt > 1 ? testCodeAgentPro : testCodeAgent
+    return await withLlmRetries("test-code generation attempt " + input.attempt, input.llmRetries, async () => {
+      const fence = String.fromCharCode(96).repeat(3)
+      const prompt = [
+        "Generate executable " + input.adapter.testFramework + " unit test code.",
+        "Return only source code. Do not use Markdown fences or explanations.",
+        "",
+        "Rules:",
+        "- Every test case must map to a real test function unless user requirements limit the scope.",
+        "- Use real assertions; do not use assert true, assert 1 == 1, empty tests, or only callable/hasattr checks.",
+        "- For expected exceptions, use the precise assertion style for the framework.",
+        "- Follow runtime/import instructions exactly.",
+        "- If previous diagnosis says the generated test code is wrong, fix that specific problem and do not repeat it.",
+        "",
+        "Language and symbol context:",
+        input.adapter.buildGenerationContext({ analysis: input.analysis, sourceFile: input.sourceFile }),
+        "",
+        "Output directory: " + path.resolve(input.outputDir),
+        "Attempt: " + input.attempt,
+        "Previous AI diagnosis:",
+        JSON.stringify(input.previousDiagnosis?.report_text ?? input.previousDiagnosis ?? null, null, 2),
+        "",
+        "Test cases:",
+        JSON.stringify(input.testCases, null, 2),
+        "",
+        "Source code:",
+        fence + input.adapter.codeFence,
+        input.sourceCode,
+        fence,
+      ].join("\n")
+      const response = await agent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 8192 } })
+      const code = extractCode(response.text, input.adapter.codeFence)
+      if (code.trim()) return code
+      throw new Error("LLM returned empty test code. Preview: " + preview(response.text))
+    })
+  } catch (error) {
+    throw new Error("LLM test code generation failed; stopped instead of using fallback. " + formatError(error))
+  }
+}
+
+async function diagnoseFailure(input: {
+  adapter: LanguageAdapter
+  sourceCode: string
+  testCode: string
+  testCases: TestCase[]
+  executionResult: ExecutionResult
+  quality: QualityResult
+  analysis: SourceAnalysis
+  sourceFile: string
+  attempt: number
+  llmRetries: number
+}): Promise<Diagnosis> {
+  assertLlmAvailable("diagnose failed tests")
+  try {
+    const agent = input.attempt > 1 ? diagnosisAgentPro : diagnosisAgent
+    const reportText = await withLlmRetries("failure diagnosis attempt " + input.attempt, input.llmRetries, async () => {
+      const fence = String.fromCharCode(96).repeat(3)
+      const prompt = [
+        "You are a senior unit-test failure diagnosis agent.",
+        "Read the source code, the designed test cases, the generated test code, and the execution error output.",
+        "Write a direct natural-language diagnosis of the root cause.",
+        "",
+        "Important:",
+        "- Do not output JSON.",
+        "- Do not output a classification template.",
+        "- Do not repeat full logs; quote only the key error lines when useful.",
+        "- Focus on whether the failure reveals a source-code defect, a wrong generated test, or an environment/runtime problem.",
+        "- If the source code is defective, explain the concrete source bug and the expected correct behavior.",
+        "- If the generated test is defective, explain exactly what is wrong with the test code.",
+        "- If an environment command is needed, say the command in plain language.",
+        "",
+        "Language: " + input.adapter.displayName,
+        "Test framework: " + input.adapter.testFramework,
+        "Attempt: " + input.attempt,
+        "",
+        "Source/test context:",
+        input.adapter.buildGenerationContext({ analysis: input.analysis, sourceFile: input.sourceFile }),
+        "",
+        "Designed test cases:",
+        JSON.stringify(input.testCases, null, 2),
+        "",
+        "Generated test code:",
+        fence + input.adapter.codeFence,
+        input.testCode,
+        fence,
+        "",
+        "Execution result and errors:",
+        fence + "json",
+        JSON.stringify(input.executionResult, null, 2),
+        fence,
+        "",
+        "Quality result:",
+        fence + "json",
+        JSON.stringify(input.quality, null, 2),
+        fence,
+        "",
+        "Source code:",
+        fence + input.adapter.codeFence,
+        input.sourceCode,
+        fence,
+      ].join("\n")
+      const response = await agent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 8192 } })
+      const text = response.text.trim()
+      if (!text) throw new Error("LLM returned an empty diagnosis.")
+      return text
+    })
+    return makeDiagnosisDecision(reportText, input.executionResult, input.quality)
+  } catch (error) {
+    throw new Error("LLM failure diagnosis failed; stopped instead of using fallback. " + formatError(error))
+  }
+}
+
+
+
+function finalize(
+  inputData: z.infer<typeof executionStepOutputSchema>,
+  testCode: string,
+  executionResult: ExecutionResult,
+  diagnosis: Diagnosis | undefined,
+  quality: QualityResult,
+  coverage: CoverageResult,
+  versions: TestCodeVersion[]
 ) {
-  const passed =
-    finalExec.status === "passed" &&
-    finalExec.failed === 0 &&
-    finalExec.errors === 0 &&
-    finalQuality?.ok !== false
-
   return {
-    source_file: runPayload.source_file,
-    test_code: finalTestCode,
-    test_cases_count: runPayload.test_cases.length,
-    passed,
+    source_file: inputData.source_file,
+    language: inputData.language,
+    test_code: testCode,
+    test_cases_count: inputData.test_cases.length,
+    passed: isPassed(executionResult, quality),
     exported_files: [],
-    execution_detail: finalExec,
-    diagnosis: finalDiagnosis,
-    quality: finalQuality,
+    execution_detail: executionResult,
+    diagnosis,
+    quality,
+    coverage,
     versions,
-    output_dir: runPayload.output_dir,
-    test_cases: runPayload.test_cases,
+    output_dir: inputData.output_dir,
+    test_cases: inputData.test_cases,
+    analysis: inputData.analysis,
   }
 }
 
@@ -475,8 +651,8 @@ function createVersionRecord(input: {
   versionNo: number
   attempt: number
   testCode: string
-  executionResult?: ExecuteTestsOutput
-  quality?: QualityCheckResult
+  executionResult?: ExecutionResult
+  quality?: QualityResult
   diagnosis?: Diagnosis
   note?: string
 }): TestCodeVersion {
@@ -492,498 +668,332 @@ function createVersionRecord(input: {
   }
 }
 
-function isExecutionPassed(executionResult: ExecuteTestsOutput): boolean {
-  return (
-    executionResult.status === "passed" &&
-    executionResult.failed === 0 &&
-    executionResult.errors === 0
-  )
+function adapterFor(language: SupportedLanguage): LanguageAdapter {
+  return getLanguageAdapter(language)
 }
 
-function qualityFailureDiagnosis(quality: QualityCheckResult): Diagnosis {
+function isPassed(executionResult: ExecutionResult, quality: QualityResult): boolean {
+  return executionResult.status === "passed" && executionResult.failed === 0 && executionResult.errors === 0 && quality.ok
+}
+
+async function withLlmRetries<T>(
+  label: string,
+  retries: number,
+  task: () => Promise<T>
+): Promise<T> {
+  const retryCount = Number.isFinite(retries) ? Math.max(0, Math.floor(retries)) : 0
+  let remaining = retryCount + 1
+  let lastError: unknown
+
+  while (remaining > 0) {
+    try {
+      return await task()
+    } catch (error) {
+      lastError = error
+      remaining -= 1
+      if (remaining > 0) {
+        const total = retryCount + 1
+        logProgress(`LLM ${label} failed on attempt ${total - remaining}/${total}; retrying. Reason: ${formatError(error)}`)
+        continue
+      }
+    }
+
+    if (llmRetriesExhaustedHandler) {
+      const additional = await llmRetriesExhaustedHandler(
+        label,
+        formatError(lastError)
+      )
+      if (additional > 0) {
+        remaining = additional
+        continue
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(formatError(lastError))
+}
+
+export function setLlmRetriesExhaustedHandler(
+  handler: null | ((label: string, errorText: string) => Promise<number>)
+): void {
+  llmRetriesExhaustedHandler = handler
+}
+
+let llmRetriesExhaustedHandler: null | ((label: string, errorText: string) => Promise<number>) = null
+
+function calculateCoverage(testCases: TestCase[], analysis: SourceAnalysis): CoverageResult {
+  const normalizedSymbols = new Map<string, string>()
+  for (const symbol of analysis.symbols) {
+    const fullName = symbol.className ? symbol.className + "." + symbol.name : symbol.name
+    normalizedSymbols.set(normalizeSymbolName(fullName), fullName)
+    normalizedSymbols.set(normalizeSymbolName(symbol.name), fullName)
+  }
+
+  const covered = new Set<string>()
+  const caseTypeCounts: Record<string, number> = {}
+  for (const testCase of testCases) {
+    const caseType = String(testCase.case_type || "unknown").toLowerCase()
+    caseTypeCounts[caseType] = (caseTypeCounts[caseType] ?? 0) + 1
+    const related = normalizeSymbolName(testCase.related_symbol)
+    const direct = normalizedSymbols.get(related)
+    if (direct) {
+      covered.add(direct)
+      continue
+    }
+    for (const [normalized, fullName] of normalizedSymbols) {
+      if (related && (related.includes(normalized) || normalized.includes(related))) covered.add(fullName)
+    }
+  }
+
+  const allSymbols = [...new Set([...normalizedSymbols.values()])]
+  const uncovered = allSymbols.filter((symbol) => !covered.has(symbol))
+  const denominator = allSymbols.length || 1
   return {
-    diagnosis_type: "TEST_CODE_ERROR",
-    confidence: 0.86,
-    evidence: [
-      "pytest已经通过，但静态质量检查未通过，说明测试代码可能存在弱断言或空测试",
-      ...quality.issues,
-    ],
-    next_action: "REGENERATE_TEST_CODE",
+    symbol_coverage: round2((covered.size / denominator) * 100),
+    covered_symbols: [...covered].sort(),
+    uncovered_symbols: uncovered.sort(),
+    case_type_coverage: Object.fromEntries(Object.entries(caseTypeCounts).map(([key, value]) => [key, round2((value / Math.max(testCases.length, 1)) * 100)])),
+    total_symbols: allSymbols.length,
+    total_cases: testCases.length,
   }
 }
 
-/**
- * 生成测试用例（核心生成步骤之一）
- * 优先调用LLM Agent生成结构化测试用例JSON数组；
- * 若未配置API Key或LLM返回不稳定，则使用确定性兜底逻辑。
- *
- * @param sourceCode - Python源代码全文
- * @param parseResult - AST解析结果（函数/类/参数/行号）
- * @param requirementsText - 可选需求文本，辅助LLM判断预期行为
- * @returns 结构化的测试用例列表
- */
-async function generateTestCases(
-  sourceCode: string,
-  parseResult: ParsedSource,
-  requirementsText?: string
-): Promise<TestCase[]> {
-  if (canUseLLM()) {
-    try {
-      const response = await testCaseAgent.generate(`
-请分析下面的Python源码和AST解析结果，为每个函数/方法设计针对性的测试用例。
-
-必须输出纯JSON数组，不要任何Markdown标记、不要代码块、不要额外解释。
-
-每一条测试用例的JSON格式如下：
-{
-  "case_number": "TC-001",
-  "title": "用一句话描述这个测试验证什么（如"传入正常参数应返回正确和"或"除数为0时应抛出ZeroDivisionError"）",
-  "case_type": "功能/边界/异常",
-  "preconditions": "测试执行的前提条件（如"被测函数可导入"或"被测类已实例化"）",
-  "steps": ["具体的测试步骤1", "步骤2"],
-  "input_params": {"a": 3, "b": 5},
-  "expected_result": "具体的预期结果，必须包含具体数值或异常信息。例如：'返回 8' 或 '抛出 ZeroDivisionError'",
-  "related_symbol": "被测的函数名或类名"
+function normalizeSymbolName(value: string): string {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9_.:]/g, "").replace(/::/g, ".")
 }
 
-设计策略（非常重要）：
-- 仔细阅读每个函数的 docstring 和参数类型，生成贴合实际逻辑的用例
-- 例如 divide_zero(a,b) 应该设计"b=0时抛出ZeroDivisionError"的异常用例，而不是笼统的"异常输入验证"
-- 例如 faulty_logic 的 docstring 说>=60返回"通过"，应设计"score=60时返回'通过'"的功能用例
-- 每个函数/方法至少3条用例，复杂函数可适当增加
-- 用例之间要有区分度，不要三件套模板
-
-需求文本：
-${requirementsText || "无"}
-
-源码：
-${sourceCode}
-
-AST：
-${JSON.stringify(parseResult, null, 2)}
-`)
-      console.error("[generateTestCases] LLM raw response length:", response.text?.length ?? 0)
-      const parsed = parseJsonArray(response.text)
-      if (!parsed || !Array.isArray(parsed) || parsed.length === 0) {
-        console.error("[generateTestCases] parseJsonArray failed or empty, raw:", response.text?.slice(0, 200))
-        return fallbackTestCases(parseResult)
-      }
-      const casesResult = z.array(testCaseSchema).safeParse(parsed)
-      if (casesResult.success && casesResult.data.length > 0) {
-        return casesResult.data
-      }
-      console.error("[generateTestCases] zod validation failed:", JSON.stringify(casesResult.error?.issues?.slice(0, 5)))
-      // Zod 校验失败时，逐条保留合法的用例
-      const validCases: TestCase[] = []
-      for (const item of parsed) {
-        if (typeof item === "object" && item !== null) {
-          const single = testCaseSchema.safeParse(item)
-          if (single.success) validCases.push(single.data)
-        }
-      }
-      if (validCases.length > 0) return validCases
-    } catch (err) {
-      console.error("[generateTestCases] exception:", err)
-      // 没有配置LLM或LLM返回不稳定时，使用确定性兜底用例。
-    }
-  }
-
-  return fallbackTestCases(parseResult)
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
 }
 
-/**
- * 生成pytest测试代码（核心生成步骤之二）
- * 首次用 deepseek-chat 快速生成，重试时换用 deepseek-v4-pro 深度推理。
- * 每次重试传入上一次的诊断信息帮助精准修复。
- *
- * @param input.sourceCode - Python源代码全文
- * @param input.filename - 源文件名，用于生成import语句
- * @param input.parseResult - AST解析结果
- * @param input.testCases - 已生成的测试用例列表
- * @param input.attempt - 当前尝试次数（1=chat, >1=v4-pro）
- * @param input.previousDiagnosis - 上一轮失败诊断（重试时传入）
- * @param input.outputDir - 用户指定的输出目录，Agent 调用 exportCasesTool 时需使用此路径
- * @returns 完整的pytest测试代码字符串
- */
-async function generateTestCode(input: {
-  sourceCode: string
-  filename: string
-  parseResult: ParsedSource
-  testCases: TestCase[]
-  attempt: number
-  previousDiagnosis?: Diagnosis
-  outputDir: string
-}): Promise<string> {
-  const moduleName = toPythonModuleName(input.filename)
-
-  if (canUseLLM()) {
-    try {
-      const agent = input.attempt > 1 ? testCodeAgentPro : testCodeAgent
-      const response = await agent.generate(`
-请为下面Python源码生成可执行pytest测试代码。只输出一个python代码块。
-
-输出目录：${path.resolve(input.outputDir)}
-
-模块名：${moduleName}
-
-AST：
-${JSON.stringify(input.parseResult, null, 2)}
-
-测试用例：
-${JSON.stringify(input.testCases, null, 2)}
-
-上一次诊断：
-${JSON.stringify(input.previousDiagnosis ?? null, null, 2)}
-
-要求：
-1. 从模块 ${moduleName} 导入被测函数或类。
-2. 不要使用未定义fixture。
-3. 不要使用assert True或空断言。
-4. 当前是第 ${input.attempt} 次生成。
-5. 若需调用 exportCasesTool 导出结果，output_dir 必须使用"${path.resolve(input.outputDir)}"。
-`)
-      const code = extractPythonCode(response.text)
-      if (code.trim()) {
-        return code
-      }
-    } catch {
-      // fallback below
-    }
-  }
-
-  return fallbackTestCode(moduleName, input.parseResult)
-}
-
-/**
- * 诊断测试失败原因（核心生成步骤之三）
- * 首次用 chat 快速诊断，重试时换用 v4-pro 深度推理。
- * 质量检查问题作为附加上下文传入 LLM，辅助判断失败根因，
- * 避免因弱断言等质量问题误杀实际是源代码 Bug 的情况。
- *
- * @param sourceCode - Python源代码全文
- * @param testCode - 当前轮的测试代码
- * @param executionResult - pytest执行结果（stdout/stderr/exit_code等）
- * @param attempt - 当前尝试次数，>1 时启用 v4-pro 深度推理模式
- * @param qualityIssues - 可选的质量检查问题列表，作为诊断辅助上下文
- * @returns 结构化诊断结果（类型、置信度、证据、建议动作）
- */
-async function diagnoseFailure(
-  sourceCode: string,
-  testCode: string,
-  executionResult: ExecuteTestsOutput,
-  attempt: number,
-  qualityIssues?: string[]
-): Promise<Diagnosis> {
-  if (canUseLLM()) {
-    try {
-      const agent = attempt > 1 ? diagnosisAgentPro : diagnosisAgent
-      const qualityCtx = qualityIssues?.length
-        ? `\n质量检查发现问题（仅作参考，不代表根因就是测试代码错误）：\n${qualityIssues.join("\n")}`
-        : ""
-      const response = await agent.generate(`
-请诊断pytest失败原因，只输出JSON对象。
-
-重要提示：质量检查发现的问题不代表一定就是测试代码的错误。请仔细分析 traceback 和退出码，判断失败的真实根因——是源代码的 bug、运行时异常，还是测试代码确实写错了。
-
-源代码：
-${sourceCode}
-
-测试代码：
-${testCode}
-
-执行结果：
-${JSON.stringify(executionResult, null, 2)}
-${qualityCtx}
-`)
-      const parsed = parseJsonObject(response.text)
-      const diagnosis = diagnosisSchema.safeParse(parsed)
-      if (diagnosis.success) {
-        return diagnosis.data
-      }
-    } catch {
-      // fallback below
-    }
-  }
-
-  const combined = `${executionResult.stdout}\n${executionResult.stderr}`
-  if (executionResult.timeout) {
+function makeDiagnosisDecision(reportText: string, executionResult: ExecutionResult, quality: QualityResult): Diagnosis {
+  const combined = (reportText + "\n" + executionResult.stdout + "\n" + executionResult.stderr).toLowerCase()
+  if (/pytest|junit|maven|g\+\+|compiler|dependency|not installed|missing package|no module named ['"]pytest/.test(combined)) {
     return {
-      diagnosis_type: "UNKNOWN",
-      confidence: 0.6,
-      evidence: ["pytest执行超时，可能是源代码死循环、测试输入不当或环境阻塞"],
-      next_action: "ASK_USER_CONFIRMATION",
+      diagnosis_type: "ENVIRONMENT_ERROR",
+      confidence: 0.75,
+      summary: firstLine(reportText),
+      evidence: ["The natural-language diagnosis indicates a missing tool, framework, or dependency."],
+      report_text: reportText,
+      next_action: "INSTALL_DEPENDENCY",
+      suggested_commands: extractLikelyCommands(reportText),
     }
   }
-
-  if (
-    /fixture .* not found/i.test(combined) ||
-    /ImportError|ModuleNotFoundError/.test(combined) ||
-    (/NameError/.test(combined) && combined.includes("test_temp.py")) ||
-    (/SyntaxError/.test(combined) && combined.includes("test_temp.py"))
-  ) {
+  if (/generated test|test code|wrong import|import path|fixture|syntax error|cannot find symbol|no matching function|not declared/.test(combined) || quality.issues.length > 0) {
     return {
       diagnosis_type: "TEST_CODE_ERROR",
-      confidence: 0.82,
-      evidence: ["pytest输出显示导入、fixture、名称或语法问题来自生成的测试代码"],
+      confidence: 0.78,
+      summary: firstLine(reportText),
+      evidence: ["The natural-language diagnosis points to generated test code or test quality problems."],
+      report_text: reportText,
       next_action: "REGENERATE_TEST_CODE",
     }
   }
-
-  if (/AssertionError|E\s+assert\b/.test(combined) || executionResult.failed > 0) {
-    return {
-      diagnosis_type: "BEHAVIOR_MISMATCH",
-      confidence: 0.66,
-      evidence: ["pytest断言失败，说明实际行为与测试预期不一致，需要结合需求或docstring确认"],
-      next_action: "ASK_USER_CONFIRMATION",
-    }
-  }
-
-  if (executionResult.errors > 0) {
+  if (/source bug|source code|implementation bug|division by zero|index error|recursion|infinite|null pointer|overflow|defect/.test(combined)) {
     return {
       diagnosis_type: "SOURCE_RUNTIME_ERROR",
-      confidence: 0.7,
-      evidence: ["pytest执行出现运行时错误，需要查看traceback确认是否源代码异常或依赖缺失"],
+      confidence: 0.78,
+      summary: firstLine(reportText),
+      evidence: ["The natural-language diagnosis points to a source-code defect."],
+      report_text: reportText,
       next_action: "REPORT_TO_USER",
+    }
+  }
+  if (executionResult.failed > 0) {
+    return {
+      diagnosis_type: "BEHAVIOR_MISMATCH",
+      confidence: 0.65,
+      summary: firstLine(reportText),
+      evidence: ["Tests executed but assertions failed; the report should be reviewed against requirements."],
+      report_text: reportText,
+      next_action: "ASK_USER_CONFIRMATION",
     }
   }
   return {
     diagnosis_type: "UNKNOWN",
     confidence: 0.5,
-    evidence: ["执行结果证据不足，无法可靠判断失败根因"],
-    next_action: "ASK_USER_CONFIRMATION",
+    summary: firstLine(reportText),
+    evidence: ["The natural-language diagnosis did not provide enough evidence for an automatic action."],
+    report_text: reportText,
+    next_action: "REPORT_TO_USER",
   }
 }
 
-/**
- * 判断是否已配置有效的LLM API Key
- * 检测OPENAI_API_KEY或MASTRA_API_KEY环境变量；
- * 排除示例占位Key（如"你的"、"sk-xxx"等）。
- *
- * @returns true表示可以调用LLM，false则走确定性兜底逻辑
- */
-function canUseLLM(): boolean {
-  const key = process.env.OPENAI_API_KEY || process.env.MASTRA_API_KEY || process.env.DEEPSEEK_API_KEY || ""
-  return /^[\x20-\x7E]+$/.test(key) && !key.includes("你的") && key.length > 20
+function firstLine(text: string): string {
+  return text.split(/\r?\n/).map((line) => line.trim()).find(Boolean)?.slice(0, 220) ?? "AI diagnosis completed."
 }
 
-/**
- * 确定性兜底：当LLM不可用时，根据AST符号信息生成基础测试用例
- * 为每个被测函数/方法生成3条用例（功能/边界/异常），确保永远有输出。
- *
- * @param parseResult - AST解析结果
- * @returns 基础测试用例列表（每个符号3条）
- */
-function fallbackTestCases(parseResult: ParsedSource): TestCase[] {
-  const symbols = collectSymbols(parseResult)
-  return symbols.flatMap((symbol, index) => {
-    const caseNo = index * 3
-    return [
-      {
-        case_number: `TC-${String(caseNo + 1).padStart(3, "0")}`,
-        title: `${symbol.name} 正常调用验证`,
-        case_type: "功能",
-        preconditions: "被测函数可导入",
-        steps: [`调用 ${symbol.name}`],
-        input_params: undefined,
-        expected_result: "函数可正常执行，并返回可观察结果",
-        related_symbol: symbol.name,
-      },
-      {
-        case_number: `TC-${String(caseNo + 2).padStart(3, "0")}`,
-        title: `${symbol.name} 边界输入验证`,
-        case_type: "边界",
-        preconditions: "被测函数可导入",
-        steps: [`使用边界参数调用 ${symbol.name}`],
-        input_params: undefined,
-        expected_result: "函数返回合理结果或抛出明确异常",
-        related_symbol: symbol.name,
-      },
-      {
-        case_number: `TC-${String(caseNo + 3).padStart(3, "0")}`,
-        title: `${symbol.name} 异常输入验证`,
-        case_type: "异常",
-        preconditions: "被测函数可导入",
-        steps: [`使用异常参数调用 ${symbol.name}`],
-        input_params: undefined,
-        expected_result: "函数不应静默产生错误结果",
-        related_symbol: symbol.name,
-      },
-    ]
-  })
+function extractLikelyCommands(text: string): string[] | undefined {
+  const pattern = new RegExp("\\x60([^\\x60]*(?:pip|npm|mvn|gradle|conda|winget|choco|vcpkg|apt|brew|g\\+\\+|javac)[^\\x60]*)\\x60", "gi")
+  const commands = [...text.matchAll(pattern)].map((match) => match[1].trim()).filter(Boolean)
+  return commands.length ? [...new Set(commands)].slice(0, 3) : undefined
 }
 
-/**
- * 确定性兜底：当LLM不可用时，根据AST符号信息生成基础pytest测试代码
- * 为每个函数生成callable检查+调用验证，为每个方法生成hasattr+callable检查。
- *
- * @param moduleName - 模块名，用于生成from...import语句
- * @param parseResult - AST解析结果
- * @returns 可用的pytest测试代码字符串
- */
-function fallbackTestCode(moduleName: string, parseResult: ParsedSource): string {
-  const symbols = collectSymbols(parseResult)
-  const importNames = new Set<string>()
-  for (const symbol of symbols) {
-    importNames.add(symbol.kind === "method" && symbol.className ? symbol.className : symbol.name)
-  }
-  const imports = [...importNames].join(", ")
-
-  if (!imports) {
-    return [
-      "def test_no_testable_function_found():",
-      "    symbols = []",
-      "    assert symbols == []",
-      "",
-    ].join("\n")
-  }
-
-  const lines = [`from ${moduleName} import ${imports}`, "", ""]
-  for (const symbol of symbols.filter((item) => item.kind === "function")) {
-    const args = symbol.params.map((param) => sampleValue(param.type)).join(", ")
-    lines.push(`def test_${symbol.name}_callable():`)
-    lines.push(`    assert callable(${symbol.name})`)
-    lines.push(`    result = ${symbol.name}(${args})`)
-    lines.push("    assert 'result' in locals()")
-    lines.push("")
-  }
-  for (const symbol of symbols.filter((item) => item.kind === "method" && item.className)) {
-    lines.push(`def test_${symbol.className}_${symbol.name}_method_exists():`)
-    lines.push(`    assert hasattr(${symbol.className}, '${symbol.name}')`)
-    lines.push(`    assert callable(getattr(${symbol.className}, '${symbol.name}'))`)
-    lines.push("")
-  }
-  return lines.join("\n")
-}
-
-function runtimeFilename(filename: string): string {
-  return `${toPythonModuleName(filename)}.py`
-}
-
-function toPythonModuleName(filename: string): string {
-  const baseName = path.basename(filename, ".py")
-  const sanitized = baseName.replace(/[^A-Za-z0-9_]/g, "_")
-  if (!sanitized) return "source_temp"
-  return /^[A-Za-z_]/.test(sanitized) ? sanitized : `m_${sanitized}`
-}
-
-/**
- * 从AST解析结果中提取所有可测试的符号（函数/类方法）
- * 将独立函数和类方法展平为统一结构，类方法自动过滤self参数。
- *
- * @param parseResult - AST解析结果
- * @returns 统一的符号列表，包含名称、类型、参数、所属类
- */
-function collectSymbols(parseResult: ParsedSource): Array<{
-  name: string
-  kind: string
-  params: Array<{ name?: string; type: string }>
-  className?: string
-}> {
-  const functions = (parseResult.functions as Array<{ name: string; params?: Array<{ type: string }> }>).map((item) => ({
-    name: item.name,
-    kind: "function",
-    params: item.params ?? [],
-  }))
-
-  const methods = (parseResult.classes as Array<{
-    name: string
-    methods?: Array<{ name: string; params?: Array<{ name?: string; type: string }> }>
-  }>).flatMap(
-    (cls) =>
-      (cls.methods ?? []).map((item) => ({
-        name: item.name,
-        kind: "method",
-        className: cls.name,
-        params: (item.params ?? []).filter((param) => param.name !== "self"),
-      }))
-  )
-
-  return [...functions, ...methods]
-}
-
-/**
- * 根据参数类型名称生成对应的Python示例值
- * 用于兜底测试代码中构造函数调用参数。
- * 支持：int/float/bool/list/dict/str，其他返回None。
- *
- * @param typeName - 类型名称字符串（忽略大小写）
- * @returns 对应类型的Python字面值字符串
- */
-function sampleValue(typeName = "Any"): string {
-  const normalized = typeName.toLowerCase()
-  if (normalized.includes("int")) return "1"
-  if (normalized.includes("float")) return "1.0"
-  if (normalized.includes("bool")) return "True"
-  if (normalized.includes("list")) return "[]"
-  if (normalized.includes("dict")) return "{}"
-  if (normalized.includes("str")) return "'test'"
-  return "None"
-}
-
-/**
- * 从LLM返回的文本中提取JSON数组
- * 兼容多种LLM常见输出格式：纯JSON、Markdown代码块包裹、文字前后缀。
- *
- * @param text - LLM返回的原始文本（可能包含Markdown或额外说明）
- * @returns 解析后的数组，若失败则返回空数组
- */
-function parseJsonArray(text: string): unknown {
-  // 1. 优先从 ```json ... ``` 代码块提取
+function parseJsonValue(text: string): unknown {
   const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)```/)
   if (codeBlock) {
-    try { return JSON.parse(codeBlock[1]) } catch { /* ignore */ }
+    try { return JSON.parse(codeBlock[1]) } catch { /* try below */ }
   }
-  // 2. 从第一个 [ 到最后一个 ] 提取
-  const firstBracket = text.indexOf("[")
-  const lastBracket = text.lastIndexOf("]")
-  if (firstBracket !== -1 && lastBracket > firstBracket) {
-    try { return JSON.parse(text.slice(firstBracket, lastBracket + 1)) } catch { /* ignore */ }
+
+  try {
+    return JSON.parse(text)
+  } catch {
+    // try below
   }
-  // 3. 兜底：贪婪正则
-  const match = text.match(/\[[\s\S]*\]/)
-  try { return match ? JSON.parse(match[0]) : [] } catch { return [] }
+
+  const objectStart = text.indexOf("{")
+  const arrayStart = text.indexOf("[")
+  const starts = [objectStart, arrayStart].filter((value) => value >= 0)
+  if (starts.length === 0) {
+    throw new Error(`No JSON object or array found in LLM response. Preview: ${preview(text)}`)
+  }
+
+  const start = Math.min(...starts)
+  const opener = text[start]
+  const closer = opener === "{" ? "}" : "]"
+  const end = findMatchingJsonEnd(text, start, opener, closer)
+  if (end < 0) {
+    throw new Error(`No complete JSON value found in LLM response. Preview: ${preview(text)}`)
+  }
+
+  return JSON.parse(text.slice(start, end + 1))
 }
 
-/**
- * 从LLM返回的文本中提取JSON对象
- * 匹配第一个被花括号包裹的JSON结构并解析。
- *
- * @param text - LLM返回的原始文本
- * @returns 解析后的对象，若失败则返回空对象
- */
-function parseJsonObject(text: string): unknown {
-  const match = text.match(/\{[\s\S]*\}/)
-  return match ? JSON.parse(match[0]) : {}
-}
-
-/**
- * 从LLM返回的文本中提取Python代码块
- * 匹配三个反引号包裹的python代码块，若未找到则返回原文。
- *
- * @param text - LLM返回的原始文本
- * @returns 提取的纯代码字符串
- */
-function extractPythonCode(text: string): string {
-  const match = text.match(/```(?:python)?\s*([\s\S]*?)```/)
-  return match ? match[1] : text
-}
-
-/**
- * 构造空的执行结果对象
- * 在自愈循环开始前初始化占位结果，避免undefined引用。
- *
- * @returns 状态为not_run的空执行结果
- */
-function emptyExecutionResult(): ExecuteTestsOutput {
-  return {
-    status: "not_run",
-    passed: 0,
-    failed: 0,
-    errors: 0,
-    stdout: "",
-    stderr: "",
-    exit_code: 0,
-    duration_ms: 0,
-    timeout: false,
+function findMatchingJsonEnd(text: string, start: number, opener: string, closer: string): number {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (char === "\\") {
+      escaped = true
+      continue
+    }
+    if (char === "\"") {
+      inString = !inString
+      continue
+    }
+    if (inString) continue
+    if (char === opener) depth += 1
+    if (char === closer) depth -= 1
+    if (depth === 0) return index
   }
+  return -1
+}
+
+function extractCode(text: string, fence: string): string {
+  const match = text.match(new RegExp(`\`\`\`(?:${fence}|[A-Za-z0-9+#-]+)?\\s*([\\s\\S]*?)\`\`\``))
+  return match ? match[1].trim() : text.trim()
+}
+
+function preview(text: string, length = 500): string {
+  const normalized = text.replace(/\s+/g, " ").trim()
+  return normalized.length > length ? `${normalized.slice(0, length)}...` : normalized
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const result: T[][] = []
+  for (let index = 0; index < items.length; index += size) {
+    result.push(items.slice(index, index + size))
+  }
+  return result
+}
+
+function renumberCases(testCases: TestCase[]): TestCase[] {
+  return testCases.map((testCase, index) => ({
+    ...testCase,
+    case_number: `TC-${String(index + 1).padStart(3, "0")}`,
+  }))
+}
+
+function extractRequestedCaseLimit(requirementsText?: string): number | undefined {
+  if (!requirementsText) return undefined
+  const normalized = requirementsText.trim()
+  const arabic = normalized.match(/(?:only|first|top|limit|up to|at most|max|generate|cases?|tests?|unit tests?)[^\d]{0,16}(\d{1,3})/i)
+  if (arabic) return clampCaseLimit(Number(arabic[1]))
+
+  const chineseDigits: Record<string, number> = {
+    "\u4e00": 1,
+    "\u4e8c": 2,
+    "\u4e24": 2,
+    "\u4e09": 3,
+    "\u56db": 4,
+    "\u4e94": 5,
+    "\u516d": 6,
+    "\u4e03": 7,
+    "\u516b": 8,
+    "\u4e5d": 9,
+    "\u5341": 10,
+  }
+  const chinese = normalized.match(/(?:\u53ea\u8981|\u53ea\u751f\u6210|\u524d|\u6700\u591a|\u4e0d\u8d85\u8fc7).{0,8}?([\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341])/)
+  if (chinese) return clampCaseLimit(chineseDigits[chinese[1]])
+  return undefined
+}
+
+function clampCaseLimit(value: number | undefined): number | undefined {
+  if (!Number.isFinite(value) || !value || value < 1) return undefined
+  return Math.min(Math.floor(value), 100)
+}
+
+function sourceExcerptForSymbols(sourceCode: string, symbols: SourceAnalysis["symbols"]): string {
+  const lines = sourceCode.split(/\r?\n/)
+  const starts = symbols.map((symbol) => symbol.startLine).filter((line): line is number => Number.isFinite(line))
+  if (starts.length === 0) return sourceCode
+
+  const start = Math.max(Math.min(...starts) - 1, 0)
+  const explicitEnds = symbols.map((symbol) => symbol.endLine).filter((line): line is number => Number.isFinite(line))
+  const end = explicitEnds.length > 0
+    ? Math.min(Math.max(...explicitEnds), lines.length)
+    : Math.min(start + 80, lines.length)
+
+  return lines.slice(start, end).join("\n")
+}
+
+function formatZodIssues(issues: z.ZodIssue[]): string {
+  return issues
+    .slice(0, 5)
+    .map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+    .join("; ")
+}
+
+function toText(value: unknown): string {
+  if (typeof value === "string") return value
+  if (value === undefined || value === null) return String(value)
+  try { return JSON.stringify(value) } catch { return String(value) }
+}
+
+function copySourceToOutput(sourceFile: string, outputDir: string): void {
+  try {
+    fs.mkdirSync(outputDir, { recursive: true })
+    const target = path.join(outputDir, path.basename(sourceFile))
+    if (!fs.existsSync(target)) fs.copyFileSync(sourceFile, target)
+  } catch {
+    // ignore
+  }
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)]
+}
+
+function renderProgressBar(label: string, current: number, total: number): void {
+  const safeTotal = Math.max(total, 1)
+  const safeCurrent = Math.min(Math.max(current, 0), safeTotal)
+  const width = 24
+  const filled = Math.round((safeCurrent / safeTotal) * width)
+  const bar = "#".repeat(filled) + "-".repeat(width - filled)
+  const percent = Math.round((safeCurrent / safeTotal) * 100)
+  process.stdout.write("\rAgent progress: " + label + " [" + bar + "] " + safeCurrent + "/" + safeTotal + " " + percent + "%")
+}
+
+function finishProgressBar(): void {
+  process.stdout.write("\n")
+}
+
+function logProgress(message: string): void {
+  console.log("Agent progress: " + message)
 }
