@@ -2,6 +2,7 @@ import { spawnSync } from "child_process"
 import fs from "fs"
 import os from "os"
 import path from "path"
+import { exportCases } from "../tools/export-cases-tool.js"
 import type {
   Diagnosis,
   ExecutionResult,
@@ -15,7 +16,7 @@ import type {
 const PACKAGE_PATTERN = /^\s*package\s+([A-Za-z_][\w.]*);/m
 const CLASS_PATTERN = /^\s*(?:public\s+)?(?:final\s+)?class\s+([A-Za-z_]\w*)/m
 const METHOD_PATTERN =
-  /^\s*(?:public|protected|private)?\s*(static\s+)?(?:final\s+)?([A-Za-z_][\w<>\[\], ?]*)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:throws\s+[^{]+)?\{/gm
+  /(?:^|[\n\r{;])\s*(?:public|protected|private)?\s*(static\s+)?(?:final\s+)?([A-Za-z_][\w<>\[\], ?]*)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:throws\s+[^{]+)?\{/gm
 
 export const javaAdapter: LanguageAdapter = {
   language: "java",
@@ -57,11 +58,13 @@ export const javaAdapter: LanguageAdapter = {
 
   buildGenerationContext({ analysis }) {
     return [
-      "语言：Java",
-      "测试框架：JUnit 5",
-      `类名：${analysis.moduleName}`,
-      analysis.packageName ? `包名：${analysis.packageName}` : "",
-      "可测试方法：",
+      "Language: Java",
+      "Test framework: JUnit 5",
+      `Class name: ${analysis.moduleName}`,
+      analysis.packageName ? `Package name: ${analysis.packageName}` : "Package name: default package",
+      "Runtime layout: source is copied to src/main/java and the generated test is copied to src/test/java using the same package path.",
+      `Import rule: generate tests for class ${analysis.moduleName}; use the package declaration only when Package name is not default package.`,
+      "Testable methods:",
       ...analysis.symbols.map((symbol) => {
         const params = symbol.params.map((param) => param.raw ?? `${param.type ?? ""} ${param.name ?? ""}`).join(", ")
         return `- ${symbol.isStatic ? "static " : ""}${symbol.returnType ?? "void"} ${symbol.name}(${params})`
@@ -94,14 +97,15 @@ function executeJavaTests(input: {
   timeoutSeconds: number
   analysis: SourceAnalysis
 }): ExecutionResult {
-  if (!commandAvailable("mvn", ["--version"])) {
+  const maven = resolveMavenCommand()
+  if (!maven) {
     return {
       status: "error",
       passed: 0,
       failed: 0,
       errors: 1,
       stdout: "",
-      stderr: "Maven 不在 PATH 中，请安装 Maven",
+      stderr: "Maven is not available. Provide MAVEN_HOME or add Maven bin to PATH.",
       exit_code: -1,
       duration_ms: 0,
       timeout: false,
@@ -121,12 +125,14 @@ function executeJavaTests(input: {
   fs.writeFileSync(path.join(tempDir, "pom.xml"), renderPom(), "utf-8")
 
   const started = Date.now()
-  const result = spawnSync("mvn", ["-q", "test"], {
+  const commandText = `${maven} -q test`
+  const result = spawnSync(maven, ["-q", "test"], {
     cwd: tempDir,
     encoding: "utf-8",
     timeout: input.timeoutSeconds * 1000,
     windowsHide: true,
     maxBuffer: 10 * 1024 * 1024,
+    shell: shouldUseShell(maven),
   })
   const duration = Date.now() - started
   const stdout = result.stdout ?? ""
@@ -136,18 +142,33 @@ function executeJavaTests(input: {
   const exitCode = typeof result.status === "number" ? result.status : -1
 
   if (timeout) {
-    return baseExecution("timeout", stdout, stderr || "Maven 测试执行超时", exitCode, duration, true, "mvn -q test", tempDir)
+    return baseExecution("timeout", stdout, stderr || "Maven test execution timed out", exitCode, duration, true, commandText, tempDir)
   }
 
   if (exitCode === 0) {
-    return baseExecution("passed", stdout, stderr, exitCode, duration, false, "mvn -q test", tempDir, 1, 0, 0)
+    const report = parseSurefireReports(tempDir)
+    return baseExecution("passed", stdout, stderr, exitCode, duration, false, commandText, tempDir, report.passed || 1, report.failed, report.errors, report.testResults)
   }
 
   const missing = inferJavaMissingDependencies(combined)
+  const report = parseSurefireReports(tempDir)
   const failures = Number(combined.match(/Failures:\s*(\d+)/)?.[1] ?? 0)
   const errors = Number(combined.match(/Errors:\s*(\d+)/)?.[1] ?? (missing.length ? 1 : 0))
   return {
-    ...baseExecution(failures > 0 ? "failed" : "error", stdout, stderr, exitCode, duration, false, "mvn -q test", tempDir, 0, failures, errors || 1),
+    ...baseExecution(
+      (report.failed || failures) > 0 ? "failed" : "error",
+      stdout,
+      stderr,
+      exitCode,
+      duration,
+      false,
+      commandText,
+      tempDir,
+      report.passed,
+      report.failed || failures,
+      report.errors || errors || 1,
+      report.testResults
+    ),
     missing_dependencies: missing.length ? missing : undefined,
   }
 }
@@ -241,9 +262,19 @@ function exportJavaArtifacts(input: {
     fs.writeFileSync(testPath, input.testCode, "utf-8")
     files.push(testPath)
   }
-  const reportPath = path.join(input.outputDir, `test_cases${suffix}.md`)
-  fs.writeFileSync(reportPath, renderReport(input), "utf-8")
-  files.push(reportPath)
+  const report = exportCases({
+    test_cases: input.testCases,
+    test_code: input.testCode,
+    output_dir: input.outputDir,
+    execution_result: input.executionResult,
+    diagnosis: input.diagnosis,
+    quality: input.quality,
+    coverage: input.coverage,
+    versions: input.versions,
+    artifact_prefix: input.artifactPrefix,
+    skip_py: true,
+  })
+  files.push(...report.exported_files)
   try {
     const sourceCopy = path.join(input.outputDir, path.basename(input.sourceFile))
     fs.copyFileSync(input.sourceFile, sourceCopy)
@@ -252,56 +283,6 @@ function exportJavaArtifacts(input: {
     // 忽略复制失败；导出的测试和报告仍可使用
   }
   return { exported_files: files }
-}
-
-function renderReport(input: {
-  testCases: TestCase[]
-  executionResult?: ExecutionResult
-  diagnosis?: Diagnosis
-  quality?: QualityResult
-  coverage?: unknown
-  versions?: unknown[]
-  analysis: SourceAnalysis
-}): string {
-  const rows = input.testCases
-    .map((item) => `| ${item.case_number} | ${item.related_symbol} | ${item.case_type} | ${item.title} | ${item.expected_result} |`)
-    .join("\n")
-  return [
-    "# Java 单元测试报告",
-    "",
-    "- 框架：JUnit 5",
-    `- 类名：${input.analysis.moduleName}`,
-    `- 测试通过：${input.executionResult?.status === "passed" ? "是" : "否"}`,
-    "",
-    "| 用例编号 | 符号 | 类型 | 标题 | 预期结果 |",
-    "| --- | --- | --- | --- | --- |",
-    rows,
-    "",
-    "## 执行结果",
-    "```json",
-    JSON.stringify(input.executionResult ?? null, null, 2),
-    "```",
-    "",
-    "## 质量检查",
-    "```json",
-    JSON.stringify(input.quality ?? null, null, 2),
-    "```",
-    "",
-    "## Coverage",
-    "```json",
-    JSON.stringify(input.coverage ?? null, null, 2),
-    "```",
-    "",
-    "## 诊断结果",
-    "",
-    input.diagnosis?.report_text ?? "```json\n" + JSON.stringify(input.diagnosis ?? null, null, 2) + "\n```",
-    "",
-    "## 版本记录",
-    "```json",
-    JSON.stringify(input.versions ?? [], null, 2),
-    "```",
-    "",
-  ].join("\n")
 }
 
 function parseJavaParams(raw: string): SourceSymbol["params"] {
@@ -371,14 +352,86 @@ function baseExecution(
   cwd: string,
   passed = 0,
   failed = 0,
-  errors = status === "error" ? 1 : 0
+  errors = status === "error" ? 1 : 0,
+  testResults?: unknown[]
 ): ExecutionResult {
-  return { status, passed, failed, errors, stdout, stderr, exit_code: exitCode, duration_ms: duration, timeout, command, cwd }
+  return { status, passed, failed, errors, stdout, stderr, exit_code: exitCode, duration_ms: duration, timeout, command, cwd, test_results: testResults }
+}
+
+function resolveMavenCommand(): string | undefined {
+  const candidates = [
+    "mvn",
+    process.env.MAVEN_HOME ? path.join(process.env.MAVEN_HOME, "bin", process.platform === "win32" ? "mvn.cmd" : "mvn") : undefined,
+    process.env.M2_HOME ? path.join(process.env.M2_HOME, "bin", process.platform === "win32" ? "mvn.cmd" : "mvn") : undefined,
+  ].filter((item): item is string => Boolean(item))
+
+  for (const candidate of candidates) {
+    if (commandAvailable(candidate, ["--version"])) return candidate
+  }
+  return undefined
+}
+
+function parseSurefireReports(tempDir: string): { passed: number; failed: number; errors: number; testResults: unknown[] } {
+  const reportDir = path.join(tempDir, "target", "surefire-reports")
+  if (!fs.existsSync(reportDir)) return { passed: 0, failed: 0, errors: 0, testResults: [] }
+
+  let passed = 0
+  let failed = 0
+  let errors = 0
+  const testResults: Array<Record<string, unknown>> = []
+
+  for (const file of fs.readdirSync(reportDir).filter((name) => name.endsWith(".xml"))) {
+    const xml = fs.readFileSync(path.join(reportDir, file), "utf-8")
+    for (const match of xml.matchAll(/<testcase\b([^>]*)>([\s\S]*?)<\/testcase>|<testcase\b([^>]*)\/>/g)) {
+      const attrs = parseXmlAttributes(match[1] ?? match[3] ?? "")
+      const body = match[2] ?? ""
+      const failure = body.match(/<(failure|error)\b([^>]*)>([\s\S]*?)<\/\1>/)
+      const skipped = /<skipped\b/.test(body)
+      const result = failure ? (failure[1] === "error" ? "error" : "failed") : skipped ? "skipped" : "passed"
+      if (result === "passed") passed += 1
+      else if (result === "failed") failed += 1
+      else if (result === "error") errors += 1
+      testResults.push({
+        test_class: attrs.classname ?? "",
+        test_name: attrs.name ?? "",
+        result,
+        duration_ms: Math.round(Number(attrs.time ?? 0) * 1000),
+        failure_reason: failure ? cleanXml(failure[3] || failure[2] || "") : "",
+      })
+    }
+  }
+
+  return { passed, failed, errors, testResults }
+}
+
+function parseXmlAttributes(raw: string): Record<string, string> {
+  const attrs: Record<string, string> = {}
+  for (const match of raw.matchAll(/([A-Za-z_:][-A-Za-z0-9_:.]*)="([^"]*)"/g)) {
+    attrs[match[1]] = cleanXml(match[2])
+  }
+  return attrs
+}
+
+function cleanXml(value: string): string {
+  return value
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim()
 }
 
 function commandAvailable(command: string, args: string[]): boolean {
-  const result = spawnSync(command, args, { encoding: "utf-8", windowsHide: true })
+  const result = spawnSync(command, args, { encoding: "utf-8", windowsHide: true, shell: shouldUseShell(command) })
   return !result.error
+}
+
+function shouldUseShell(command: string): boolean {
+  return process.platform === "win32" && /\.(cmd|bat)$/i.test(command)
 }
 
 function inferJavaMissingDependencies(output: string): string[] {
@@ -415,4 +468,3 @@ function safeName(value: string): string {
   const result = value.replace(/[^A-Za-z0-9_]/g, "_")
   return /^[A-Za-z_]/.test(result) ? result : `test_${result}`
 }
-

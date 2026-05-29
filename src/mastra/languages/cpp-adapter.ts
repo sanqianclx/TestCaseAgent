@@ -2,6 +2,7 @@ import { spawnSync } from "child_process"
 import fs from "fs"
 import os from "os"
 import path from "path"
+import { exportCases } from "../tools/export-cases-tool.js"
 import type {
   Diagnosis,
   ExecutionResult,
@@ -53,12 +54,15 @@ export const cppAdapter: LanguageAdapter = {
     }
   },
 
-  buildGenerationContext({ analysis }) {
+  buildGenerationContext({ analysis, sourceFile }) {
     return [
-      "语言：C++",
-      "测试框架：GoogleTest",
-      `模块名：${analysis.moduleName}`,
-      "可测试符号：",
+      "Language: C++",
+      "Test framework: GoogleTest",
+      `Module name: ${analysis.moduleName}`,
+      `Source filename available beside the generated test: ${sourceFile.split(/[\\/]/).pop()}`,
+      "Runtime layout: the source file and generated test file are copied into the same temporary directory before compilation.",
+      "Import rule: include the source file by its basename when needed, for example #include \"example.cpp\". Do not include unavailable project paths.",
+      "Testable symbols:",
       ...analysis.symbols.map((symbol) => {
         const params = symbol.params.map((param) => param.raw ?? `${param.type ?? ""} ${param.name ?? ""}`).join(", ")
         const owner = symbol.className ? `${symbol.className}::` : ""
@@ -224,9 +228,19 @@ function exportCppArtifacts(input: {
     fs.writeFileSync(testPath, input.testCode, "utf-8")
     files.push(testPath)
   }
-  const reportPath = path.join(input.outputDir, `test_cases${suffix}.md`)
-  fs.writeFileSync(reportPath, renderReport(input), "utf-8")
-  files.push(reportPath)
+  const report = exportCases({
+    test_cases: input.testCases,
+    test_code: input.testCode,
+    output_dir: input.outputDir,
+    execution_result: input.executionResult,
+    diagnosis: input.diagnosis,
+    quality: input.quality,
+    coverage: input.coverage,
+    versions: input.versions,
+    artifact_prefix: input.artifactPrefix,
+    skip_py: true,
+  })
+  files.push(...report.exported_files)
   try {
     const sourceCopy = path.join(input.outputDir, path.basename(input.sourceFile))
     fs.copyFileSync(input.sourceFile, sourceCopy)
@@ -235,56 +249,6 @@ function exportCppArtifacts(input: {
     // 忽略复制失败；导出的测试和报告仍可使用
   }
   return { exported_files: files }
-}
-
-function renderReport(input: {
-  testCases: TestCase[]
-  executionResult?: ExecutionResult
-  diagnosis?: Diagnosis
-  quality?: QualityResult
-  coverage?: unknown
-  versions?: unknown[]
-  analysis: SourceAnalysis
-}): string {
-  const rows = input.testCases
-    .map((item) => `| ${item.case_number} | ${item.related_symbol} | ${item.case_type} | ${item.title} | ${item.expected_result} |`)
-    .join("\n")
-  return [
-    "# C++ 单元测试报告",
-    "",
-    "- 框架：GoogleTest",
-    `- 模块名：${input.analysis.moduleName}`,
-    `- 测试通过：${input.executionResult?.status === "passed" ? "是" : "否"}`,
-    "",
-    "| 用例编号 | 符号 | 类型 | 标题 | 预期结果 |",
-    "| --- | --- | --- | --- | --- |",
-    rows,
-    "",
-    "## 执行结果",
-    "```json",
-    JSON.stringify(input.executionResult ?? null, null, 2),
-    "```",
-    "",
-    "## 质量检查",
-    "```json",
-    JSON.stringify(input.quality ?? null, null, 2),
-    "```",
-    "",
-    "## Coverage",
-    "```json",
-    JSON.stringify(input.coverage ?? null, null, 2),
-    "```",
-    "",
-    "## 诊断结果",
-    "",
-    input.diagnosis?.report_text ?? "```json\n" + JSON.stringify(input.diagnosis ?? null, null, 2) + "\n```",
-    "",
-    "## 版本记录",
-    "```json",
-    JSON.stringify(input.versions ?? [], null, 2),
-    "```",
-    "",
-  ].join("\n")
 }
 
 function parseCppParams(raw: string): SourceSymbol["params"] {
@@ -390,4 +354,3 @@ function safeName(value: string): string {
   const result = value.replace(/[^A-Za-z0-9_]/g, "_")
   return /^[A-Za-z_]/.test(result) ? result : `Generated_${result}`
 }
-

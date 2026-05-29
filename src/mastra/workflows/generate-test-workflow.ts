@@ -3,7 +3,7 @@ import fsp from "fs/promises"
 import path from "path"
 import { createStep, createWorkflow } from "@mastra/core/workflows"
 import { z } from "zod"
-import { diagnosisAgent, diagnosisAgentPro } from "../agents/diagnosis-agent.js"
+import { diagnosisAgent, diagnosisAgentPro, diagnosisDecisionAgent } from "../agents/diagnosis-agent.js"
 import { testCaseAgent } from "../agents/test-case-agent.js"
 import { testCodeAgent, testCodeAgentPro } from "../agents/test-code-agent.js"
 import { detectLanguage, getLanguageAdapter } from "../languages/registry.js"
@@ -113,6 +113,8 @@ const workflowOutputSchema = z.object({
   source_file: z.string(),
   language: supportedLanguageSchema,
   test_code: z.string(),
+  test_cases: z.array(testCaseSchema).optional(),
+  analysis: z.any().optional(),
   test_cases_count: z.number(),
   passed: z.boolean(),
   exported_files: z.array(z.string()),
@@ -266,99 +268,7 @@ const selfHealingStep = createStep({
   inputSchema: executionStepOutputSchema,
   outputSchema: finalStepOutputSchema,
   execute: async ({ inputData }) => {
-    const adapter = adapterFor(inputData.language)
-    logProgress("Running quality check, AI diagnosis, and self-healing decision")
-    let testCode = inputData.test_code
-    let executionResult = inputData.execution_result as ExecutionResult
-    let quality = adapter.checkQuality({ testCode, analysis: inputData.analysis as SourceAnalysis })
-    const coverage = calculateCoverage(inputData.test_cases, inputData.analysis as SourceAnalysis)
-    let diagnosis: Diagnosis | undefined
-    const versions: TestCodeVersion[] = [
-      createVersionRecord({
-        versionNo: 1,
-        attempt: inputData.attempt,
-        testCode,
-        executionResult,
-        quality,
-        note: "initial generation",
-      }),
-    ]
-
-    if (isPassed(executionResult, quality)) {
-      return finalize(inputData, testCode, executionResult, undefined, quality, coverage, versions)
-    }
-
-    for (let attempt = 2; attempt <= inputData.max_attempts; attempt += 1) {
-      diagnosis = await diagnoseFailure({
-        adapter,
-        sourceCode: inputData.source_code,
-        testCode,
-        testCases: inputData.test_cases,
-        executionResult,
-        quality,
-        analysis: inputData.analysis as SourceAnalysis,
-        sourceFile: inputData.source_file,
-        attempt,
-        llmRetries: inputData.llm_retries,
-      })
-
-      versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
-      if (diagnosis.diagnosis_type !== "TEST_CODE_ERROR" || diagnosis.confidence < 0.7) {
-        return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
-      }
-
-      logProgress(`Self-healing attempt ${attempt}: regenerating test code from AI diagnosis`)
-      testCode = await generateTestCode({
-        adapter,
-        sourceCode: inputData.source_code,
-        sourceFile: inputData.source_file,
-        filename: inputData.filename,
-        outputDir: inputData.output_dir,
-        analysis: inputData.analysis as SourceAnalysis,
-        testCases: inputData.test_cases,
-        attempt,
-        previousDiagnosis: diagnosis,
-        llmRetries: inputData.llm_retries,
-      })
-
-      executionResult = adapter.executeTests({
-        sourceCode: inputData.source_code,
-        sourceFile: inputData.source_file,
-        filename: inputData.filename,
-        testCode,
-        outputDir: inputData.output_dir,
-        timeoutSeconds: 60,
-        analysis: inputData.analysis as SourceAnalysis,
-      })
-      quality = adapter.checkQuality({ testCode, analysis: inputData.analysis as SourceAnalysis })
-      versions.push(createVersionRecord({
-        versionNo: versions.length + 1,
-        attempt,
-        testCode,
-        executionResult,
-        quality,
-        note: "self-healing regeneration",
-      }))
-
-      if (isPassed(executionResult, quality)) {
-        return finalize(inputData, testCode, executionResult, undefined, quality, coverage, versions)
-      }
-    }
-
-    diagnosis ??= await diagnoseFailure({
-      adapter,
-      sourceCode: inputData.source_code,
-      testCode,
-      testCases: inputData.test_cases,
-      executionResult,
-      quality,
-      analysis: inputData.analysis as SourceAnalysis,
-      sourceFile: inputData.source_file,
-      attempt: inputData.max_attempts,
-      llmRetries: inputData.llm_retries,
-    })
-    versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
-    return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
+    return await runSelfHealing(inputData, "initial generation")
   },
 })
 
@@ -368,6 +278,26 @@ const exportResultsStep = createStep({
   outputSchema: workflowOutputSchema,
   execute: async ({ inputData }) => {
     const adapter = adapterFor(inputData.language)
+    const diagnosis = inputData.diagnosis as Diagnosis | undefined
+    if (diagnosis?.next_action === "INSTALL_DEPENDENCY") {
+      logProgress("Workflow paused before final export because an environment or dependency action is needed")
+      return {
+        source_file: inputData.source_file,
+        language: inputData.language,
+        test_code: inputData.test_code,
+        test_cases: inputData.test_cases,
+        analysis: inputData.analysis,
+        test_cases_count: inputData.test_cases_count,
+        passed: inputData.passed,
+        exported_files: [],
+        execution_detail: inputData.execution_detail,
+        diagnosis: inputData.diagnosis,
+        quality: inputData.quality,
+        coverage: inputData.coverage,
+        versions: inputData.versions,
+      }
+    }
+
     logProgress("Exporting final test code, report, and version records")
     const exportResult = adapter.exportArtifacts({
       testCases: inputData.test_cases,
@@ -375,7 +305,7 @@ const exportResultsStep = createStep({
       outputDir: inputData.output_dir,
       sourceFile: inputData.source_file,
       executionResult: inputData.execution_detail as ExecutionResult,
-      diagnosis: inputData.diagnosis as Diagnosis | undefined,
+      diagnosis,
       quality: inputData.quality as QualityResult | undefined,
       coverage: inputData.coverage as CoverageResult | undefined,
       versions: inputData.versions as TestCodeVersion[] | undefined,
@@ -386,6 +316,8 @@ const exportResultsStep = createStep({
       source_file: inputData.source_file,
       language: inputData.language,
       test_code: inputData.test_code,
+      test_cases: inputData.test_cases,
+      analysis: inputData.analysis,
       test_cases_count: inputData.test_cases_count,
       passed: inputData.passed,
       exported_files: unique(exportResult.exported_files),
@@ -412,6 +344,197 @@ export const generateTestWorkflow = createWorkflow({
   .then(exportResultsStep)
   .commit()
 
+export async function resumeGeneratedTests(input: {
+  sourceFile: string
+  outputDir: string
+  language: SupportedLanguage
+  testCode: string
+  testCases: TestCase[]
+  maxAttempts: number
+  llmRetries: number
+}): Promise<z.infer<typeof workflowOutputSchema>> {
+  const adapter = adapterFor(input.language)
+  const sourceFile = path.resolve(input.sourceFile)
+  const outputDir = path.resolve(input.outputDir)
+  logProgress("Resuming from generated test code; skipping source parsing, test-case design, and test-code generation")
+  const sourceCode = await fsp.readFile(sourceFile, "utf-8")
+  const filename = path.basename(sourceFile)
+  const analysis = adapter.parseSource({ sourceCode, filename, sourceFile })
+  logProgress(`Re-executing tests with ${adapter.displayName} adapter`)
+  const executionResult = adapter.executeTests({
+    sourceCode,
+    sourceFile,
+    filename,
+    testCode: input.testCode,
+    outputDir,
+    timeoutSeconds: 60,
+    analysis,
+  })
+  const finalData = await runSelfHealing({
+    file_path: sourceFile,
+    output_dir: outputDir,
+    max_attempts: input.maxAttempts,
+    llm_retries: input.llmRetries,
+    language: input.language,
+    source_file: sourceFile,
+    source_code: sourceCode,
+    filename,
+    analysis,
+    test_cases: input.testCases,
+    test_code: input.testCode,
+    attempt: 1,
+    execution_result: executionResult,
+  }, "resumed generated test code")
+
+  if (finalData.diagnosis?.next_action === "INSTALL_DEPENDENCY") {
+    logProgress("Workflow remains paused before final export because an environment or dependency action is still needed")
+    return {
+      source_file: sourceFile,
+      language: input.language,
+      test_code: finalData.test_code,
+      test_cases: input.testCases,
+      analysis,
+      test_cases_count: input.testCases.length,
+      passed: false,
+      exported_files: [],
+      execution_detail: finalData.execution_detail,
+      diagnosis: finalData.diagnosis,
+      quality: finalData.quality,
+      coverage: finalData.coverage,
+      versions: finalData.versions,
+    }
+  }
+
+  logProgress("Exporting final test code, report, and version records")
+  const exportResult = adapter.exportArtifacts({
+    testCases: input.testCases,
+    testCode: finalData.test_code,
+    outputDir,
+    sourceFile,
+    executionResult: finalData.execution_detail as ExecutionResult,
+    diagnosis: finalData.diagnosis as Diagnosis | undefined,
+    quality: finalData.quality as QualityResult | undefined,
+    coverage: finalData.coverage as CoverageResult | undefined,
+    versions: finalData.versions as TestCodeVersion[] | undefined,
+    analysis,
+  })
+  copySourceToOutput(sourceFile, outputDir)
+  return {
+    source_file: sourceFile,
+    language: input.language,
+    test_code: finalData.test_code,
+    test_cases: input.testCases,
+    analysis,
+    test_cases_count: input.testCases.length,
+    passed: finalData.passed,
+    exported_files: unique(exportResult.exported_files),
+    execution_detail: finalData.execution_detail,
+    diagnosis: finalData.diagnosis,
+    quality: finalData.quality,
+    coverage: finalData.coverage,
+    versions: finalData.versions,
+  }
+}
+
+async function runSelfHealing(
+  inputData: z.infer<typeof executionStepOutputSchema>,
+  initialNote: string
+) {
+  const adapter = adapterFor(inputData.language)
+  logProgress("Running quality check, AI diagnosis, and self-healing decision")
+  let testCode = inputData.test_code
+  let executionResult = inputData.execution_result as ExecutionResult
+  let quality = adapter.checkQuality({ testCode, analysis: inputData.analysis as SourceAnalysis })
+  const coverage = calculateCoverage(inputData.test_cases, inputData.analysis as SourceAnalysis)
+  let diagnosis: Diagnosis | undefined
+  const versions: TestCodeVersion[] = [
+    createVersionRecord({
+      versionNo: 1,
+      attempt: inputData.attempt,
+      testCode,
+      executionResult,
+      quality,
+      note: initialNote,
+    }),
+  ]
+
+  if (isPassed(executionResult, quality)) {
+    return finalize(inputData, testCode, executionResult, undefined, quality, coverage, versions)
+  }
+
+  for (let attempt = 2; attempt <= inputData.max_attempts; attempt += 1) {
+    diagnosis = await diagnoseFailure({
+      adapter,
+      sourceCode: inputData.source_code,
+      testCode,
+      testCases: inputData.test_cases,
+      executionResult,
+      quality,
+      analysis: inputData.analysis as SourceAnalysis,
+      sourceFile: inputData.source_file,
+      attempt,
+      llmRetries: inputData.llm_retries,
+    })
+
+    versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
+    if (diagnosis.diagnosis_type !== "TEST_CODE_ERROR" || diagnosis.confidence < 0.7) {
+      return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
+    }
+
+    logProgress(`Self-healing attempt ${attempt}: regenerating test code from AI diagnosis`)
+    testCode = await generateTestCode({
+      adapter,
+      sourceCode: inputData.source_code,
+      sourceFile: inputData.source_file,
+      filename: inputData.filename,
+      outputDir: inputData.output_dir,
+      analysis: inputData.analysis as SourceAnalysis,
+      testCases: inputData.test_cases,
+      attempt,
+      previousDiagnosis: diagnosis,
+      llmRetries: inputData.llm_retries,
+    })
+
+    executionResult = adapter.executeTests({
+      sourceCode: inputData.source_code,
+      sourceFile: inputData.source_file,
+      filename: inputData.filename,
+      testCode,
+      outputDir: inputData.output_dir,
+      timeoutSeconds: 60,
+      analysis: inputData.analysis as SourceAnalysis,
+    })
+    quality = adapter.checkQuality({ testCode, analysis: inputData.analysis as SourceAnalysis })
+    versions.push(createVersionRecord({
+      versionNo: versions.length + 1,
+      attempt,
+      testCode,
+      executionResult,
+      quality,
+      note: "self-healing regeneration",
+    }))
+
+    if (isPassed(executionResult, quality)) {
+      return finalize(inputData, testCode, executionResult, undefined, quality, coverage, versions)
+    }
+  }
+
+  diagnosis ??= await diagnoseFailure({
+    adapter,
+    sourceCode: inputData.source_code,
+    testCode,
+    testCases: inputData.test_cases,
+    executionResult,
+    quality,
+    analysis: inputData.analysis as SourceAnalysis,
+    sourceFile: inputData.source_file,
+    attempt: inputData.max_attempts,
+    llmRetries: inputData.llm_retries,
+  })
+  versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
+  return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
+}
+
 async function generateTestCases(input: {
   adapter: LanguageAdapter
   sourceCode: string
@@ -429,6 +552,7 @@ async function generateTestCases(input: {
 
     for (const [batchIndex, symbols] of effectiveBatches.entries()) {
       if (requestedCaseLimit !== undefined && allCases.length >= requestedCaseLimit) break
+      const remainingGlobalLimit = requestedCaseLimit === undefined ? undefined : Math.max(0, requestedCaseLimit - allCases.length)
       const batchAnalysis: SourceAnalysis = { ...input.analysis, symbols }
       renderProgressBar("Designing test cases", batchIndex, effectiveBatches.length)
       const batchCases = await withLlmRetries("test-case batch " + (batchIndex + 1) + "/" + effectiveBatches.length, input.llmRetries, async () => {
@@ -444,11 +568,16 @@ async function generateTestCases(input: {
           "- Division/modulo code must include a zero divisor case.",
           "- Recursive code must include base-case and invalid-input cases.",
           "- A function name containing safe should be tested under unsafe/error inputs.",
+          "- Generate enough cases for meaningful coverage; do not reduce coverage just to keep the response short.",
+          "- Use compact JSON and concise strings so long batches can still be received completely.",
           "- Do not assume the source is correct only because it runs.",
           "- input_params keys must exactly match parameter names.",
           "- expected_result must be concrete.",
+          "- Keep titles, steps, and expected_result concise so the JSON remains complete.",
           "- Omit optional fields instead of writing null.",
           "- Global test case limit: " + (requestedCaseLimit ?? "none") + ".",
+          "- Remaining global case limit for this batch: " + (remainingGlobalLimit ?? "none") + ".",
+          "- If there is no global limit, generate all useful cases for the listed symbol.",
           "",
           "Expected JSON example:",
           JSON.stringify({ cases: [{ case_number: "TC-001", title: "specific title", case_type: "functional|boundary|exception", preconditions: "setup", steps: ["step"], input_params: { param: "value" }, expected_result: "specific expected behavior", related_symbol: "symbol name" }] }, null, 2),
@@ -464,20 +593,11 @@ async function generateTestCases(input: {
           sourceExcerptForSymbols(input.sourceCode, symbols),
           fence,
         ].join("\n")
-        const response = await testCaseAgent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 4096 } })
-
-        const parsed = parseJsonValue(response.text)
-        const result = testCaseBatchSchema.safeParse(parsed)
-        if (!result.success) {
-          throw new Error("Invalid test-case JSON: " + formatZodIssues(result.error.issues) + ". Preview: " + preview(response.text))
-        }
-        if (result.data.cases.length === 0) {
-          throw new Error("LLM returned an empty case list. Preview: " + preview(response.text))
-        }
-        return result.data.cases
+        const response = await testCaseAgent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 12000 } })
+        return await parseTestCaseBatch(response.text, input.llmRetries, prompt)
       })
-      const remaining = requestedCaseLimit === undefined ? batchCases.length : requestedCaseLimit - allCases.length
-      allCases.push(...batchCases.slice(0, Math.max(0, remaining)))
+      const acceptedCases = remainingGlobalLimit === undefined ? batchCases : batchCases.slice(0, remainingGlobalLimit)
+      allCases.push(...acceptedCases)
       renderProgressBar("Designing test cases", batchIndex + 1, effectiveBatches.length)
     }
     finishProgressBar()
@@ -612,10 +732,55 @@ async function diagnoseFailure(input: {
       if (!text) throw new Error("LLM returned an empty diagnosis.")
       return text
     })
-    return makeDiagnosisDecision(reportText, input.executionResult, input.quality)
+    const decision = await classifyDiagnosisDecision(reportText, input)
+    return { ...decision, report_text: reportText }
   } catch (error) {
     throw new Error("LLM failure diagnosis failed; stopped instead of using fallback. " + formatError(error))
   }
+}
+
+async function classifyDiagnosisDecision(
+  reportText: string,
+  input: {
+    adapter: LanguageAdapter
+    executionResult: ExecutionResult
+    quality: QualityResult
+    analysis: SourceAnalysis
+    sourceFile: string
+    attempt: number
+    llmRetries: number
+  }
+): Promise<Diagnosis> {
+  const prompt = [
+    "Convert this unit-test failure diagnosis into the required internal JSON decision.",
+    "Return only valid JSON. Do not add Markdown.",
+    "",
+    "Natural-language diagnosis:",
+    reportText,
+    "",
+    "Execution result:",
+    JSON.stringify(input.executionResult, null, 2),
+    "",
+    "Quality result:",
+    JSON.stringify(input.quality, null, 2),
+    "",
+    "Language: " + input.adapter.displayName,
+    "Test framework: " + input.adapter.testFramework,
+    "Attempt: " + input.attempt,
+    "Source/test context:",
+    input.adapter.buildGenerationContext({ analysis: input.analysis, sourceFile: input.sourceFile }),
+  ].join("\n")
+
+  return await withLlmRetries("failure diagnosis decision attempt " + input.attempt, input.llmRetries, async () => {
+    const response = await diagnosisDecisionAgent.generate(prompt, {
+      modelSettings: { temperature: 0, maxOutputTokens: 2048 },
+    })
+    const parsed = diagnosisSchema.safeParse(parseJsonValue(response.text))
+    if (!parsed.success) {
+      throw new Error("Invalid diagnosis decision JSON: " + parsed.error.message + ". Preview: " + preview(response.text))
+    }
+    return parsed.data as Diagnosis
+  })
 }
 
 
@@ -721,6 +886,129 @@ export function setLlmRetriesExhaustedHandler(
 
 let llmRetriesExhaustedHandler: null | ((label: string, errorText: string) => Promise<number>) = null
 
+async function parseTestCaseBatch(text: string, llmRetries: number, originalPrompt?: string): Promise<TestCase[]> {
+  try {
+    return validateTestCaseBatch(text)
+  } catch (error) {
+    if (originalPrompt && isIncompleteJsonError(error)) {
+      logProgress("Test-case JSON looks truncated; asking LLM to continue from the cutoff.")
+      try {
+        const continued = await continueTestCaseJson(text, originalPrompt, llmRetries)
+        return validateTestCaseBatch(continued)
+      } catch (continuationError) {
+        logProgress("Continuation did not produce complete JSON; falling back to JSON repair. Reason: " + formatError(continuationError))
+      }
+    }
+
+    logProgress("Repairing invalid test-case JSON with LLM. Reason: " + formatError(error))
+    return await withLlmRetries("test-case JSON repair", Math.min(llmRetries, 1), async () => {
+      const repairPrompt = [
+        "The previous response was intended to be JSON for unit test cases, but it was invalid or incomplete.",
+        "Repair it into one compact, valid JSON object only.",
+        "Do not add Markdown. Do not add explanations.",
+        "Every case must contain: case_number, title, case_type, preconditions, steps, input_params, expected_result, related_symbol.",
+        "If preconditions are missing, use \"none\".",
+        "If steps are missing, infer a short step from the input parameters.",
+        "Keep the original intent and do not invent unrelated symbols.",
+        "",
+        "Required shape:",
+        JSON.stringify({ cases: [{ case_number: "TC-001", title: "specific title", case_type: "functional", preconditions: "none", steps: ["call function"], input_params: {}, expected_result: "specific expected behavior", related_symbol: "symbol" }] }, null, 2),
+        "",
+        "Invalid or incomplete response:",
+        text,
+      ].join("\n")
+      const response = await testCaseAgent.generate(repairPrompt, { modelSettings: { temperature: 0, maxOutputTokens: 12000 } })
+      return validateTestCaseBatch(response.text)
+    })
+  }
+}
+
+function validateTestCaseBatch(text: string): TestCase[] {
+  const parsed = parseJsonValue(text)
+  const result = testCaseBatchSchema.safeParse(parsed)
+  if (!result.success) {
+    throw new Error("Invalid test-case JSON: " + formatZodIssues(result.error.issues) + ". Preview: " + preview(text))
+  }
+  if (result.data.cases.length === 0) {
+    throw new Error("LLM returned an empty case list. Preview: " + preview(text))
+  }
+  return result.data.cases
+}
+
+async function continueTestCaseJson(partialText: string, originalPrompt: string, llmRetries: number): Promise<string> {
+  let combined = partialText
+  const rounds = Math.max(2, Math.min(6, llmRetries + 3))
+
+  for (let round = 1; round <= rounds; round += 1) {
+    const continuation = await withLlmRetries("test-case JSON continuation " + round + "/" + rounds, Math.min(llmRetries, 1), async () => {
+      const prompt = [
+        "Your previous unit-test JSON response was truncated before the JSON value was complete.",
+        "Continue from the exact cutoff point so that the final concatenated text becomes one valid JSON object.",
+        "Do not restart from the beginning unless you choose to return the whole corrected JSON object.",
+        "Do not use Markdown. Do not explain.",
+        "",
+        "Original task:",
+        originalPrompt,
+        "",
+        "Partial response received so far:",
+        combined,
+      ].join("\n")
+      const response = await testCaseAgent.generate(prompt, {
+        modelSettings: { temperature: 0, maxOutputTokens: 12000 },
+      })
+      return response.text
+    })
+
+    for (const candidate of continuationCandidates(combined, continuation)) {
+      try {
+        validateTestCaseBatch(candidate)
+        return candidate
+      } catch {
+        // try next candidate
+      }
+    }
+
+    combined = appendWithOverlap(combined, stripMarkdownFence(continuation))
+    try {
+      validateTestCaseBatch(combined)
+      return combined
+    } catch (error) {
+      if (!isIncompleteJsonError(error)) throw error
+    }
+  }
+
+  return combined
+}
+
+function continuationCandidates(prefix: string, suffix: string): string[] {
+  const cleanSuffix = stripMarkdownFence(suffix)
+  return unique([
+    appendWithOverlap(prefix, cleanSuffix),
+    prefix + cleanSuffix,
+    prefix + "\n" + cleanSuffix,
+    cleanSuffix,
+  ])
+}
+
+function stripMarkdownFence(text: string): string {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+  return fenced ? fenced[1] : text
+}
+
+function appendWithOverlap(prefix: string, suffix: string): string {
+  const max = Math.min(prefix.length, suffix.length, 4000)
+  for (let size = max; size > 0; size -= 1) {
+    if (prefix.endsWith(suffix.slice(0, size))) {
+      return prefix + suffix.slice(size)
+    }
+  }
+  return prefix + suffix
+}
+
+function isIncompleteJsonError(error: unknown): boolean {
+  return formatError(error).includes("No complete JSON value found")
+}
+
 function calculateCoverage(testCases: TestCase[], analysis: SourceAnalysis): CoverageResult {
   const normalizedSymbols = new Map<string, string>()
   for (const symbol of analysis.symbols) {
@@ -764,69 +1052,6 @@ function normalizeSymbolName(value: string): string {
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100
-}
-
-function makeDiagnosisDecision(reportText: string, executionResult: ExecutionResult, quality: QualityResult): Diagnosis {
-  const combined = (reportText + "\n" + executionResult.stdout + "\n" + executionResult.stderr).toLowerCase()
-  if (/pytest|junit|maven|g\+\+|compiler|dependency|not installed|missing package|no module named ['"]pytest/.test(combined)) {
-    return {
-      diagnosis_type: "ENVIRONMENT_ERROR",
-      confidence: 0.75,
-      summary: firstLine(reportText),
-      evidence: ["The natural-language diagnosis indicates a missing tool, framework, or dependency."],
-      report_text: reportText,
-      next_action: "INSTALL_DEPENDENCY",
-      suggested_commands: extractLikelyCommands(reportText),
-    }
-  }
-  if (/generated test|test code|wrong import|import path|fixture|syntax error|cannot find symbol|no matching function|not declared/.test(combined) || quality.issues.length > 0) {
-    return {
-      diagnosis_type: "TEST_CODE_ERROR",
-      confidence: 0.78,
-      summary: firstLine(reportText),
-      evidence: ["The natural-language diagnosis points to generated test code or test quality problems."],
-      report_text: reportText,
-      next_action: "REGENERATE_TEST_CODE",
-    }
-  }
-  if (/source bug|source code|implementation bug|division by zero|index error|recursion|infinite|null pointer|overflow|defect/.test(combined)) {
-    return {
-      diagnosis_type: "SOURCE_RUNTIME_ERROR",
-      confidence: 0.78,
-      summary: firstLine(reportText),
-      evidence: ["The natural-language diagnosis points to a source-code defect."],
-      report_text: reportText,
-      next_action: "REPORT_TO_USER",
-    }
-  }
-  if (executionResult.failed > 0) {
-    return {
-      diagnosis_type: "BEHAVIOR_MISMATCH",
-      confidence: 0.65,
-      summary: firstLine(reportText),
-      evidence: ["Tests executed but assertions failed; the report should be reviewed against requirements."],
-      report_text: reportText,
-      next_action: "ASK_USER_CONFIRMATION",
-    }
-  }
-  return {
-    diagnosis_type: "UNKNOWN",
-    confidence: 0.5,
-    summary: firstLine(reportText),
-    evidence: ["The natural-language diagnosis did not provide enough evidence for an automatic action."],
-    report_text: reportText,
-    next_action: "REPORT_TO_USER",
-  }
-}
-
-function firstLine(text: string): string {
-  return text.split(/\r?\n/).map((line) => line.trim()).find(Boolean)?.slice(0, 220) ?? "AI diagnosis completed."
-}
-
-function extractLikelyCommands(text: string): string[] | undefined {
-  const pattern = new RegExp("\\x60([^\\x60]*(?:pip|npm|mvn|gradle|conda|winget|choco|vcpkg|apt|brew|g\\+\\+|javac)[^\\x60]*)\\x60", "gi")
-  const commands = [...text.matchAll(pattern)].map((match) => match[1].trim()).filter(Boolean)
-  return commands.length ? [...new Set(commands)].slice(0, 3) : undefined
 }
 
 function parseJsonValue(text: string): unknown {

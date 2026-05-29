@@ -3,12 +3,22 @@ import path from "path"
 import readline from "readline/promises"
 import { stdin as input, stdout as output } from "process"
 import { canUseLLM, formatError, getLlmUnavailableReason, loadProjectEnv } from "./mastra/runtime/env.js"
-import { cliConversationAgent, cliIntentAgent } from "./mastra/agents/cli-conversation-agent.js"
-import { generateTestWorkflow, setLlmRetriesExhaustedHandler } from "./mastra/workflows/generate-test-workflow.js"
+import { cliConversationAgent, cliFollowupAgent, cliIntentAgent } from "./mastra/agents/cli-conversation-agent.js"
+import { generateTestWorkflow, resumeGeneratedTests, setLlmRetriesExhaustedHandler } from "./mastra/workflows/generate-test-workflow.js"
 import { detectLanguage, type SupportedLanguage } from "./mastra/languages/registry.js"
 import { assessCommandRisk, runCommandInVisibleTerminal } from "./mastra/runtime/command-runner.js"
 import { memoryStore } from "./mastra/memory/in-memory-store.js"
 import { getSessionState, updateSessionState } from "./mastra/memory/session-state.js"
+
+type WorkflowResult = {
+  source_file: string
+  language: SupportedLanguage
+  test_code: string
+  test_cases?: unknown[]
+  test_cases_count: number
+  diagnosis?: { next_action?: string; report_text?: string; summary?: string; suggested_commands?: string[] }
+  [key: string]: unknown
+}
 
 type CliArgs = {
   input?: string
@@ -28,6 +38,7 @@ type PendingPlan = {
   maxAttempts: number
   llmRetries: number
   requirementsText?: string
+  env?: Record<string, string>
 }
 
 type PendingCommand = {
@@ -35,11 +46,16 @@ type PendingCommand = {
   cwd: string
   reason: string
   plan?: PendingPlan
+  pausedResult?: WorkflowResult
 }
 
-type PendingRetry = {
+type PendingFollowup = {
   plan: PendingPlan
-  nextMaxAttempts: number
+  reason: string
+  diagnosis?: unknown
+  suggestedCommand?: string
+  nextMaxAttempts?: number
+  pausedResult?: WorkflowResult
 }
 
 type AgentDecision = {
@@ -60,11 +76,19 @@ type PendingIntent = {
   reply?: string
 }
 
+type FollowupDecision = {
+  action: "answer" | "continue" | "run_command" | "update_env" | "update_plan" | "cancel" | "exit"
+  reply?: string
+  command?: string
+  env?: Record<string, string>
+  plan?: AgentDecision["plan"]
+}
+
 type ConversationState =
   | { mode: "idle" }
   | { mode: "awaiting_plan_confirmation"; plan: PendingPlan }
   | { mode: "awaiting_command_confirmation"; command: PendingCommand }
-  | { mode: "awaiting_retry_confirmation"; retry: PendingRetry }
+  | { mode: "awaiting_followup"; followup: PendingFollowup }
   | { mode: "exit" }
 
 async function main(): Promise<void> {
@@ -119,6 +143,13 @@ async function runInteractive(args: CliArgs): Promise<void> {
       if (!line) continue
       memoryStore.addMessage(sessionId, "user", line)
 
+      if (state.mode === "awaiting_followup") {
+        const decision = await askFollowupAgent(line, sessionId, state.followup, args)
+        state = await applyFollowupDecision(decision, state.followup, sessionId)
+        if (state.mode === "exit") break
+        continue
+      }
+
       if (state.mode === "awaiting_command_confirmation") {
         const intent = await askPendingIntent(line, sessionId, state, args)
         if (intent.intent === "exit") {
@@ -128,9 +159,10 @@ async function runInteractive(args: CliArgs): Promise<void> {
         if (intent.intent === "confirm") {
           const commandResult = await runVisibleCommand(state.command, sessionId)
           if (state.command.plan && commandResult.exitCode === 0) {
-            console.log("Agent: command finished successfully. Continuing the same workflow now.")
-            const result = await runGeneration({ ...state.command.plan, sessionId, interactive: true })
-            state = await maybeAskNextAction(result, state.command.plan, sessionId)
+            console.log("Agent: command finished successfully. Continuing the paused workflow now.")
+            state = state.command.pausedResult
+              ? await resumePausedWorkflow(state.command.pausedResult, state.command.plan, sessionId)
+              : await maybeAskNextAction(await runGeneration({ ...state.command.plan, sessionId, interactive: true }), state.command.plan, sessionId)
             continue
           }
           if (state.command.plan) {
@@ -145,25 +177,6 @@ async function runInteractive(args: CliArgs): Promise<void> {
           continue
         }
         state = { mode: "idle" }
-        continue
-      }
-
-      if (state.mode === "awaiting_retry_confirmation") {
-        const intent = await askPendingIntent(line, sessionId, state, args)
-        if (intent.intent === "exit") {
-          console.log("Agent: bye.")
-          break
-        }
-        if (intent.intent === "confirm") {
-          const retryPlan = { ...state.retry.plan, maxAttempts: state.retry.nextMaxAttempts }
-          const result = await runGeneration({ ...retryPlan, sessionId, interactive: true })
-          state = await maybeAskNextAction(result, retryPlan, sessionId)
-        } else if (intent.intent === "cancel") {
-          console.log("Agent: okay, I will stop retrying and keep the current report.")
-          state = { mode: "idle" }
-        } else {
-          console.log(`Agent: ${intent.reply ?? "I need your decision on whether to continue retrying."}`)
-        }
         continue
       }
 
@@ -297,6 +310,85 @@ ${userMessage}
   })
 }
 
+async function askFollowupAgent(
+  userMessage: string,
+  sessionId: string,
+  followup: PendingFollowup,
+  args: CliArgs
+): Promise<FollowupDecision> {
+  if (!canUseLLM()) {
+    return {
+      action: "answer",
+      reply: `LLM is not connected, so I cannot understand this reply. Reason: ${getLlmUnavailableReason()}`,
+    }
+  }
+
+  return await withRetries("workflow follow-up", args.llmRetries, async () => {
+    const response = await cliFollowupAgent.generate(`
+The unit-test generation workflow is paused and waiting for the user.
+Interpret the user's latest reply and choose the next generic action.
+Do not execute anything.
+
+Return only valid JSON:
+{
+  "action": "answer" | "continue" | "run_command" | "update_env" | "update_plan" | "cancel" | "exit",
+  "reply": "short message for the user",
+  "command": "shell command, only when action is run_command",
+  "env": { "NAME": "value", "PATH_PREPEND": "optional path to prepend" },
+  "plan": {
+    "file_path": "optional",
+    "output_dir": "optional",
+    "language": "auto|python|java|cpp, optional",
+    "max_attempts": 3,
+    "llm_retries": 2,
+    "requirements_text": "optional"
+  }
+}
+
+Paused workflow context:
+${JSON.stringify(followup, null, 2)}
+
+Conversation memory:
+${memoryStore.summarize(sessionId)}
+
+Latest user reply:
+${userMessage}
+`, { modelSettings: { temperature: 0, maxOutputTokens: 2048 } })
+    return parseFollowupDecisionStrict(response.text)
+  })
+}
+
+async function askRetryExtensionWithAI(label: string, errorText: string, llmRetries: number): Promise<number> {
+  const ql = readline.createInterface({ input, output })
+  try {
+    while (true) {
+      console.log(`\nLLM call "${label}" has exhausted its retry limit.`)
+      console.log(`Last error: ${errorText}`)
+      const answer = await ql.question("Do you want to add 3 more retries? ")
+      const intent = await withRetries("retry-extension intent classification", llmRetries, async () => {
+        const response = await cliIntentAgent.generate([
+          "Classify whether the user wants to add 3 more LLM retries.",
+          "Return only JSON:",
+          "{\"intent\":\"confirm|cancel|exit|other\",\"reply\":\"optional short reply\"}",
+          "",
+          "Pending question: add 3 more retries for " + label,
+          "Last error: " + errorText,
+          "User reply: " + answer,
+        ].join("\n"), { modelSettings: { temperature: 0, maxOutputTokens: 512 } })
+        return parsePendingIntentStrict(response.text)
+      })
+      if (intent.intent === "confirm") return 3
+      if (intent.intent === "cancel" || intent.intent === "exit") {
+        console.log("Agent: okay, I will stop retrying and report the failure.")
+        return 0
+      }
+      console.log(`Agent: ${intent.reply ?? "I need a clear decision before adding retries."}`)
+    }
+  } finally {
+    ql.close()
+  }
+}
+
 async function applyDecision(
   decision: AgentDecision,
   sessionId: string,
@@ -340,6 +432,7 @@ async function runGeneration(inputData: {
   llmRetries: number
   requirementsText?: string
   language?: string
+  env?: Record<string, string>
   sessionId: string
   interactive?: boolean
 }) {
@@ -357,16 +450,10 @@ async function runGeneration(inputData: {
 
   console.log("Agent: confirmed. Starting test generation and printing each step.")
 
+  const restoreEnv = applyTemporaryEnv(inputData.env)
   if (inputData.interactive) {
     setLlmRetriesExhaustedHandler(async (label: string, errorText: string) => {
-      const ql = readline.createInterface({ input, output })
-      console.log(`\nLLM 调用 "${label}" 的重试次数已耗尽。`)
-      console.log(`最后一次错误：${errorText}`)
-      const answer = await ql.question("要额外增加 3 次重试吗？输入 yes/no：")
-      ql.close()
-      if (/^(yes|y|是|好|继续|确认)$/i.test(answer.trim())) return 3
-      console.log("好的，不再重试，生成将结束并报错。")
-      return 0
+      return askRetryExtensionWithAI(label, errorText, inputData.llmRetries)
     })
   }
 
@@ -406,6 +493,15 @@ async function runGeneration(inputData: {
       exportedFiles: outputData.exported_files,
     })
 
+    if (inputData.interactive && outputData.diagnosis?.next_action === "INSTALL_DEPENDENCY") {
+      console.log("Agent: workflow paused during test execution.")
+      console.log(`- Language: ${outputData.language}`)
+      console.log(`- Test cases designed: ${outputData.test_cases_count}`)
+      console.log("- AI diagnosis:")
+      console.log(outputData.diagnosis.report_text ?? outputData.diagnosis.summary ?? "Environment or dependency action is needed.")
+      return outputData
+    }
+
     console.log("Agent: task finished.")
     console.log(`- Language: ${outputData.language}`)
     console.log(`- Tests passed: ${outputData.passed ? "yes" : "no"}`)
@@ -424,6 +520,7 @@ async function runGeneration(inputData: {
     return outputData
   } finally {
     setLlmRetriesExhaustedHandler(null)
+    restoreEnv()
   }
 }
 
@@ -435,45 +532,153 @@ async function maybeAskNextAction(
   const diagnosis = result?.diagnosis
   const command = diagnosis?.suggested_commands?.[0]
 
-  if (diagnosis?.next_action === "INSTALL_DEPENDENCY" && command) {
-    if (!looksExecutableCommand(command)) {
-      console.log("Agent: AI diagnosis says an environment action is needed, but it is not a shell command.")
-      console.log(`Manual action: ${command}`)
-      console.log("After you finish it, type confirm and I will continue the same plan.")
-      return { mode: "awaiting_plan_confirmation", plan }
-    }
-
-    const risk = assessCommandRisk(command)
-    console.log("Agent: AI diagnosis says an environment or dependency command is needed.")
-    console.log(`Command: ${command}`)
-    console.log(`Evidence: ${diagnosis.evidence.join("; ")}`)
-    console.log(`Risk: ${risk.level}`)
-    for (const reason of risk.reasons) console.log(`- ${reason}`)
-    console.log("Allow me to open a new PowerShell window to run it?")
-    memoryStore.addMessage(sessionId, "agent", `waiting command confirmation: ${command}`)
-
+  if (diagnosis?.next_action === "INSTALL_DEPENDENCY") {
+    console.log("Agent: workflow is paused because the AI diagnosis says an environment or dependency action is needed.")
+    if (command) console.log(`Suggested action: ${command}`)
+    console.log("You can provide a tool path, ask me to run a command, say you fixed it, change the plan, or cancel.")
+    memoryStore.addMessage(sessionId, "agent", "workflow paused for follow-up", { diagnosis, command })
     return {
-      mode: "awaiting_command_confirmation",
-      command: {
-        command,
-        cwd: path.dirname(plan.filePath),
-        reason: diagnosis.evidence.join("; "),
+      mode: "awaiting_followup",
+      followup: {
         plan,
+        reason: "environment_or_dependency_action_needed",
+        diagnosis,
+        suggestedCommand: command,
+        pausedResult: result,
       },
     }
   }
 
   if (result && !result.passed && diagnosis?.next_action === "REGENERATE_TEST_CODE") {
     const nextMaxAttempts = plan.maxAttempts + 2
-    console.log(`Agent: retry limit reached at ${plan.maxAttempts}. AI still thinks the generated test code is wrong.`)
-    console.log(`Do you want me to continue with ${nextMaxAttempts} total attempts?`)
+    console.log(`Agent: workflow is paused at retry limit ${plan.maxAttempts}. AI still thinks generated test code should be repaired.`)
+    console.log(`You can continue with more attempts, change the plan, or cancel.`)
     return {
-      mode: "awaiting_retry_confirmation",
-      retry: { plan, nextMaxAttempts },
+      mode: "awaiting_followup",
+      followup: {
+        plan,
+        reason: "self_healing_retry_limit_reached",
+        diagnosis,
+        nextMaxAttempts,
+        pausedResult: result,
+      },
     }
   }
 
   return { mode: "idle" }
+}
+
+async function applyFollowupDecision(
+  decision: FollowupDecision,
+  followup: PendingFollowup,
+  sessionId: string
+): Promise<ConversationState> {
+  if (decision.action === "answer") {
+    console.log(`Agent: ${decision.reply ?? "I am waiting for your next instruction."}`)
+    return { mode: "awaiting_followup", followup }
+  }
+
+  if (decision.action === "cancel") {
+    console.log(`Agent: ${decision.reply ?? "Okay, I will stop this paused workflow."}`)
+    return { mode: "idle" }
+  }
+
+  if (decision.action === "exit") {
+    console.log(`Agent: ${decision.reply ?? "bye."}`)
+    return { mode: "exit" }
+  }
+
+  if (decision.action === "run_command") {
+    const command = decision.command?.trim()
+    if (!command || !looksExecutableCommand(command)) {
+      console.log(`Agent: ${decision.reply ?? "I need a concrete shell command before I can ask for execution permission."}`)
+      return { mode: "awaiting_followup", followup }
+    }
+    const risk = assessCommandRisk(command)
+    console.log(`Agent: ${decision.reply ?? "I can run this command in a visible PowerShell window."}`)
+    console.log(`Command: ${command}`)
+    console.log(`Risk: ${risk.level}`)
+    for (const reason of risk.reasons) console.log(`- ${reason}`)
+    console.log("Allow me to open a new PowerShell window to run it?")
+    return {
+      mode: "awaiting_command_confirmation",
+      command: {
+        command,
+        cwd: path.dirname(followup.plan.filePath),
+        reason: followup.reason,
+        plan: followup.plan,
+        pausedResult: followup.pausedResult,
+      },
+    }
+  }
+
+  const updatedPlan = decision.action === "update_plan"
+    ? applyPlanDelta(followup.plan, decision.plan)
+    : decision.action === "update_env"
+      ? { ...followup.plan, env: mergeEnv(followup.plan.env, decision.env) }
+      : followup.nextMaxAttempts && followup.reason === "self_healing_retry_limit_reached"
+        ? { ...followup.plan, maxAttempts: followup.nextMaxAttempts }
+        : followup.plan
+
+  console.log(`Agent: ${decision.reply ?? "I will continue the same workflow now."}`)
+  if (followup.pausedResult && followup.reason === "environment_or_dependency_action_needed" && decision.action !== "update_plan") {
+    return await resumePausedWorkflow(followup.pausedResult, updatedPlan, sessionId)
+  }
+  const result = await runGeneration({ ...updatedPlan, sessionId, interactive: true })
+  return await maybeAskNextAction(result, updatedPlan, sessionId)
+}
+
+async function resumePausedWorkflow(
+  pausedResult: WorkflowResult,
+  plan: PendingPlan,
+  sessionId: string
+): Promise<ConversationState> {
+  if (!pausedResult.test_cases?.length) {
+    console.log("Agent: I do not have the generated test cases in memory, so I have to restart the workflow.")
+    const result = await runGeneration({ ...plan, sessionId, interactive: true })
+    return await maybeAskNextAction(result, plan, sessionId)
+  }
+
+  const restoreEnv = applyTemporaryEnv(plan.env)
+  try {
+    const result = await resumeGeneratedTests({
+      sourceFile: pausedResult.source_file,
+      outputDir: plan.outputDir,
+      language: plan.language,
+      testCode: pausedResult.test_code,
+      testCases: pausedResult.test_cases as Parameters<typeof resumeGeneratedTests>[0]["testCases"],
+      maxAttempts: plan.maxAttempts,
+      llmRetries: plan.llmRetries,
+    })
+
+    if (result.diagnosis?.next_action === "INSTALL_DEPENDENCY") {
+      console.log("Agent: workflow is still paused during test execution.")
+      console.log(`- Language: ${result.language}`)
+      console.log(`- Test cases kept in memory: ${result.test_cases_count}`)
+      console.log("- AI diagnosis:")
+      console.log(result.diagnosis.report_text ?? result.diagnosis.summary ?? "Environment or dependency action is still needed.")
+      return await maybeAskNextAction(result, plan, sessionId)
+    }
+
+    console.log("Agent: resumed workflow finished.")
+    console.log(`- Language: ${result.language}`)
+    console.log(`- Tests passed: ${result.passed ? "yes" : "no"}`)
+    console.log(`- Test cases: ${result.test_cases_count}`)
+    if (result.quality) console.log(`- Quality: ${result.quality.ok ? "passed" : "failed"}`)
+    if (result.coverage) {
+      console.log(`- Coverage: ${result.coverage.symbol_coverage}% symbols (${result.coverage.covered_symbols.length}/${result.coverage.total_symbols})`)
+    }
+    if (result.diagnosis) {
+      console.log("- AI diagnosis:")
+      console.log(result.diagnosis.report_text ?? result.diagnosis.summary ?? "Diagnosis written to report.")
+    }
+    console.log("- Exported files:")
+    for (const file of result.exported_files) console.log(`  - ${file}`)
+
+    return await maybeAskNextAction(result, plan, sessionId)
+  } finally {
+    restoreEnv()
+  }
 }
 
 async function runVisibleCommand(command: PendingCommand, sessionId: string) {
@@ -497,6 +702,46 @@ function resolvePlan(plan: AgentDecision["plan"], sessionId: string): PendingPla
   const llmRetries = normalizeLlmRetries(plan?.llm_retries ?? sessionState.lastLlmRetries)
   const requirementsText = plan?.requirements_text ?? sessionState.lastRequirements
   return { filePath: sourceFile, outputDir, language, maxAttempts, llmRetries, requirementsText }
+}
+
+function applyPlanDelta(base: PendingPlan, delta?: AgentDecision["plan"]): PendingPlan {
+  if (!delta) return base
+  const filePath = delta.file_path ? path.resolve(delta.file_path) : base.filePath
+  if (!fs.existsSync(filePath)) throw new Error(`source file does not exist: ${filePath}`)
+  return {
+    filePath,
+    outputDir: delta.output_dir ? path.resolve(delta.output_dir) : base.outputDir,
+    language: detectLanguage(filePath, delta.language ?? base.language),
+    maxAttempts: normalizeAttempts(delta.max_attempts ?? base.maxAttempts),
+    llmRetries: normalizeLlmRetries(delta.llm_retries ?? base.llmRetries),
+    requirementsText: delta.requirements_text ?? base.requirementsText,
+    env: base.env,
+  }
+}
+
+function mergeEnv(base?: Record<string, string>, update?: Record<string, string>): Record<string, string> | undefined {
+  if (!update || Object.keys(update).length === 0) return base
+  return { ...(base ?? {}), ...update }
+}
+
+function applyTemporaryEnv(env?: Record<string, string>): () => void {
+  if (!env || Object.keys(env).length === 0) return () => {}
+  const previous = new Map<string, string | undefined>()
+  for (const [key, value] of Object.entries(env)) {
+    if (key === "PATH_PREPEND") continue
+    previous.set(key, process.env[key])
+    process.env[key] = value
+  }
+  if (env.PATH_PREPEND) {
+    previous.set("PATH", process.env.PATH)
+    process.env.PATH = `${env.PATH_PREPEND}${path.delimiter}${process.env.PATH ?? ""}`
+  }
+  return () => {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
 }
 
 function printPlan(reply: string, plan: PendingPlan): void {
@@ -563,6 +808,24 @@ function parsePendingIntentStrict(text: string): PendingIntent {
   return {
     intent: item.intent,
     reply: typeof item.reply === "string" ? item.reply : undefined,
+  }
+}
+
+function parseFollowupDecisionStrict(text: string): FollowupDecision {
+  const raw = parseJsonObject(text)
+  if (!raw || typeof raw !== "object") {
+    throw new Error(`Follow-up agent returned non-JSON output. Preview: ${preview(text)}`)
+  }
+  const item = raw as Partial<FollowupDecision>
+  if (!item.action || !["answer", "continue", "run_command", "update_env", "update_plan", "cancel", "exit"].includes(item.action)) {
+    throw new Error(`Follow-up agent returned invalid action. Preview: ${preview(text)}`)
+  }
+  return {
+    action: item.action,
+    reply: typeof item.reply === "string" ? item.reply : undefined,
+    command: typeof item.command === "string" ? item.command : undefined,
+    env: item.env && typeof item.env === "object" ? item.env as Record<string, string> : undefined,
+    plan: item.plan,
   }
 }
 

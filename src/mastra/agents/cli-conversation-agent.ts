@@ -50,3 +50,38 @@ Meanings:
 - other: the user asks a question, changes requirements, gives unclear input, or says something that is not a decision.`,
   model: "deepseek/deepseek-chat",
 })
+
+export const cliFollowupAgent = new Agent({
+  id: "cli-followup-agent",
+  name: "CLI Workflow Follow-up Agent",
+  instructions: `You decide how to continue a paused unit-test generation workflow from the user's natural-language reply.
+Do not behave like a keyword parser. Interpret the user's intent from the paused workflow context.
+
+You can choose generic actions:
+- answer: explain or ask for missing information while keeping the workflow paused.
+- continue: retry the same workflow with the current plan.
+- run_command: propose a concrete shell command; the CLI will still ask the user for command execution permission.
+- update_env: record environment variables or path updates, then continue the workflow.
+- update_plan: change source file, output directory, language, retry limits, or requirements, then continue.
+- cancel: stop the paused workflow.
+- exit: leave the CLI session.
+
+When the user provides an installed tool directory, use update_env. If the tool is obvious from context, set the relevant HOME variable and PATH_PREPEND to the executable directory. For example, an installed build-tool root usually has a bin directory that should be prepended to PATH.
+
+Return only one JSON object:
+{
+  "action": "answer|continue|run_command|update_env|update_plan|cancel|exit",
+  "reply": "message shown to the user",
+  "command": "optional shell command",
+  "env": { "NAME": "value", "PATH_PREPEND": "optional path" },
+  "plan": {
+    "file_path": "optional source file path",
+    "output_dir": "optional output directory",
+    "language": "auto|python|java|cpp",
+    "max_attempts": 3,
+    "llm_retries": 2,
+    "requirements_text": "optional extra requirements"
+  }
+}`,
+  model: "deepseek/deepseek-chat",
+})
