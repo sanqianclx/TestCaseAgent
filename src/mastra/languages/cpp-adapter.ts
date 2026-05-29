@@ -119,7 +119,16 @@ function executeCppTests(input: {
   fs.writeFileSync(sourcePath, input.sourceCode, "utf-8")
   fs.writeFileSync(testPath, input.testCode, "utf-8")
 
-  const compile = runRaw("g++", [path.basename(testPath), "-std=c++17", "-lgtest", "-lgtest_main", "-pthread", "-o", exePath], tempDir, input.timeoutSeconds)
+  const gtest = resolveGtestCompileConfig(input.testCode)
+  const compileArgs = [
+    path.basename(testPath),
+    "-std=c++17",
+    ...gtest.args,
+    "-pthread",
+    "-o",
+    exePath,
+  ]
+  const compile = runRaw("g++", compileArgs, tempDir, input.timeoutSeconds)
   if (compile.timeout) {
     return baseExecution("timeout", compile.stdout, compile.stderr || "C++ 编译超时", compile.exitCode, compile.durationMs, true, compile.command, tempDir)
   }
@@ -136,9 +145,11 @@ function executeCppTests(input: {
     return baseExecution("timeout", run.stdout, run.stderr || "C++ 测试执行超时", run.exitCode, compile.durationMs + run.durationMs, true, run.command, tempDir)
   }
   if (run.exitCode === 0) {
-    return baseExecution("passed", run.stdout, run.stderr, 0, compile.durationMs + run.durationMs, false, run.command, tempDir, countGtestPassed(run.stdout), 0, 0)
+    const report = parseGtestOutput(run.stdout)
+    return baseExecution("passed", run.stdout, run.stderr, 0, compile.durationMs + run.durationMs, false, run.command, tempDir, report.passed, report.failed, 0, report.testResults)
   }
-  return baseExecution("failed", run.stdout, run.stderr, run.exitCode, compile.durationMs + run.durationMs, false, run.command, tempDir, 0, countGtestFailed(run.stdout), 0)
+  const report = parseGtestOutput(run.stdout)
+  return baseExecution("failed", run.stdout, run.stderr, run.exitCode, compile.durationMs + run.durationMs, false, run.command, tempDir, report.passed, report.failed || countGtestFailed(run.stdout), 0, report.testResults)
 }
 
 function checkCppQuality(testCode: string): QualityResult {
@@ -170,8 +181,10 @@ function diagnoseCppFailure(executionResult: ExecutionResult, quality: QualityRe
       next_action: "REGENERATE_TEST_CODE",
     }
   }
-  if (executionResult.missing_dependencies?.length || /gtest\/gtest\.h|cannot find -lgtest|g\+\+ is not available/i.test(combined)) {
-    const commands = /g\+\+ is not available/i.test(combined)
+  if (executionResult.missing_dependencies?.length || /gtest\/gtest\.h|cannot find -lgtest|g\+\+ is not available|std::mutex|Thread model:\s*win32/i.test(combined)) {
+    const commands = /mingw posix\/ucrt64 thread model compiler|std::mutex/i.test(combined)
+      ? ["Install MSYS2 UCRT64/MinGW64 g++ and use its bin directory in PATH"]
+      : /g\+\+ is not available/i.test(combined)
       ? ["winget install MSYS2.MSYS2"]
       : ["vcpkg install gtest"]
     return {
@@ -301,9 +314,10 @@ function baseExecution(
   cwd: string,
   passed = 0,
   failed = 0,
-  errors = status === "error" ? 1 : 0
+  errors = status === "error" ? 1 : 0,
+  testResults?: unknown[]
 ): ExecutionResult {
-  return { status, passed, failed, errors, stdout, stderr, exit_code: exitCode, duration_ms: duration, timeout, command, cwd }
+  return { status, passed, failed, errors, stdout, stderr, exit_code: exitCode, duration_ms: duration, timeout, command, cwd, test_results: testResults }
 }
 
 function commandAvailable(command: string, args: string[]): boolean {
@@ -315,6 +329,9 @@ function inferCppMissingDependencies(output: string): string[] {
   const missing = new Set<string>()
   if (/gtest\/gtest\.h/.test(output)) missing.add("googletest")
   if (/cannot find -lgtest/.test(output)) missing.add("libgtest")
+  if (/std::mutex|<mutex>|enable-threads=win32|Thread model:\s*win32/i.test(output)) {
+    missing.add("mingw posix/ucrt64 thread model compiler")
+  }
   if (/No such file or directory/.test(output)) missing.add("header or source dependency")
   return [...missing]
 }
@@ -339,11 +356,122 @@ function isCppLiteral(expression: string): boolean {
 }
 
 function countGtestPassed(output: string): number {
-  return Number(output.match(/\[\s*PASSED\s*\]\s*(\d+)/)?.[1] ?? 1)
+  const match = output.match(/\[\s*PASSED\s*\]\s*(\d+)\s*test/)
+  return match ? Number(match[1]) : 0
 }
 
 function countGtestFailed(output: string): number {
-  return Number(output.match(/\[\s*FAILED\s*\]\s*(\d+)/)?.[1] ?? 1)
+  const match = output.match(/\[\s*FAILED\s*\]\s*(\d+)\s*test/)
+  return match ? Number(match[1]) : 0
+}
+
+function parseGtestOutput(output: string): { passed: number; failed: number; testResults: unknown[] } {
+  const lines = output.split(/\r?\n/)
+  const results: Array<Record<string, unknown>> = []
+  const testNames = new Map<string, number>()
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    const trimmed = line.trim()
+
+    const runMatch = trimmed.match(/^\[\s*RUN\s*\]\s+(.+)/)
+    if (runMatch) {
+      testNames.set(runMatch[1].trim(), index)
+      continue
+    }
+
+    const okHeader = /^\[\s*OK\s*\]\s+/
+    if (okHeader.test(trimmed)) {
+      const raw = trimmed.replace(okHeader, "")
+      const name = raw.replace(/\s*\(\d+\s*ms\)\s*$/, "").trim()
+      const duration = raw.match(/\((\d+)\s*ms\)\s*$/)?.[1]
+      addGtestResult(results, testNames, name, "passed", duration ?? "0")
+      continue
+    }
+
+    const failedHeader = /^\[\s*FAILED\s*\]\s+/
+    if (failedHeader.test(trimmed)) {
+      const raw = trimmed.replace(failedHeader, "")
+      const name = raw.replace(/\s*\(\d+\s*ms\)\s*$/, "").trim()
+      const duration = raw.match(/\((\d+)\s*ms\)\s*$/)?.[1]
+      const runLine = testNames.get(name)
+      const failureText = runLine !== undefined
+        ? lines.slice(runLine + 1, index)
+            .map((item) => item.trim())
+            .filter((item) => item && !/^\[/.test(item))
+            .join(" ")
+            .replace(/\s+/g, " ")
+            .slice(0, 800)
+        : ""
+      addGtestResult(results, testNames, name, "failed", duration ?? "0", failureText)
+    }
+  }
+
+  const parsedPassed = results.filter((item) => item.result === "passed").length
+  const parsedFailed = results.filter((item) => item.result === "failed").length
+
+  const passed = parsedPassed || countGtestPassed(output)
+  const failed = parsedFailed || countGtestFailed(output)
+
+  return { passed, failed, testResults: results }
+}
+
+function addGtestResult(
+  results: Array<Record<string, unknown>>,
+  testNames: Map<string, number>,
+  fullName: string,
+  result: string,
+  durationMs: string,
+  failureReason?: string
+) {
+  const lastDot = fullName.lastIndexOf(".")
+  const entry: Record<string, unknown> = {
+    test_class: lastDot >= 0 ? fullName.slice(0, lastDot) : "",
+    test_name: lastDot >= 0 ? fullName.slice(lastDot + 1) : fullName,
+    result,
+    duration_ms: Number(durationMs) || 0,
+    failure_reason: failureReason || "",
+  }
+  results.push(entry)
+  testNames.delete(fullName)
+}
+
+function resolveGtestCompileConfig(testCode: string): { args: string[]; mode: "source" | "installed" } {
+  const root = findGtestSourceRoot()
+  if (root) {
+    const gtestDir = path.join(root, "googletest")
+    const args = [
+      "-I" + path.join(gtestDir, "include"),
+      "-I" + gtestDir,
+      path.join(gtestDir, "src", "gtest-all.cc"),
+    ]
+    if (!/\bmain\s*\(/.test(testCode)) {
+      args.push(path.join(gtestDir, "src", "gtest_main.cc"))
+    }
+    return { args, mode: "source" }
+  }
+  return { args: ["-lgtest", "-lgtest_main"], mode: "installed" }
+}
+
+function findGtestSourceRoot(): string | undefined {
+  const candidates = [
+    process.env.GTEST_ROOT,
+    process.env.GOOGLETEST_ROOT,
+    process.env.GTEST_HOME,
+    process.env.GOOGLETEST_HOME,
+    "D:\\gtest\\googletest-1.17.0",
+  ].filter((item): item is string => Boolean(item))
+
+  for (const candidate of candidates) {
+    const root = path.resolve(candidate)
+    if (
+      fs.existsSync(path.join(root, "googletest", "include", "gtest", "gtest.h")) &&
+      fs.existsSync(path.join(root, "googletest", "src", "gtest-all.cc"))
+    ) {
+      return root
+    }
+  }
+  return undefined
 }
 
 function lineOf(sourceCode: string, index: number): number {

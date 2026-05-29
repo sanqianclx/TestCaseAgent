@@ -1,4 +1,5 @@
 import { createTool } from "@mastra/core/tools"
+import path from "path"
 import { z } from "zod"
 import { callPythonScript } from "../runtime/python-bridge.js"
 
@@ -32,7 +33,10 @@ export function exportCases(inputData: {
   artifact_prefix?: string
   skip_py?: boolean
 }): ExportCasesOutput {
-  const result = callPythonScript<ExportCasesOutput>("export_cases.py", inputData, 30_000)
+  const result = callPythonScript<ExportCasesOutput>("export_cases.py", {
+    ...inputData,
+    output_dir: path.resolve(inputData.output_dir),
+  }, 30_000)
   if (!result.ok || !result.data) {
     throw new Error(`导出失败: ${result.error?.message ?? "未知错误"}`)
   }
