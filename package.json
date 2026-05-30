@@ -11,6 +11,9 @@
   "dependencies": {
     "@ai-sdk/deepseek": "^2.0.35",
     "@mastra/core": "^1.0.0",
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-cpp": "^0.23.4",
+    "tree-sitter-java": "^0.23.5",
     "zod": "^3.23.0"
   },
   "devDependencies": {

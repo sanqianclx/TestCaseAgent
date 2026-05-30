@@ -2,6 +2,7 @@ import { spawnSync } from "child_process"
 import fs from "fs"
 import os from "os"
 import path from "path"
+import { parseSourceCode, type ParsedSource } from "../tools/parse-source-code-tool.js"
 import { exportCases } from "../tools/export-cases-tool.js"
 import type {
   Diagnosis,
@@ -13,11 +14,6 @@ import type {
   TestCase,
 } from "./types.js"
 
-const PACKAGE_PATTERN = /^\s*package\s+([A-Za-z_][\w.]*);/m
-const CLASS_PATTERN = /^\s*(?:public\s+)?(?:final\s+)?class\s+([A-Za-z_]\w*)/m
-const METHOD_PATTERN =
-  /(?:^|[\n\r{;])\s*(?:public|protected|private)?\s*(static\s+)?(?:final\s+)?([A-Za-z_][\w<>\[\], ?]*)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:throws\s+[^{]+)?\{/gm
-
 export const javaAdapter: LanguageAdapter = {
   language: "java",
   displayName: "Java",
@@ -26,34 +22,8 @@ export const javaAdapter: LanguageAdapter = {
   codeFence: "java",
 
   parseSource({ sourceCode, filename }) {
-    const className = CLASS_PATTERN.exec(sourceCode)?.[1] ?? path.basename(filename, ".java")
-    const symbols: SourceSymbol[] = []
-
-    for (const match of sourceCode.matchAll(METHOD_PATTERN)) {
-      const name = match[3]
-      if (["if", "for", "while", "switch", "catch", "main"].includes(name)) continue
-      const body = extractBlock(sourceCode, (match.index ?? 0) + match[0].length - 1)
-      symbols.push({
-        name,
-        kind: "method",
-        className,
-        returnType: match[2].trim(),
-        returnExpression: extractSimpleReturnExpression(body),
-        isStatic: Boolean(match[1]),
-        params: parseJavaParams(match[4]),
-        startLine: lineOf(sourceCode, match.index ?? 0),
-      })
-    }
-
-    return {
-      language: "java",
-      moduleName: className,
-      packageName: PACKAGE_PATTERN.exec(sourceCode)?.[1],
-      imports: [...sourceCode.matchAll(/^\s*import\s+([^;]+);/gm)].map((item) => item[1]),
-      symbols,
-      raw: { className },
-      warnings: symbols.length === 0 ? ["NO_TESTABLE_SYMBOL: 未检测到 Java 方法"] : [],
-    }
+    const parsed = parseSourceCode({ source_code: sourceCode, filename, language: "java" })
+    return normalizeJavaAnalysis(parsed, sourceCode)
   },
 
   buildGenerationContext({ analysis }) {
@@ -285,26 +255,89 @@ function exportJavaArtifacts(input: {
   return { exported_files: files }
 }
 
-function parseJavaParams(raw: string): SourceSymbol["params"] {
-  return raw.split(",").map((item) => item.trim()).filter(Boolean).map((item) => {
-    const parts = item.split(/\s+/)
-    const name = parts.at(-1)?.replace(/\[\]$/, "")
-    const type = parts.slice(0, -1).join(" ")
-    return { name, type, raw: item }
-  })
+/**
+ * 将统一 ParsedSource 转换为 Java SourceAnalysis
+ * 关键字段：moduleName（类名）、packageName、symbols（每个方法一个 SourceSymbol）
+ */
+function normalizeJavaAnalysis(parsed: ParsedSource, sourceCode: string): SourceAnalysis {
+  const packageName = extractJavaPackageName(sourceCode)
+  const symbols: SourceSymbol[] = []
+
+  const classes = (parsed.classes as Array<{
+    name?: string; methods?: Array<{
+      name: string; params: Array<{ name?: string; type?: string; raw?: string }>
+      return_type: string; start_line: number; end_line: number
+    }>
+  }>)
+
+  for (const cls of classes) {
+    const className = cls.name ?? parsed.module_name
+    for (const method of (cls.methods ?? [])) {
+      symbols.push({
+        name: method.name,
+        kind: "method",
+        className,
+        returnType: method.return_type,
+        returnExpression: extractReturnExpr(sourceCode, method.start_line, method.end_line),
+        params: method.params.map(p => ({ name: p.name, type: p.type, raw: p.raw })),
+        startLine: method.start_line,
+        endLine: method.end_line,
+      })
+    }
+  }
+
+  // 顶层函数（非类内方法）
+  const functions = (parsed.functions as Array<{
+    name: string; params: Array<{ name?: string; type?: string; raw?: string }>
+    return_type: string; start_line: number; end_line: number
+  }>)
+
+  for (const fn of functions) {
+    symbols.push({
+      name: fn.name,
+      kind: "function",
+      returnType: fn.return_type,
+      returnExpression: extractReturnExpr(sourceCode, fn.start_line, fn.end_line),
+      params: fn.params.map(p => ({ name: p.name, type: p.type, raw: p.raw })),
+      startLine: fn.start_line,
+      endLine: fn.end_line,
+    })
+  }
+
+  const warnings = parsed.warnings ?? []
+  if (symbols.length === 0 && (!warnings.some(w => w.includes("NO_TESTABLE_SYMBOL")))) {
+    warnings.push("NO_TESTABLE_SYMBOL: 未检测到 Java 方法")
+  }
+
+  return {
+    language: "java",
+    moduleName: parsed.module_name,
+    packageName,
+    imports: parsed.imports,
+    symbols,
+    raw: { className: parsed.module_name },
+    warnings,
+  }
 }
 
-function sampleJavaValue(typeName: string): string {
-  const normalized = typeName.toLowerCase()
-  if (normalized.includes("string[]") || normalized.includes("string...")) return "new String[]{}"
-  if (normalized.includes("string")) return "\"test\""
-  if (normalized.includes("boolean")) return "true"
-  if (normalized.includes("double") || normalized.includes("float")) return "1.0"
-  if (normalized.includes("long")) return "1L"
-  if (normalized.includes("int") || normalized.includes("short") || normalized.includes("byte")) return "1"
-  if (normalized.includes("list")) return "java.util.List.of()"
-  if (normalized.includes("map")) return "java.util.Map.of()"
-  return "null"
+/**
+ * 从源代码中提取 package 声明
+ */
+function extractJavaPackageName(sourceCode: string): string | undefined {
+  const match = sourceCode.match(/^\s*package\s+([A-Za-z_][\w.]*);/m)
+  return match ? match[1] : undefined
+}
+
+/**
+ * 从源代码的行号区间提取 return 表达式
+ */
+function extractReturnExpr(sourceCode: string, startLine: number, endLine: number): string | undefined {
+  const lines = sourceCode.split(/\r?\n/)
+  for (let i = startLine - 1; i < Math.min(endLine, lines.length); i += 1) {
+    const match = lines[i].match(/\breturn\s+([^;]+);/)
+    if (match) return match[1].trim()
+  }
+  return undefined
 }
 
 function renderPom(): string {
@@ -439,32 +472,4 @@ function inferJavaMissingDependencies(output: string): string[] {
   for (const match of output.matchAll(/package\s+([A-Za-z_][\w.]*)\s+does not exist/g)) missing.add(match[1])
   if (/Could not resolve dependencies|Could not find artifact/i.test(output)) missing.add("maven dependency")
   return [...missing]
-}
-
-function extractBlock(sourceCode: string, openBraceIndex: number): string {
-  let depth = 0
-  for (let index = openBraceIndex; index < sourceCode.length; index += 1) {
-    const char = sourceCode[index]
-    if (char === "{") depth += 1
-    if (char === "}") depth -= 1
-    if (depth === 0) return sourceCode.slice(openBraceIndex + 1, index)
-  }
-  return ""
-}
-
-function extractSimpleReturnExpression(body: string): string | undefined {
-  return body.match(/\breturn\s+([^;]+);/)?.[1]?.trim()
-}
-
-function isJavaLiteral(expression: string): boolean {
-  return /^".*"$/.test(expression) || /^'.*'$/.test(expression) || /^-?\d+(?:\.\d+)?[dDfFlL]?$/.test(expression) || /^(true|false|null)$/.test(expression)
-}
-
-function lineOf(sourceCode: string, index: number): number {
-  return sourceCode.slice(0, index).split(/\r?\n/).length
-}
-
-function safeName(value: string): string {
-  const result = value.replace(/[^A-Za-z0-9_]/g, "_")
-  return /^[A-Za-z_]/.test(result) ? result : `test_${result}`
 }

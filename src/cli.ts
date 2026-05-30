@@ -3,12 +3,31 @@ import path from "path"
 import readline from "readline/promises"
 import { stdin as input, stdout as output } from "process"
 import { canUseLLM, formatError, getLlmUnavailableReason, loadProjectEnv } from "./mastra/runtime/env.js"
-import { cliConversationAgent, cliFollowupAgent, cliIntentAgent } from "./mastra/agents/cli-conversation-agent.js"
+import { cliAgent } from "./mastra/agents/cli-conversation-agent.js"
 import { generateTestWorkflow, resumeGeneratedTests, setLlmRetriesExhaustedHandler } from "./mastra/workflows/generate-test-workflow.js"
 import { detectLanguage, type SupportedLanguage } from "./mastra/languages/registry.js"
 import { assessCommandRisk, runCommandInVisibleTerminal } from "./mastra/runtime/command-runner.js"
 import { memoryStore } from "./mastra/memory/in-memory-store.js"
 import { getSessionState, updateSessionState } from "./mastra/memory/session-state.js"
+
+/**
+ * 拦截全局 console.log，项目中所有以 "Agent" 或 "User" 开头的消息自动着色
+ * Agent → 亮黄色加粗  |  User → 亮青色加粗
+ */
+const originalLog = console.log
+console.log = (...args: unknown[]) => {
+  const first = args[0]
+  if (typeof first === "string") {
+    if (first.startsWith("Agent")) {
+      return originalLog("\x1b[1;93m" + first + "\x1b[0m", ...args.slice(1))
+    }
+    if (first.startsWith("User")) {
+      return originalLog("\x1b[1;96m" + first + "\x1b[0m", ...args.slice(1))
+    }
+  }
+  originalLog(...args)
+}
+const USER_PROMPT = "\x1b[1;96mUser：\x1b[0m"
 
 type WorkflowResult = {
   source_file: string
@@ -84,6 +103,19 @@ type FollowupDecision = {
   plan?: AgentDecision["plan"]
 }
 
+/**
+ * 统一 Agent 的输出类型，根据 mode 决定哪些字段有效
+ */
+type UnifiedCliDecision = {
+  mode: "conversation" | "intent" | "followup"
+  action?: string
+  reply?: string
+  intent?: string
+  command?: string
+  env?: Record<string, string>
+  plan?: AgentDecision["plan"]
+}
+
 type ConversationState =
   | { mode: "idle" }
   | { mode: "awaiting_plan_confirmation"; plan: PendingPlan }
@@ -139,7 +171,7 @@ async function runInteractive(args: CliArgs): Promise<void> {
     }
 
     while (true) {
-      const line = (await rl.question("User: ")).trim()
+      const line = (await rl.question(USER_PROMPT)).trim()
       if (!line) continue
       memoryStore.addMessage(sessionId, "user", line)
 
@@ -222,27 +254,9 @@ async function askConversationAgent(
 
   const sessionState = getSessionState(sessionId)
   try {
-     return await withRetries("CLI 对话", args.llmRetries, async () => {
-      const response = await cliConversationAgent.generate(`
-你是一个命令行单元测试生成 Agent。
-只处理单元测试生成相关的任务。
-如果缺少必要信息，请追问一句简洁的补充问题。
-如果信息充足，请提出执行计划并等待用户确认。
-在 requirements_text 中保留用户的范围约束，包括只生成有限数量测试的请求。
-
-只返回有效的 JSON：
-{
-  "action": "answer" | "ask" | "propose_plan" | "cancel" | "exit",
-  "reply": "给用户的自然语言回复",
-  "plan": {
-    "file_path": "源文件路径，可选",
-    "output_dir": "输出目录，可选",
-    "language": "auto|python|java|cpp，可选",
-    "max_attempts": 3,
-    "llm_retries": 2,
-    "requirements_text": "额外需求，可选"
-  }
-}
+      return await withRetries("CLI 对话", args.llmRetries, async () => {
+      const response = await cliAgent.generate(`
+mode=conversation
 
 当前工作目录：${process.cwd()}
 对话记忆：${memoryStore.summarize(sessionId)}
@@ -263,7 +277,7 @@ ${JSON.stringify({
 用户最新消息：
 ${userMessage}
 `, { modelSettings: { temperature: 0.2, maxOutputTokens: 2048 } })
-      return parseDecisionStrict(response.text)
+      return parseConversationDecision(response.text)
     })
   } catch (error) {
     return {
@@ -287,15 +301,8 @@ async function askPendingIntent(
   }
 
   return await withRetries("待定意图分类", args.llmRetries, async () => {
-    const response = await cliIntentAgent.generate(`
-对用户在待定 CLI 状态下的最新回复进行意图分类。
-不要执行任何操作。只对用户意图进行分类。
-
-只返回有效的 JSON：
-{
-  "intent": "confirm" | "cancel" | "exit" | "other",
-  "reply": "当 intent 为 other 时显示的简短消息，其他情况可选"
-}
+    const response = await cliAgent.generate(`
+mode=intent
 
 待定状态：
 ${JSON.stringify(state, null, 2)}
@@ -306,7 +313,7 @@ ${memoryStore.summarize(sessionId)}
 用户最新回复：
 ${userMessage}
 `, { modelSettings: { temperature: 0, maxOutputTokens: 1024 } })
-    return parsePendingIntentStrict(response.text)
+    return parseIntentDecision(response.text)
   })
 }
 
@@ -324,26 +331,8 @@ async function askFollowupAgent(
   }
 
   return await withRetries("工作流跟进", args.llmRetries, async () => {
-    const response = await cliFollowupAgent.generate(`
-单元测试生成工作流已暂停，正在等待用户。
-解读用户的最新回复并选择下一步操作。
-不要执行任何操作。
-
-只返回有效的 JSON：
-{
-  "action": "answer" | "continue" | "run_command" | "update_env" | "update_plan" | "cancel" | "exit",
-  "reply": "给用户的简短消息",
-  "command": "shell 命令，仅在 action 为 run_command 时需要",
-  "env": { "NAME": "value", "PATH_PREPEND": "要追加到 PATH 的可选路径" },
-  "plan": {
-    "file_path": "可选",
-    "output_dir": "可选",
-    "language": "auto|python|java|cpp，可选",
-    "max_attempts": 3,
-    "llm_retries": 2,
-    "requirements_text": "可选"
-  }
-}
+    const response = await cliAgent.generate(`
+mode=followup
 
 已暂停的工作流上下文：
 ${JSON.stringify(followup, null, 2)}
@@ -354,7 +343,7 @@ ${memoryStore.summarize(sessionId)}
 用户最新回复：
 ${userMessage}
 `, { modelSettings: { temperature: 0, maxOutputTokens: 2048 } })
-    return parseFollowupDecisionStrict(response.text)
+    return parseFollowupDecision(response.text)
   })
 }
 
@@ -366,16 +355,14 @@ async function askRetryExtensionWithAI(label: string, errorText: string, llmRetr
       console.log(`最后错误：${errorText}`)
       const answer = await ql.question("是否要增加 3 次重试？")
       const intent = await withRetries("重试扩展意图分类", llmRetries, async () => {
-        const response = await cliIntentAgent.generate([
-          "判断用户是否想要增加 3 次 LLM 重试。",
-          "只返回 JSON：",
-          "{\"intent\":\"confirm|cancel|exit|other\",\"reply\":\"可选的简短回复\"}",
+        const response = await cliAgent.generate([
+          "mode=intent",
           "",
           "待定问题：为 " + label + " 增加 3 次重试",
           "最后错误：" + errorText,
           "用户回复：" + answer,
         ].join("\n"), { modelSettings: { temperature: 0, maxOutputTokens: 512 } })
-        return parsePendingIntentStrict(response.text)
+        return parseIntentDecision(response.text)
       })
       if (intent.intent === "confirm") return 3
       if (intent.intent === "cancel" || intent.intent === "exit") {
@@ -761,71 +748,71 @@ function printPlan(reply: string, plan: PendingPlan): void {
   console.log("确认后我将开始执行。")
 }
 
-function parseDecision(text: string): AgentDecision {
-  const raw = parseJsonObject(text)
-  if (!raw || typeof raw !== "object") {
-    return { action: "answer", reply: text.trim() || "我没理解，请再说一遍。" }
-  }
-  const item = raw as Partial<AgentDecision>
-  const action = item.action && ["answer", "ask", "propose_plan", "cancel", "exit"].includes(item.action)
-    ? item.action
-    : "answer"
-  return {
-    action,
-    reply: typeof item.reply === "string" ? item.reply : "",
-    plan: item.plan,
-  }
-}
-
-function parseDecisionStrict(text: string): AgentDecision {
+/**
+ * 统一解析函数：先 parse JSON，再根据 mode 校验字段
+ */
+function parseCliDecision(text: string): UnifiedCliDecision {
   const raw = parseJsonObject(text)
   if (!raw || typeof raw !== "object") {
     throw new Error(`CLI Agent 返回了非 JSON 输出。预览：${preview(text)}`)
   }
-  const item = raw as Partial<AgentDecision>
-  if (!item.action || !["answer", "ask", "propose_plan", "cancel", "exit"].includes(item.action)) {
-    throw new Error(`CLI Agent 返回了无效的 action。预览：${preview(text)}`)
-  }
-  if (typeof item.reply !== "string") {
-    throw new Error(`CLI Agent 返回缺少 reply。预览：${preview(text)}`)
+  const item = raw as Record<string, unknown>
+  if (typeof item.mode !== "string" || !["conversation", "intent", "followup"].includes(item.mode)) {
+    throw new Error(`CLI Agent 返回了无效的 mode。预览：${preview(text)}`)
   }
   return {
-    action: item.action,
-    reply: item.reply,
-    plan: item.plan,
-  }
-}
-
-function parsePendingIntentStrict(text: string): PendingIntent {
-  const raw = parseJsonObject(text)
-  if (!raw || typeof raw !== "object") {
-    throw new Error(`CLI 意图 Agent 返回了非 JSON 输出。预览：${preview(text)}`)
-  }
-  const item = raw as Partial<PendingIntent>
-  if (!item.intent || !["confirm", "cancel", "exit", "other"].includes(item.intent)) {
-    throw new Error(`CLI 意图 Agent 返回了无效的 intent。预览：${preview(text)}`)
-  }
-  return {
-    intent: item.intent,
+    mode: item.mode as UnifiedCliDecision["mode"],
+    action: typeof item.action === "string" ? item.action : undefined,
     reply: typeof item.reply === "string" ? item.reply : undefined,
-  }
-}
-
-function parseFollowupDecisionStrict(text: string): FollowupDecision {
-  const raw = parseJsonObject(text)
-  if (!raw || typeof raw !== "object") {
-    throw new Error(`跟进 Agent 返回了非 JSON 输出。预览：${preview(text)}`)
-  }
-  const item = raw as Partial<FollowupDecision>
-  if (!item.action || !["answer", "continue", "run_command", "update_env", "update_plan", "cancel", "exit"].includes(item.action)) {
-    throw new Error(`跟进 Agent 返回了无效的 action。预览：${preview(text)}`)
-  }
-  return {
-    action: item.action,
-    reply: typeof item.reply === "string" ? item.reply : undefined,
+    intent: typeof item.intent === "string" ? item.intent : undefined,
     command: typeof item.command === "string" ? item.command : undefined,
     env: item.env && typeof item.env === "object" ? item.env as Record<string, string> : undefined,
-    plan: item.plan,
+    plan: item.plan && typeof item.plan === "object" ? item.plan as AgentDecision["plan"] : undefined,
+  }
+}
+
+function parseConversationDecision(text: string): AgentDecision {
+  const decision = parseCliDecision(text)
+  if (decision.mode !== "conversation") {
+    throw new Error(`期望 conversation 模式，但返回了 ${decision.mode}。预览：${preview(text)}`)
+  }
+  const action = decision.action as AgentDecision["action"]
+  if (!action || !["answer", "ask", "propose_plan", "cancel", "exit"].includes(action)) {
+    throw new Error(`CLI Agent 返回了无效的 action（${action}）。预览：${preview(text)}`)
+  }
+  if (typeof decision.reply !== "string") {
+    throw new Error(`CLI Agent 返回缺少 reply。预览：${preview(text)}`)
+  }
+  return { action, reply: decision.reply, plan: decision.plan }
+}
+
+function parseIntentDecision(text: string): PendingIntent {
+  const decision = parseCliDecision(text)
+  if (decision.mode !== "intent") {
+    throw new Error(`期望 intent 模式，但返回了 ${decision.mode}。预览：${preview(text)}`)
+  }
+  const intent = decision.intent as PendingIntent["intent"]
+  if (!intent || !["confirm", "cancel", "exit", "other"].includes(intent)) {
+    throw new Error(`CLI Agent 返回了无效的 intent（${intent}）。预览：${preview(text)}`)
+  }
+  return { intent, reply: decision.reply }
+}
+
+function parseFollowupDecision(text: string): FollowupDecision {
+  const decision = parseCliDecision(text)
+  if (decision.mode !== "followup") {
+    throw new Error(`期望 followup 模式，但返回了 ${decision.mode}。预览：${preview(text)}`)
+  }
+  const action = decision.action as FollowupDecision["action"]
+  if (!action || !["answer", "continue", "run_command", "update_env", "update_plan", "cancel", "exit"].includes(action)) {
+    throw new Error(`CLI Agent 返回了无效的 action（${action}）。预览：${preview(text)}`)
+  }
+  return {
+    action,
+    reply: decision.reply,
+    command: decision.command,
+    env: decision.env,
+    plan: decision.plan,
   }
 }
 

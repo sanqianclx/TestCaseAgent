@@ -2,6 +2,7 @@ import { spawnSync } from "child_process"
 import fs from "fs"
 import os from "os"
 import path from "path"
+import { parseSourceCode, type ParsedSource } from "../tools/parse-source-code-tool.js"
 import { exportCases } from "../tools/export-cases-tool.js"
 import type {
   Diagnosis,
@@ -13,10 +14,6 @@ import type {
   TestCase,
 } from "./types.js"
 
-const FUNCTION_PATTERN =
-  /^\s*(?:inline\s+|static\s+|constexpr\s+)?([A-Za-z_][\w:<>\s*&]+?)\s+([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*(?:const\s*)?\{/gm
-const CLASS_PATTERN = /^\s*(?:class|struct)\s+([A-Za-z_]\w*)/m
-
 export const cppAdapter: LanguageAdapter = {
   language: "cpp",
   displayName: "C++",
@@ -25,33 +22,8 @@ export const cppAdapter: LanguageAdapter = {
   codeFence: "cpp",
 
   parseSource({ sourceCode, filename }) {
-    const moduleName = path.basename(filename, path.extname(filename))
-    const className = CLASS_PATTERN.exec(sourceCode)?.[1]
-    const symbols: SourceSymbol[] = []
-
-    for (const match of sourceCode.matchAll(FUNCTION_PATTERN)) {
-      const name = match[2]
-      if (["if", "for", "while", "switch", "catch", "main"].includes(name)) continue
-      const body = extractBlock(sourceCode, (match.index ?? 0) + match[0].length - 1)
-      symbols.push({
-        name,
-        kind: className && sourceCode.slice(0, match.index ?? 0).includes(`class ${className}`) ? "method" : "function",
-        className,
-        returnType: match[1].trim(),
-        returnExpression: extractSimpleReturnExpression(body),
-        params: parseCppParams(match[3]),
-        startLine: lineOf(sourceCode, match.index ?? 0),
-      })
-    }
-
-    return {
-      language: "cpp",
-      moduleName,
-      imports: [...sourceCode.matchAll(/^\s*#include\s+[<"]([^>"]+)[>"]/gm)].map((item) => item[1]),
-      symbols,
-      raw: { className },
-      warnings: symbols.length === 0 ? ["NO_TESTABLE_SYMBOL: 未检测到 C++ 函数"] : [],
-    }
+    const parsed = parseSourceCode({ source_code: sourceCode, filename, language: "cpp" })
+    return normalizeCppAnalysis(parsed, sourceCode)
   },
 
   buildGenerationContext({ analysis, sourceFile }) {
@@ -264,24 +236,77 @@ function exportCppArtifacts(input: {
   return { exported_files: files }
 }
 
-function parseCppParams(raw: string): SourceSymbol["params"] {
-  return raw.split(",").map((item) => item.trim()).filter(Boolean).map((item) => {
-    const cleaned = item.replace(/=.*/, "").trim()
-    const parts = cleaned.split(/\s+/)
-    const name = parts.at(-1)?.replace(/[&*]/g, "")
-    const type = parts.slice(0, -1).join(" ")
-    return { name, type: type || cleaned, raw: item }
-  })
+/**
+ * 将统一 ParsedSource 转换为 C++ SourceAnalysis
+ * 关键字段：moduleName、symbols（每个方法/函数一个 SourceSymbol）
+ */
+function normalizeCppAnalysis(parsed: ParsedSource, sourceCode: string): SourceAnalysis {
+  const symbols: SourceSymbol[] = []
+
+  const classes = (parsed.classes as Array<{
+    name: string; methods?: Array<{
+      name: string; params: Array<{ name?: string; type?: string; raw?: string }>
+      return_type: string; start_line: number; end_line: number
+    }>
+  }>)
+
+  for (const cls of classes) {
+    for (const method of (cls.methods ?? [])) {
+      symbols.push({
+        name: method.name,
+        kind: "method",
+        className: cls.name,
+        returnType: method.return_type,
+        returnExpression: extractReturnExpr(sourceCode, method.start_line, method.end_line),
+        params: method.params.map(p => ({ name: p.name, type: p.type, raw: p.raw })),
+        startLine: method.start_line,
+        endLine: method.end_line,
+      })
+    }
+  }
+
+  const functions = (parsed.functions as Array<{
+    name: string; params: Array<{ name?: string; type?: string; raw?: string }>
+    return_type: string; start_line: number; end_line: number
+  }>)
+
+  for (const fn of functions) {
+    symbols.push({
+      name: fn.name,
+      kind: "function",
+      returnType: fn.return_type,
+      returnExpression: extractReturnExpr(sourceCode, fn.start_line, fn.end_line),
+      params: fn.params.map(p => ({ name: p.name, type: p.type, raw: p.raw })),
+      startLine: fn.start_line,
+      endLine: fn.end_line,
+    })
+  }
+
+  const warnings = parsed.warnings ?? []
+  if (symbols.length === 0 && (!warnings.some(w => w.includes("NO_TESTABLE_SYMBOL")))) {
+    warnings.push("NO_TESTABLE_SYMBOL: 未检测到 C++ 函数")
+  }
+
+  return {
+    language: "cpp",
+    moduleName: parsed.module_name,
+    imports: parsed.imports,
+    symbols,
+    raw: { className: classes[0]?.name },
+    warnings,
+  }
 }
 
-function sampleCppValue(typeName: string): string {
-  const normalized = typeName.toLowerCase()
-  if (normalized.includes("std::string") || normalized.includes("string")) return "\"test\""
-  if (normalized.includes("bool")) return "true"
-  if (normalized.includes("double") || normalized.includes("float")) return "1.0"
-  if (normalized.includes("int") || normalized.includes("long") || normalized.includes("short")) return "1"
-  if (normalized.includes("vector")) return "{}"
-  return "{}"
+/**
+ * 从源代码的行号区间提取 return 表达式
+ */
+function extractReturnExpr(sourceCode: string, startLine: number, endLine: number): string | undefined {
+  const lines = sourceCode.split(/\r?\n/)
+  for (let i = startLine - 1; i < Math.min(endLine, lines.length); i += 1) {
+    const match = lines[i].match(/\breturn\s+([^;]+);/)
+    if (match) return match[1].trim()
+  }
+  return undefined
 }
 
 function runRaw(command: string, args: string[], cwd: string, timeoutSeconds: number) {
@@ -334,25 +359,6 @@ function inferCppMissingDependencies(output: string): string[] {
   }
   if (/No such file or directory/.test(output)) missing.add("header or source dependency")
   return [...missing]
-}
-
-function extractBlock(sourceCode: string, openBraceIndex: number): string {
-  let depth = 0
-  for (let index = openBraceIndex; index < sourceCode.length; index += 1) {
-    const char = sourceCode[index]
-    if (char === "{") depth += 1
-    if (char === "}") depth -= 1
-    if (depth === 0) return sourceCode.slice(openBraceIndex + 1, index)
-  }
-  return ""
-}
-
-function extractSimpleReturnExpression(body: string): string | undefined {
-  return body.match(/\breturn\s+([^;]+);/)?.[1]?.trim()
-}
-
-function isCppLiteral(expression: string): boolean {
-  return /^".*"$/.test(expression) || /^'.*'$/.test(expression) || /^-?\d+(?:\.\d+)?[fFlLuU]*$/.test(expression) || /^(true|false|nullptr)$/.test(expression)
 }
 
 function countGtestPassed(output: string): number {
@@ -472,13 +478,4 @@ function findGtestSourceRoot(): string | undefined {
     }
   }
   return undefined
-}
-
-function lineOf(sourceCode: string, index: number): number {
-  return sourceCode.slice(0, index).split(/\r?\n/).length
-}
-
-function safeName(value: string): string {
-  const result = value.replace(/[^A-Za-z0-9_]/g, "_")
-  return /^[A-Za-z_]/.test(result) ? result : `Generated_${result}`
 }
