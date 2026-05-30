@@ -50,14 +50,14 @@ const instructions = `你是 Python、Java 和 C++ 的专业单元测试代码�
 
 export const testCodeAgent = new Agent({
   id: "test-code-agent",
-  name: "Unit Test Code Generation Agent",
+  name: "单元测试代码生成 Agent",
   instructions,
   model: "deepseek/deepseek-chat",
 })
 
 export const testCodeAgentPro = new Agent({
   id: "test-code-agent-pro",
-  name: "Unit Test Code Generation Agent Pro",
+  name: "单元测试代码生成 Agent Pro",
   instructions,
   model: "deepseek/deepseek-v4-pro",
 })

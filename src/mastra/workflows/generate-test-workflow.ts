@@ -158,13 +158,13 @@ const readParseStep = createStep({
   inputSchema: workflowInputSchema,
   outputSchema: sourceStepOutputSchema,
   execute: async ({ inputData }) => {
-    logProgress("Reading source code and detecting language")
+    logProgress("正在读取源代码并检测语言")
     const sourceFile = path.resolve(inputData.file_path)
     const sourceCode = await fsp.readFile(sourceFile, "utf-8")
     const language = detectLanguage(sourceFile, inputData.language)
     const adapter = getLanguageAdapter(language)
     const filename = path.basename(sourceFile)
-    logProgress(`Parsing source structure with ${adapter.displayName} adapter`)
+    logProgress(`正在使用 ${adapter.displayName} 适配器解析源代码结构`)
     const analysis = adapter.parseSource({ sourceCode, filename, sourceFile })
 
     return {
@@ -188,7 +188,7 @@ const designCasesStep = createStep({
   outputSchema: casesStepOutputSchema,
   execute: async ({ inputData }) => {
     const adapter = adapterFor(inputData.language)
-    logProgress(`Calling LLM test-case agent for ${adapter.displayName}`)
+    logProgress(`正在调用 LLM 测试用例 Agent（${adapter.displayName}）`)
     const testCases = await generateTestCases({
       adapter,
       sourceCode: inputData.source_code,
@@ -207,7 +207,7 @@ const exportPlanStep = createStep({
   outputSchema: casesStepOutputSchema,
   execute: async ({ inputData }) => {
     const adapter = adapterFor(inputData.language)
-    logProgress("Exporting test-case plan")
+    logProgress("正在导出测试用例计划")
     adapter.exportArtifacts({
       testCases: inputData.test_cases,
       testCode: "",
@@ -227,7 +227,7 @@ const generateCodeStep = createStep({
   outputSchema: codeStepOutputSchema,
   execute: async ({ inputData }) => {
     const adapter = adapterFor(inputData.language)
-    logProgress(`Calling LLM test-code agent to generate ${adapter.testFramework} tests`)
+    logProgress(`正在调用 LLM 测试代码 Agent 生成 ${adapter.testFramework} 测试`)
     const testCode = await generateTestCode({
       adapter,
       sourceCode: inputData.source_code,
@@ -249,7 +249,7 @@ const executeStep = createStep({
   outputSchema: executionStepOutputSchema,
   execute: async ({ inputData }) => {
     const adapter = adapterFor(inputData.language)
-    logProgress(`Executing tests with ${adapter.displayName} adapter`)
+    logProgress(`正在使用 ${adapter.displayName} 适配器执行测试`)
     const executionResult = adapter.executeTests({
       sourceCode: inputData.source_code,
       sourceFile: inputData.source_file,
@@ -280,7 +280,7 @@ const exportResultsStep = createStep({
     const adapter = adapterFor(inputData.language)
     const diagnosis = inputData.diagnosis as Diagnosis | undefined
     if (diagnosis?.next_action === "INSTALL_DEPENDENCY") {
-      logProgress("Workflow paused before final export because an environment or dependency action is needed")
+      logProgress("工作流在最终导出前暂停，因为需要环境或依赖操作")
       return {
         source_file: inputData.source_file,
         language: inputData.language,
@@ -298,7 +298,7 @@ const exportResultsStep = createStep({
       }
     }
 
-    logProgress("Exporting final test code, report, and version records")
+    logProgress("正在导出最终的测试代码、报告和版本记录")
     const exportResult = adapter.exportArtifacts({
       testCases: inputData.test_cases,
       testCode: inputData.test_code,
@@ -356,11 +356,11 @@ export async function resumeGeneratedTests(input: {
   const adapter = adapterFor(input.language)
   const sourceFile = path.resolve(input.sourceFile)
   const outputDir = path.resolve(input.outputDir)
-  logProgress("Resuming from generated test code; skipping source parsing, test-case design, and test-code generation")
+  logProgress("从已生成的测试代码恢复工作流；跳过源代码解析、测试用例设计和测试代码生成")
   const sourceCode = await fsp.readFile(sourceFile, "utf-8")
   const filename = path.basename(sourceFile)
   const analysis = adapter.parseSource({ sourceCode, filename, sourceFile })
-  logProgress(`Re-executing tests with ${adapter.displayName} adapter`)
+  logProgress(`正在使用 ${adapter.displayName} 适配器重新执行测试`)
   const executionResult = adapter.executeTests({
     sourceCode,
     sourceFile,
@@ -387,7 +387,7 @@ export async function resumeGeneratedTests(input: {
   }, "resumed generated test code")
 
   if (finalData.diagnosis?.next_action === "INSTALL_DEPENDENCY") {
-    logProgress("Workflow remains paused before final export because an environment or dependency action is still needed")
+    logProgress("工作流在最终导出前仍然暂停，因为仍然需要环境或依赖操作")
     return {
       source_file: sourceFile,
       language: input.language,
@@ -441,7 +441,7 @@ async function runSelfHealing(
   initialNote: string
 ) {
   const adapter = adapterFor(inputData.language)
-  logProgress("Running quality check, AI diagnosis, and self-healing decision")
+  logProgress("正在运行质量检查、AI 诊断和自愈决策")
   let testCode = inputData.test_code
   let executionResult = inputData.execution_result as ExecutionResult
   let quality = adapter.checkQuality({ testCode, analysis: inputData.analysis as SourceAnalysis })
@@ -481,7 +481,7 @@ async function runSelfHealing(
       return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
     }
 
-    logProgress(`Self-healing attempt ${attempt}: regenerating test code from AI diagnosis`)
+    logProgress(`自愈尝试第 ${attempt} 次：根据 AI 诊断重新生成测试代码`)
     testCode = await generateTestCode({
       adapter,
       sourceCode: inputData.source_code,
@@ -554,41 +554,41 @@ async function generateTestCases(input: {
       if (requestedCaseLimit !== undefined && allCases.length >= requestedCaseLimit) break
       const remainingGlobalLimit = requestedCaseLimit === undefined ? undefined : Math.max(0, requestedCaseLimit - allCases.length)
       const batchAnalysis: SourceAnalysis = { ...input.analysis, symbols }
-      renderProgressBar("Designing test cases", batchIndex, effectiveBatches.length)
-      const batchCases = await withLlmRetries("test-case batch " + (batchIndex + 1) + "/" + effectiveBatches.length, input.llmRetries, async () => {
+      renderProgressBar("设计测试用例", batchIndex, effectiveBatches.length)
+      const batchCases = await withLlmRetries("测试用例批次 " + (batchIndex + 1) + "/" + effectiveBatches.length, input.llmRetries, async () => {
         const fence = String.fromCharCode(96).repeat(3)
         const prompt = [
-          "Generate concrete unit test cases for every listed symbol.",
-          "Return only valid JSON in this shape: { \"cases\": [...] }.",
-          "Use double quotes for all strings. Do not use Markdown.",
+          "为列出的每个符号生成具体的单元测试用例。",
+          "只返回以下格式的有效 JSON：{ \"cases\": [...] }。",
+          "所有字符串使用双引号。不要使用 Markdown。",
           "",
-          "Rules:",
-          "- Prefer one functional case, boundary cases, and exception/error cases when useful.",
-          "- Boundary values should cover 0, empty strings/collections, negative values, None/null, and extreme values when relevant.",
-          "- Division/modulo code must include a zero divisor case.",
-          "- Recursive code must include base-case and invalid-input cases.",
-          "- A function name containing safe should be tested under unsafe/error inputs.",
-          "- Generate enough cases for meaningful coverage; do not reduce coverage just to keep the response short.",
-          "- Use compact JSON and concise strings so long batches can still be received completely.",
-          "- Do not assume the source is correct only because it runs.",
-          "- input_params keys must exactly match parameter names.",
-          "- expected_result must be concrete.",
-          "- Keep titles, steps, and expected_result concise so the JSON remains complete.",
-          "- Omit optional fields instead of writing null.",
-          "- Global test case limit: " + (requestedCaseLimit ?? "none") + ".",
-          "- Remaining global case limit for this batch: " + (remainingGlobalLimit ?? "none") + ".",
-          "- If there is no global limit, generate all useful cases for the listed symbol.",
+          "规则：",
+          "- 每个符号优先包含一个功能用例、边界用例和异常/错误用例（如果适用）。",
+          "- 边界值应覆盖 0、空字符串/集合、负值、None/null 和极值（如果相关）。",
+          "- 除法/取模代码必须包含除数为零的用例。",
+          "- 递归代码必须包含基本情况和无效输入用例。",
+          "- 包含 safe 的函数名应在不安全/错误输入下进行测试。",
+          "- 生成足够多的用例以达到有意义的覆盖率；不要为了缩短响应而减少覆盖率。",
+          "- 使用紧凑的 JSON 和简洁的字符串，以便长批次仍能完整接收。",
+          "- 不要因为源代码能运行就假设它是正确的。",
+          "- input_params 的键必须与参数名完全匹配。",
+          "- expected_result 必须是具体的。",
+          "- 保持标题、步骤和 expected_result 简洁，以便 JSON 保持完整。",
+          "- 省略可选字段而不是写 null。",
+          "- 全局测试用例限制：" + (requestedCaseLimit ?? "无") + "。",
+          "- 本批次剩余全局用例限制：" + (remainingGlobalLimit ?? "无") + "。",
+          "- 如果没有全局限制，为列出的符号生成所有有用的用例。",
           "",
-          "Expected JSON example:",
+          "预期的 JSON 示例：",
           JSON.stringify({ cases: [{ case_number: "TC-001", title: "specific title", case_type: "functional|boundary|exception", preconditions: "setup", steps: ["step"], input_params: { param: "value" }, expected_result: "specific expected behavior", related_symbol: "symbol name" }] }, null, 2),
           "",
-          "Symbol context:",
+          "符号上下文：",
           input.adapter.buildGenerationContext({ analysis: batchAnalysis, sourceFile: input.sourceFile }),
           "",
-          "Extra requirements:",
-          input.requirementsText ?? "None",
+          "额外需求：",
+          input.requirementsText ?? "无",
           "",
-          "Relevant source code:",
+          "相关源代码：",
           fence + input.adapter.codeFence,
           sourceExcerptForSymbols(input.sourceCode, symbols),
           fence,
@@ -603,12 +603,12 @@ async function generateTestCases(input: {
     finishProgressBar()
 
     if (allCases.length === 0) {
-      throw new Error("LLM returned no test cases.")
+      throw new Error("LLM 未返回任何测试用例。")
     }
     return renumberCases(allCases)
   } catch (error) {
     finishProgressBar()
-    throw new Error("LLM test case generation failed; stopped instead of using fallback. " + formatError(error))
+    throw new Error("LLM 测试用例生成失败，已停止而非使用回退。" + formatError(error))
   }
 }
 
@@ -627,31 +627,31 @@ async function generateTestCode(input: {
   assertLlmAvailable("generate test code")
   try {
     const agent = input.attempt > 1 ? testCodeAgentPro : testCodeAgent
-    return await withLlmRetries("test-code generation attempt " + input.attempt, input.llmRetries, async () => {
+    return await withLlmRetries("测试代码生成尝试 " + input.attempt, input.llmRetries, async () => {
       const fence = String.fromCharCode(96).repeat(3)
       const prompt = [
-        "Generate executable " + input.adapter.testFramework + " unit test code.",
-        "Return only source code. Do not use Markdown fences or explanations.",
+        "生成可执行的 " + input.adapter.testFramework + " 单元测试代码。",
+        "只返回源代码。不要使用 Markdown 代码块或解释性文字。",
         "",
-        "Rules:",
-        "- Every test case must map to a real test function unless user requirements limit the scope.",
-        "- Use real assertions; do not use assert true, assert 1 == 1, empty tests, or only callable/hasattr checks.",
-        "- For expected exceptions, use the precise assertion style for the framework.",
-        "- Follow runtime/import instructions exactly.",
-        "- If previous diagnosis says the generated test code is wrong, fix that specific problem and do not repeat it.",
+        "规则：",
+        "- 每个测试用例必须映射到一个真实的测试函数，除非用户需求限制了范围。",
+        "- 使用真实的断言；不要使用 assert true、assert 1 == 1、空测试或仅 callable/hasattr 检查。",
+        "- 对于预期异常，使用该框架的精确断言风格。",
+        "- 精确遵循运行时/导入指令。",
+        "- 如果之前的诊断指出生成的测试代码有错误，修复该具体问题并且不要重复犯同类错误。",
         "",
-        "Language and symbol context:",
+        "语言和符号上下文：",
         input.adapter.buildGenerationContext({ analysis: input.analysis, sourceFile: input.sourceFile }),
         "",
-        "Output directory: " + path.resolve(input.outputDir),
-        "Attempt: " + input.attempt,
-        "Previous AI diagnosis:",
+        "输出目录：" + path.resolve(input.outputDir),
+        "尝试次数：" + input.attempt,
+        "之前的 AI 诊断：",
         JSON.stringify(input.previousDiagnosis?.report_text ?? input.previousDiagnosis ?? null, null, 2),
         "",
-        "Test cases:",
+        "测试用例：",
         JSON.stringify(input.testCases, null, 2),
         "",
-        "Source code:",
+        "源代码：",
         fence + input.adapter.codeFence,
         input.sourceCode,
         fence,
@@ -659,10 +659,10 @@ async function generateTestCode(input: {
       const response = await agent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 8192 } })
       const code = extractCode(response.text, input.adapter.codeFence)
       if (code.trim()) return code
-      throw new Error("LLM returned empty test code. Preview: " + preview(response.text))
+      throw new Error("LLM 返回了空的测试代码。预览：" + preview(response.text))
     })
   } catch (error) {
-    throw new Error("LLM test code generation failed; stopped instead of using fallback. " + formatError(error))
+    throw new Error("LLM 测试代码生成失败，已停止而非使用回退。" + formatError(error))
   }
 }
 
@@ -681,62 +681,62 @@ async function diagnoseFailure(input: {
   assertLlmAvailable("diagnose failed tests")
   try {
     const agent = input.attempt > 1 ? diagnosisAgentPro : diagnosisAgent
-    const reportText = await withLlmRetries("failure diagnosis attempt " + input.attempt, input.llmRetries, async () => {
+    const reportText = await withLlmRetries("失败诊断尝试 " + input.attempt, input.llmRetries, async () => {
       const fence = String.fromCharCode(96).repeat(3)
       const prompt = [
-        "You are a senior unit-test failure diagnosis agent.",
-        "Read the source code, the designed test cases, the generated test code, and the execution error output.",
-        "Write a direct natural-language diagnosis of the root cause.",
+        "你是一名高级单元测试失败诊断 Agent。",
+        "阅读源代码、设计的测试用例、生成的测试代码和执行错误输出。",
+        "撰写一份直接的自然语言诊断，描述根本原因。",
         "",
-        "Important:",
-        "- Do not output JSON.",
-        "- Do not output a classification template.",
-        "- Do not repeat full logs; quote only the key error lines when useful.",
-        "- Focus on whether the failure reveals a source-code defect, a wrong generated test, or an environment/runtime problem.",
-        "- If the source code is defective, explain the concrete source bug and the expected correct behavior.",
-        "- If the generated test is defective, explain exactly what is wrong with the test code.",
-        "- If an environment command is needed, say the command in plain language.",
+        "重要：",
+        "- 不要输出 JSON。",
+        "- 不要输出分类模板。",
+        "- 不要重复完整日志；只在必要时引用关键的报错行。",
+        "- 关注失败是揭示了源代码缺陷、生成的测试错误还是环境/运行时问题。",
+        "- 如果源代码有缺陷，解释具体的源代码 bug 和预期的正确行为。",
+        "- 如果生成的测试有缺陷，精确解释测试代码中什么错了。",
+        "- 如果需要环境命令，用纯语言说出该命令。",
         "",
-        "Language: " + input.adapter.displayName,
-        "Test framework: " + input.adapter.testFramework,
-        "Runtime OS: " + process.platform,
-        "Attempt: " + input.attempt,
+        "语言：" + input.adapter.displayName,
+        "测试框架：" + input.adapter.testFramework,
+        "运行时操作系统：" + process.platform,
+        "尝试次数：" + input.attempt,
         "",
-        "Source/test context:",
+        "源代码/测试上下文：",
         input.adapter.buildGenerationContext({ analysis: input.analysis, sourceFile: input.sourceFile }),
         "",
-        "Designed test cases:",
+        "设计的测试用例：",
         JSON.stringify(input.testCases, null, 2),
         "",
-        "Generated test code:",
+        "生成的测试代码：",
         fence + input.adapter.codeFence,
         input.testCode,
         fence,
         "",
-        "Execution result and errors:",
+        "执行结果和错误：",
         fence + "json",
         JSON.stringify(input.executionResult, null, 2),
         fence,
         "",
-        "Quality result:",
+        "质量检查结果：",
         fence + "json",
         JSON.stringify(input.quality, null, 2),
         fence,
         "",
-        "Source code:",
+        "源代码：",
         fence + input.adapter.codeFence,
         input.sourceCode,
         fence,
       ].join("\n")
       const response = await agent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 8192 } })
       const text = response.text.trim()
-      if (!text) throw new Error("LLM returned an empty diagnosis.")
+      if (!text) throw new Error("LLM 返回了空的诊断。")
       return text
     })
     const decision = await classifyDiagnosisDecision(reportText, input)
     return { ...decision, report_text: reportText }
   } catch (error) {
-    throw new Error("LLM failure diagnosis failed; stopped instead of using fallback. " + formatError(error))
+    throw new Error("LLM 失败诊断失败，已停止而非使用回退。" + formatError(error))
   }
 }
 
@@ -753,33 +753,33 @@ async function classifyDiagnosisDecision(
   }
 ): Promise<Diagnosis> {
   const prompt = [
-    "Convert this unit-test failure diagnosis into the required internal JSON decision.",
-    "Return only valid JSON. Do not add Markdown.",
+    "将此单元测试失败诊断转换为所需的内部 JSON 决策。",
+    "只返回有效的 JSON。不要添加 Markdown。",
     "",
-    "Natural-language diagnosis:",
+    "自然语言诊断：",
     reportText,
     "",
-    "Execution result:",
+    "执行结果：",
     JSON.stringify(input.executionResult, null, 2),
     "",
-    "Quality result:",
+    "质量检查结果：",
     JSON.stringify(input.quality, null, 2),
     "",
-    "Language: " + input.adapter.displayName,
-    "Test framework: " + input.adapter.testFramework,
-    "Runtime OS: " + process.platform,
-    "Attempt: " + input.attempt,
-    "Source/test context:",
+    "语言：" + input.adapter.displayName,
+    "测试框架：" + input.adapter.testFramework,
+    "运行时操作系统：" + process.platform,
+    "尝试次数：" + input.attempt,
+    "源代码/测试上下文：",
     input.adapter.buildGenerationContext({ analysis: input.analysis, sourceFile: input.sourceFile }),
   ].join("\n")
 
-  return await withLlmRetries("failure diagnosis decision attempt " + input.attempt, input.llmRetries, async () => {
+  return await withLlmRetries("失败诊断决策尝试 " + input.attempt, input.llmRetries, async () => {
     const response = await diagnosisDecisionAgent.generate(prompt, {
       modelSettings: { temperature: 0, maxOutputTokens: 2048 },
     })
     const parsed = diagnosisSchema.safeParse(parseJsonValue(response.text))
     if (!parsed.success) {
-      throw new Error("Invalid diagnosis decision JSON: " + parsed.error.message + ". Preview: " + preview(response.text))
+      throw new Error("无效的诊断决策 JSON：" + parsed.error.message + "。预览：" + preview(response.text))
     }
     return parsed.data as Diagnosis
   })
@@ -860,7 +860,7 @@ async function withLlmRetries<T>(
       remaining -= 1
       if (remaining > 0) {
         const total = retryCount + 1
-        logProgress(`LLM ${label} failed on attempt ${total - remaining}/${total}; retrying. Reason: ${formatError(error)}`)
+        logProgress(`LLM ${label} 在第 ${total - remaining}/${total} 次尝试中失败，正在重试。原因：${formatError(error)}`)
         continue
       }
     }
@@ -893,32 +893,32 @@ async function parseTestCaseBatch(text: string, llmRetries: number, originalProm
     return validateTestCaseBatch(text)
   } catch (error) {
     if (originalPrompt && isIncompleteJsonError(error)) {
-      logProgress("Test-case JSON looks truncated; asking LLM to continue from the cutoff.")
+      logProgress("测试用例 JSON 看起来被截断了；请求 LLM 从中断处继续。")
       try {
         const continued = await continueTestCaseJson(text, originalPrompt, llmRetries)
         return validateTestCaseBatch(continued)
       } catch (continuationError) {
-        logProgress("Continuation did not produce complete JSON; falling back to JSON repair. Reason: " + formatError(continuationError))
+        logProgress("续写未能生成完整的 JSON；回退到 JSON 修复。原因：" + formatError(continuationError))
       }
     }
 
-    logProgress("Repairing invalid test-case JSON with LLM. Reason: " + formatError(error))
-    return await withLlmRetries("test-case JSON repair", Math.min(llmRetries, 1), async () => {
-      const repairPrompt = [
-        "The previous response was intended to be JSON for unit test cases, but it was invalid or incomplete.",
-        "Repair it into one compact, valid JSON object only.",
-        "Do not add Markdown. Do not add explanations.",
-        "Every case must contain: case_number, title, case_type, preconditions, steps, input_params, expected_result, related_symbol.",
-        "If preconditions are missing, use \"none\".",
-        "If steps are missing, infer a short step from the input parameters.",
-        "Keep the original intent and do not invent unrelated symbols.",
-        "",
-        "Required shape:",
-        JSON.stringify({ cases: [{ case_number: "TC-001", title: "specific title", case_type: "functional", preconditions: "none", steps: ["call function"], input_params: {}, expected_result: "specific expected behavior", related_symbol: "symbol" }] }, null, 2),
-        "",
-        "Invalid or incomplete response:",
-        text,
-      ].join("\n")
+    logProgress("正在用 LLM 修复无效的测试用例 JSON。原因：" + formatError(error))
+    return await withLlmRetries("测试用例 JSON 修复", Math.min(llmRetries, 1), async () => {
+        const repairPrompt = [
+          "之前的响应本应为单元测试用例的 JSON，但无效或不完整。",
+          "将其修复为一个紧凑、有效的 JSON 对象。",
+          "不要添加 Markdown。不要添加解释。",
+          "每个用例必须包含：case_number、title、case_type、preconditions、steps、input_params、expected_result、related_symbol。",
+          "如果缺少 preconditions，使用 \"无\"。",
+          "如果缺少 steps，从输入参数推断一个简短步骤。",
+          "保持原始意图，不要发明无关的符号。",
+          "",
+          "所需格式：",
+          JSON.stringify({ cases: [{ case_number: "TC-001", title: "specific title", case_type: "functional", preconditions: "none", steps: ["call function"], input_params: {}, expected_result: "specific expected behavior", related_symbol: "symbol" }] }, null, 2),
+          "",
+          "无效或不完整的响应：",
+          text,
+        ].join("\n")
       const response = await testCaseAgent.generate(repairPrompt, { modelSettings: { temperature: 0, maxOutputTokens: 12000 } })
       return validateTestCaseBatch(response.text)
     })
@@ -929,10 +929,10 @@ function validateTestCaseBatch(text: string): TestCase[] {
   const parsed = parseJsonValue(text)
   const result = testCaseBatchSchema.safeParse(parsed)
   if (!result.success) {
-    throw new Error("Invalid test-case JSON: " + formatZodIssues(result.error.issues) + ". Preview: " + preview(text))
+    throw new Error("无效的测试用例 JSON：" + formatZodIssues(result.error.issues) + "。预览：" + preview(text))
   }
   if (result.data.cases.length === 0) {
-    throw new Error("LLM returned an empty case list. Preview: " + preview(text))
+    throw new Error("LLM 返回了空的用例列表。预览：" + preview(text))
   }
   return result.data.cases
 }
@@ -942,17 +942,17 @@ async function continueTestCaseJson(partialText: string, originalPrompt: string,
   const rounds = Math.max(2, Math.min(6, llmRetries + 3))
 
   for (let round = 1; round <= rounds; round += 1) {
-    const continuation = await withLlmRetries("test-case JSON continuation " + round + "/" + rounds, Math.min(llmRetries, 1), async () => {
+    const continuation = await withLlmRetries("测试用例 JSON 续写 " + round + "/" + rounds, Math.min(llmRetries, 1), async () => {
       const prompt = [
-        "Your previous unit-test JSON response was truncated before the JSON value was complete.",
-        "Continue from the exact cutoff point so that the final concatenated text becomes one valid JSON object.",
-        "Do not restart from the beginning unless you choose to return the whole corrected JSON object.",
-        "Do not use Markdown. Do not explain.",
+        "你之前的单元测试 JSON 响应在 JSON 值完成之前被截断了。",
+        "从确切的截断点继续，使最终拼接的文本成为一个有效的 JSON 对象。",
+        "除非你选择返回整个修正后的 JSON 对象，否则不要从头重新开始。",
+        "不要使用 Markdown。不要解释。",
         "",
-        "Original task:",
+        "原始任务：",
         originalPrompt,
         "",
-        "Partial response received so far:",
+        "目前已收到的部分响应：",
         combined,
       ].join("\n")
       const response = await testCaseAgent.generate(prompt, {
@@ -1072,7 +1072,7 @@ function parseJsonValue(text: string): unknown {
   const arrayStart = text.indexOf("[")
   const starts = [objectStart, arrayStart].filter((value) => value >= 0)
   if (starts.length === 0) {
-    throw new Error(`No JSON object or array found in LLM response. Preview: ${preview(text)}`)
+    throw new Error(`在 LLM 响应中未找到 JSON 对象或数组。预览：${preview(text)}`)
   }
 
   const start = Math.min(...starts)
@@ -1080,7 +1080,7 @@ function parseJsonValue(text: string): unknown {
   const closer = opener === "{" ? "}" : "]"
   const end = findMatchingJsonEnd(text, start, opener, closer)
   if (end < 0) {
-    throw new Error(`No complete JSON value found in LLM response. Preview: ${preview(text)}`)
+    throw new Error(`在 LLM 响应中未找到完整的 JSON 值。预览：${preview(text)}`)
   }
 
   return JSON.parse(text.slice(start, end + 1))
@@ -1214,7 +1214,7 @@ function renderProgressBar(label: string, current: number, total: number): void 
   const filled = Math.round((safeCurrent / safeTotal) * width)
   const bar = "#".repeat(filled) + "-".repeat(width - filled)
   const percent = Math.round((safeCurrent / safeTotal) * 100)
-  process.stdout.write("\rAgent progress: " + label + " [" + bar + "] " + safeCurrent + "/" + safeTotal + " " + percent + "%")
+  process.stdout.write("\rAgent 进度：" + label + " [" + bar + "] " + safeCurrent + "/" + safeTotal + " " + percent + "%")
 }
 
 function finishProgressBar(): void {
@@ -1222,5 +1222,5 @@ function finishProgressBar(): void {
 }
 
 function logProgress(message: string): void {
-  console.log("Agent progress: " + message)
+  console.log("Agent 进度：" + message)
 }

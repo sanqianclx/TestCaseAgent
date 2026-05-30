@@ -1,48 +1,48 @@
 import { Agent } from "@mastra/core/agent"
 import "../runtime/env.js"
 
-const instructions = `You are a unit-test failure diagnosis expert for Python, Java, and C++.
+const instructions = `你是 Python、Java 和 C++ 单元测试失败诊断专家。
 
-Your output is written directly into the final report, so write natural-language diagnosis text, not JSON.
+你的输出直接写入最终报告，所以请写自然语言的诊断文本，而不是 JSON。
 
-Focus on root cause:
-- If source code is wrong, explain the concrete source defect and the correct expected behavior.
-- If generated test code is wrong, explain what the test code got wrong.
-- If the environment is missing a tool or dependency, explain what is missing and mention the command only as plain text.
-- Quote only key error lines. Do not paste full logs.
-- Be direct and useful.`
+关注根本原因：
+- 如果源代码有错误，解释具体的源代码缺陷和正确的预期行为。
+- 如果生成的测试代码有错误，解释测试代码错在哪里。
+- 如果环境缺少工具或依赖，解释缺少什么，并仅以纯文本形式提及命令。
+- 只引用关键的报错行。不要粘贴完整日志。
+- 要直接而有用。`
 
 export const diagnosisAgent = new Agent({
   id: "diagnosis-agent",
-  name: "Failure Diagnosis Agent",
+  name: "失败诊断 Agent",
   instructions,
   model: "deepseek/deepseek-chat",
 })
 
 export const diagnosisAgentPro = new Agent({
   id: "diagnosis-agent-pro",
-  name: "Failure Diagnosis Agent Pro",
+  name: "失败诊断 Agent Pro",
   instructions,
   model: "deepseek/deepseek-v4-pro",
 })
 
 export const diagnosisDecisionAgent = new Agent({
   id: "diagnosis-decision-agent",
-  name: "Failure Diagnosis Decision Agent",
-  instructions: `You convert a natural-language unit-test failure diagnosis into a small JSON decision for automation.
-This JSON is internal and is not written to the final user report.
+  name: "失败诊断决策 Agent",
+  instructions: `你将自然语言的单元测试失败诊断转换为用于自动化的简短 JSON 决策。
+这个 JSON 是内部使用的，不会写入用户的最终报告。
 
-Return only valid JSON:
+只返回有效的 JSON：
 {
   "diagnosis_type": "TEST_CODE_ERROR|SOURCE_RUNTIME_ERROR|BEHAVIOR_MISMATCH|ENVIRONMENT_ERROR|UNKNOWN",
   "confidence": 0.0,
-  "summary": "short decision summary",
-  "evidence": ["key evidence"],
+  "summary": "简短决策摘要",
+  "evidence": ["关键证据"],
   "next_action": "REGENERATE_TEST_CODE|ASK_USER_CONFIRMATION|INSTALL_DEPENDENCY|REPORT_TO_USER",
-  "suggested_commands": ["optional shell command"]
+  "suggested_commands": ["可选的 shell 命令"]
 }
 
-Decision rules:
+决策规则：
 - TEST_CODE_ERROR -> REGENERATE_TEST_CODE
 - SOURCE_RUNTIME_ERROR -> REPORT_TO_USER
 - BEHAVIOR_MISMATCH -> ASK_USER_CONFIRMATION

@@ -39,12 +39,12 @@ const mediumRiskPatterns = [
 
 export function assessCommandRisk(command: string): CommandRisk {
   if (highRiskPatterns.some((pattern) => pattern.test(command))) {
-    return { level: "high", reasons: ["The command may delete files, reset a repository, or modify system state."] }
+    return { level: "high", reasons: ["该命令可能删除文件、重置仓库或修改系统状态。"] }
   }
   if (mediumRiskPatterns.some((pattern) => pattern.test(command))) {
-    return { level: "medium", reasons: ["The command may install dependencies, create environments, or run a project build."] }
+    return { level: "medium", reasons: ["该命令可能安装依赖、创建环境或运行项目构建。"] }
   }
-  return { level: "low", reasons: ["The command looks like a normal check or test command."] }
+  return { level: "low", reasons: ["该命令看起来像是普通的检查或测试命令。"] }
 }
 
 export function runCommandInVisibleTerminal(input: {
@@ -62,8 +62,8 @@ export function runCommandInVisibleTerminal(input: {
     "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8",
     "$ErrorActionPreference = \"Continue\"",
     `Set-Location -LiteralPath ${psString(cwd)}`,
-    `Write-Host "Working directory: ${cwd}"`,
-    `Write-Host "Command: ${input.command.replace(/"/g, '\\"')}"`,
+    `Write-Host "工作目录：${cwd}"`,
+    `Write-Host "命令：${input.command.replace(/"/g, '\\"')}"`,
     "Write-Host \"\"",
     "$__cmd = @'",
     input.command.replace(/'@/g, "' + '@' + '"),
@@ -72,7 +72,7 @@ export function runCommandInVisibleTerminal(input: {
     "$__exit = if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } else { 0 }",
     "Write-Host \"\"",
     "Write-Host \"Exit code: $__exit\"",
-    keepOpen ? "Write-Host \"Window kept open for inspection. Press Enter to close.\"; Read-Host | Out-Null" : "",
+    keepOpen ? "Write-Host \"窗口保持打开以供检查。按 Enter 关闭。\"; Read-Host | Out-Null" : "",
     "exit $__exit",
   ].filter(Boolean).join("\r\n")
 

@@ -37,14 +37,14 @@ def export_cases(
         exported.append(py_path)
 
     md_lines = [
-        "# Unit Test Generation Report",
+        "# 单元测试生成报告",
         "",
-        f"- Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"- Test cases: {len(test_cases)}",
+        f"- 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 测试用例数：{len(test_cases)}",
         "",
-        "## Test Cases",
+        "## 测试用例",
         "",
-        "| ID | Title | Type | Input Params | Preconditions | Expected Result |",
+        "| 编号 | 标题 | 类型 | 输入参数 | 前置条件 | 预期结果 |",
         "| --- | --- | --- | --- | --- | --- |",
     ]
 
@@ -63,44 +63,44 @@ def export_cases(
     if coverage:
         md_lines.extend([
             "",
-            "## Coverage",
+            "## 覆盖率",
             "",
-            f"- Symbol coverage: {coverage.get('symbol_coverage', 0)}%",
-            f"- Covered symbols: {len(coverage.get('covered_symbols', []))}/{coverage.get('total_symbols', 0)}",
-            f"- Total test cases: {coverage.get('total_cases', len(test_cases))}",
+            f"- 符号覆盖率：{coverage.get('symbol_coverage', 0)}%",
+            f"- 已覆盖符号：{len(coverage.get('covered_symbols', []))}/{coverage.get('total_symbols', 0)}",
+            f"- 总测试用例数：{coverage.get('total_cases', len(test_cases))}",
         ])
         case_type_coverage = coverage.get("case_type_coverage") or {}
         if case_type_coverage:
-            md_lines.append("- Case type distribution:")
+            md_lines.append("- 用例类型分布：")
             for key, value in case_type_coverage.items():
                 md_lines.append(f"  - {clean_text(key)}: {value}%")
         uncovered = coverage.get("uncovered_symbols") or []
         if uncovered:
-            md_lines.append("- Uncovered symbols:")
+            md_lines.append("- 未覆盖符号：")
             for item in uncovered:
                 md_lines.append(f"  - {clean_text(item)}")
 
     if execution_result:
         md_lines.extend([
             "",
-            "## Execution Summary",
+            "## 执行摘要",
             "",
-            f"- Status: {execution_result.get('status', 'unknown')}",
-            f"- Passed: {execution_result.get('passed', 0)}",
-            f"- Failed: {execution_result.get('failed', 0)}",
-            f"- Errors: {execution_result.get('errors', 0)}",
-            f"- Exit code: {execution_result.get('exit_code', '')}",
-            f"- Duration: {execution_result.get('duration_ms', '')} ms",
-            f"- Timeout: {execution_result.get('timeout', False)}",
+            f"- 状态：{execution_result.get('status', 'unknown')}",
+            f"- 通过：{execution_result.get('passed', 0)}",
+            f"- 失败：{execution_result.get('failed', 0)}",
+            f"- 错误：{execution_result.get('errors', 0)}",
+            f"- 退出码：{execution_result.get('exit_code', '')}",
+            f"- 耗时：{execution_result.get('duration_ms', '')} 毫秒",
+            f"- 超时：{execution_result.get('timeout', False)}",
         ])
 
         test_results = execution_result.get("test_results", [])
         if test_results:
             md_lines.extend([
                 "",
-                "## Per-Test Results",
+                "## 逐用例结果",
                 "",
-                "| # | Test | Result | Failure Reason |",
+                "| # | 测试 | 结果 | 失败原因 |",
                 "| --- | --- | --- | --- |",
             ])
             for idx, tr in enumerate(test_results, 1):
@@ -115,21 +115,21 @@ def export_cases(
     if quality:
         md_lines.extend([
             "",
-            "## Quality Check",
+            "## 质量检查",
             "",
-            f"- Result: {'passed' if quality.get('ok') else 'failed'}",
-            f"- Checked tests: {quality.get('checked_tests', '')}",
+            f"- 结果：{'通过' if quality.get('ok') else '未通过'}",
+            f"- 检查的测试数：{quality.get('checked_tests', '')}",
         ])
         issues = quality.get("issues", [])
         if issues:
-            md_lines.append("- Issues:")
+            md_lines.append("- 问题列表：")
             for item in issues:
                 md_lines.append(f"  - {clean_text(item)}")
 
     if diagnosis:
         md_lines.extend([
             "",
-            "## AI Failure Diagnosis",
+            "## AI 失败诊断",
             "",
             clean_text(diagnosis.get("report_text") or diagnosis.get("summary") or json.dumps(diagnosis, ensure_ascii=False, indent=2)),
         ])
@@ -137,9 +137,9 @@ def export_cases(
     if versions:
         md_lines.extend([
             "",
-            "## Test Code Version History",
+            "## 测试代码版本历史",
             "",
-            "| Version | Attempt | Execution Status | Quality | Internal Decision | Note |",
+            "| 版本 | 尝试次数 | 执行状态 | 质量 | 内部决策 | 备注 |",
             "| --- | --- | --- | --- | --- | --- |",
         ])
         for version in versions:

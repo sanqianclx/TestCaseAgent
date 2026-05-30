@@ -22,18 +22,18 @@ export function getLlmUnavailableReason(): string | undefined {
 
   const forcedOff = (process.env.TESTGENERATE_LLM ?? "").toLowerCase()
   if (["0", "false", "off"].includes(forcedOff)) {
-    return "TESTGENERATE_LLM is disabled."
+    return "TESTGENERATE_LLM 已被禁用。"
   }
 
   const key = process.env.OPENAI_API_KEY || process.env.MASTRA_API_KEY || process.env.DEEPSEEK_API_KEY || ""
   if (!key) {
-    return "No API key found. Set DEEPSEEK_API_KEY, OPENAI_API_KEY, or MASTRA_API_KEY in .env or environment variables."
+    return "未找到 API Key。请在 .env 文件或环境变量中设置 DEEPSEEK_API_KEY、OPENAI_API_KEY 或 MASTRA_API_KEY。"
   }
   if (!/^[\x20-\x7E]+$/.test(key)) {
-    return "The API key contains non-ASCII or hidden characters. Copy it into .env again as plain text."
+    return "API Key 包含非 ASCII 或隐藏字符。请重新以纯文本形式复制到 .env 中。"
   }
   if (key.length <= 20 || key.includes("your") || key.includes("xxx")) {
-    return "The API key looks like a placeholder or is too short."
+    return "API Key 看起来像是占位符或太短。"
   }
 
   return undefined
@@ -46,7 +46,7 @@ export function canUseLLM(): boolean {
 export function assertLlmAvailable(stage: string): void {
   const reason = getLlmUnavailableReason()
   if (reason) {
-    throw new Error(`LLM is not connected, cannot ${stage}. ${reason}`)
+    throw new Error(`LLM 未连接，无法执行${stage}。${reason}`)
   }
 }
 

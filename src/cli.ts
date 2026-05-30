@@ -119,9 +119,9 @@ async function main(): Promise<void> {
 async function runInteractive(args: CliArgs): Promise<void> {
   const sessionId = `cli-${Date.now()}`
   let state: ConversationState = { mode: "idle" }
-  memoryStore.addMessage(sessionId, "system", "natural language CLI session started")
+  memoryStore.addMessage(sessionId, "system", "自然语言 CLI 会话已启动")
 
-  console.log("Unit-test generation Agent started. You can say: generate tests for output\\sources\\test_source.py")
+  console.log("单元测试生成 Agent 已启动。你可以说：为 output\\sources\\test_source.py 生成测试")
   const rl = readline.createInterface({ input, output })
 
   try {
@@ -153,27 +153,27 @@ async function runInteractive(args: CliArgs): Promise<void> {
       if (state.mode === "awaiting_command_confirmation") {
         const intent = await askPendingIntent(line, sessionId, state, args)
         if (intent.intent === "exit") {
-          console.log("Agent: bye.")
+          console.log("Agent：再见。")
           break
         }
         if (intent.intent === "confirm") {
           const commandResult = await runVisibleCommand(state.command, sessionId)
           if (state.command.plan && commandResult.exitCode === 0) {
-            console.log("Agent: command finished successfully. Continuing the paused workflow now.")
+            console.log("Agent：命令执行成功。现在继续已暂停的工作流。")
             state = state.command.pausedResult
               ? await resumePausedWorkflow(state.command.pausedResult, state.command.plan, sessionId)
               : await maybeAskNextAction(await runGeneration({ ...state.command.plan, sessionId, interactive: true }), state.command.plan, sessionId)
             continue
           }
           if (state.command.plan) {
-            console.log("Agent: the command did not finish successfully. I will keep the plan blocked here; confirm again after you fix the environment.")
+            console.log("Agent：命令未成功执行。我将保持计划挂起状态；修复环境后请再次确认。")
             state = { mode: "awaiting_plan_confirmation", plan: state.command.plan }
             continue
           }
         } else if (intent.intent === "cancel") {
-          console.log("Agent: command skipped. The diagnosis is already written to the report.")
+          console.log("Agent：命令已跳过。诊断结果已写入报告。")
         } else {
-          console.log(`Agent: ${intent.reply ?? "I need your decision before running the command."}`)
+          console.log(`Agent：${intent.reply ?? "我需要你的决定后才能执行命令。"}`)
           continue
         }
         state = { mode: "idle" }
@@ -183,7 +183,7 @@ async function runInteractive(args: CliArgs): Promise<void> {
       if (state.mode === "awaiting_plan_confirmation") {
         const intent = await askPendingIntent(line, sessionId, state, args)
         if (intent.intent === "exit") {
-          console.log("Agent: bye.")
+          console.log("Agent：再见。")
           break
         }
         if (intent.intent === "confirm") {
@@ -192,7 +192,7 @@ async function runInteractive(args: CliArgs): Promise<void> {
           continue
         }
         if (intent.intent === "cancel") {
-          console.log("Agent: cancelled. Tell me another source file when you are ready.")
+          console.log("Agent：已取消。准备好后告诉我另一个源文件路径。")
           state = { mode: "idle" }
           continue
         }
@@ -216,38 +216,38 @@ async function askConversationAgent(
   if (!canUseLLM()) {
     return {
       action: "answer",
-      reply: `LLM is not connected, so I cannot understand requests or generate tests. Reason: ${getLlmUnavailableReason()}`,
+      reply: `LLM 未连接，无法理解请求或生成测试。原因：${getLlmUnavailableReason()}`,
     }
   }
 
   const sessionState = getSessionState(sessionId)
   try {
-    return await withRetries("CLI conversation", args.llmRetries, async () => {
+     return await withRetries("CLI 对话", args.llmRetries, async () => {
       const response = await cliConversationAgent.generate(`
-You are a command-line unit-test generation agent.
-Only handle unit-test generation tasks.
-If required information is missing, ask one concise follow-up question.
-If enough information is available, propose an execution plan and wait for confirmation.
-Preserve user scope constraints in requirements_text, including requests to generate only a limited number of tests.
+你是一个命令行单元测试生成 Agent。
+只处理单元测试生成相关的任务。
+如果缺少必要信息，请追问一句简洁的补充问题。
+如果信息充足，请提出执行计划并等待用户确认。
+在 requirements_text 中保留用户的范围约束，包括只生成有限数量测试的请求。
 
-Return only valid JSON:
+只返回有效的 JSON：
 {
   "action": "answer" | "ask" | "propose_plan" | "cancel" | "exit",
-  "reply": "natural language reply for the user",
+  "reply": "给用户的自然语言回复",
   "plan": {
-    "file_path": "source file path, optional",
-    "output_dir": "output directory, optional",
-    "language": "auto|python|java|cpp, optional",
+    "file_path": "源文件路径，可选",
+    "output_dir": "输出目录，可选",
+    "language": "auto|python|java|cpp，可选",
     "max_attempts": 3,
     "llm_retries": 2,
-    "requirements_text": "extra requirements, optional"
+    "requirements_text": "额外需求，可选"
   }
 }
 
-Current working directory: ${process.cwd()}
-Conversation memory: ${memoryStore.summarize(sessionId)}
-Current CLI state: ${JSON.stringify(state, null, 2)}
-Startup args and remembered context:
+当前工作目录：${process.cwd()}
+对话记忆：${memoryStore.summarize(sessionId)}
+当前 CLI 状态：${JSON.stringify(state, null, 2)}
+启动参数和上下文记忆：
 ${JSON.stringify({
   output: args.output,
   maxAttempts: args.maxAttempts,
@@ -260,7 +260,7 @@ ${JSON.stringify({
   lastLlmRetries: sessionState.lastLlmRetries,
 }, null, 2)}
 
-Latest user message:
+用户最新消息：
 ${userMessage}
 `, { modelSettings: { temperature: 0.2, maxOutputTokens: 2048 } })
       return parseDecisionStrict(response.text)
@@ -268,7 +268,7 @@ ${userMessage}
   } catch (error) {
     return {
       action: "answer",
-      reply: `LLM call failed and no local fallback will be used. Reason: ${formatError(error)}`,
+      reply: `LLM 调用失败，不会使用本地回退。原因：${formatError(error)}`,
     }
   }
 }
@@ -282,28 +282,28 @@ async function askPendingIntent(
   if (!canUseLLM()) {
     return {
       intent: "other",
-      reply: `LLM is not connected, so I cannot understand this reply. Reason: ${getLlmUnavailableReason()}`,
+      reply: `LLM 未连接，无法理解此回复。原因：${getLlmUnavailableReason()}`,
     }
   }
 
-  return await withRetries("pending intent classification", args.llmRetries, async () => {
+  return await withRetries("待定意图分类", args.llmRetries, async () => {
     const response = await cliIntentAgent.generate(`
-Classify the user's latest reply for the pending CLI state.
-Do not execute anything. Only classify the user's intent.
+对用户在待定 CLI 状态下的最新回复进行意图分类。
+不要执行任何操作。只对用户意图进行分类。
 
-Return only valid JSON:
+只返回有效的 JSON：
 {
   "intent": "confirm" | "cancel" | "exit" | "other",
-  "reply": "short message to show if intent is other, optional otherwise"
+  "reply": "当 intent 为 other 时显示的简短消息，其他情况可选"
 }
 
-Pending state:
+待定状态：
 ${JSON.stringify(state, null, 2)}
 
-Conversation memory:
+对话记忆：
 ${memoryStore.summarize(sessionId)}
 
-Latest user reply:
+用户最新回复：
 ${userMessage}
 `, { modelSettings: { temperature: 0, maxOutputTokens: 1024 } })
     return parsePendingIntentStrict(response.text)
@@ -319,39 +319,39 @@ async function askFollowupAgent(
   if (!canUseLLM()) {
     return {
       action: "answer",
-      reply: `LLM is not connected, so I cannot understand this reply. Reason: ${getLlmUnavailableReason()}`,
+      reply: `LLM 未连接，无法理解此回复。原因：${getLlmUnavailableReason()}`,
     }
   }
 
-  return await withRetries("workflow follow-up", args.llmRetries, async () => {
+  return await withRetries("工作流跟进", args.llmRetries, async () => {
     const response = await cliFollowupAgent.generate(`
-The unit-test generation workflow is paused and waiting for the user.
-Interpret the user's latest reply and choose the next generic action.
-Do not execute anything.
+单元测试生成工作流已暂停，正在等待用户。
+解读用户的最新回复并选择下一步操作。
+不要执行任何操作。
 
-Return only valid JSON:
+只返回有效的 JSON：
 {
   "action": "answer" | "continue" | "run_command" | "update_env" | "update_plan" | "cancel" | "exit",
-  "reply": "short message for the user",
-  "command": "shell command, only when action is run_command",
-  "env": { "NAME": "value", "PATH_PREPEND": "optional path to prepend" },
+  "reply": "给用户的简短消息",
+  "command": "shell 命令，仅在 action 为 run_command 时需要",
+  "env": { "NAME": "value", "PATH_PREPEND": "要追加到 PATH 的可选路径" },
   "plan": {
-    "file_path": "optional",
-    "output_dir": "optional",
-    "language": "auto|python|java|cpp, optional",
+    "file_path": "可选",
+    "output_dir": "可选",
+    "language": "auto|python|java|cpp，可选",
     "max_attempts": 3,
     "llm_retries": 2,
-    "requirements_text": "optional"
+    "requirements_text": "可选"
   }
 }
 
-Paused workflow context:
+已暂停的工作流上下文：
 ${JSON.stringify(followup, null, 2)}
 
-Conversation memory:
+对话记忆：
 ${memoryStore.summarize(sessionId)}
 
-Latest user reply:
+用户最新回复：
 ${userMessage}
 `, { modelSettings: { temperature: 0, maxOutputTokens: 2048 } })
     return parseFollowupDecisionStrict(response.text)
@@ -362,27 +362,27 @@ async function askRetryExtensionWithAI(label: string, errorText: string, llmRetr
   const ql = readline.createInterface({ input, output })
   try {
     while (true) {
-      console.log(`\nLLM call "${label}" has exhausted its retry limit.`)
-      console.log(`Last error: ${errorText}`)
-      const answer = await ql.question("Do you want to add 3 more retries? ")
-      const intent = await withRetries("retry-extension intent classification", llmRetries, async () => {
+      console.log(`\nLLM 调用"${label}"已耗尽重试次数。`)
+      console.log(`最后错误：${errorText}`)
+      const answer = await ql.question("是否要增加 3 次重试？")
+      const intent = await withRetries("重试扩展意图分类", llmRetries, async () => {
         const response = await cliIntentAgent.generate([
-          "Classify whether the user wants to add 3 more LLM retries.",
-          "Return only JSON:",
-          "{\"intent\":\"confirm|cancel|exit|other\",\"reply\":\"optional short reply\"}",
+          "判断用户是否想要增加 3 次 LLM 重试。",
+          "只返回 JSON：",
+          "{\"intent\":\"confirm|cancel|exit|other\",\"reply\":\"可选的简短回复\"}",
           "",
-          "Pending question: add 3 more retries for " + label,
-          "Last error: " + errorText,
-          "User reply: " + answer,
+          "待定问题：为 " + label + " 增加 3 次重试",
+          "最后错误：" + errorText,
+          "用户回复：" + answer,
         ].join("\n"), { modelSettings: { temperature: 0, maxOutputTokens: 512 } })
         return parsePendingIntentStrict(response.text)
       })
       if (intent.intent === "confirm") return 3
       if (intent.intent === "cancel" || intent.intent === "exit") {
-        console.log("Agent: okay, I will stop retrying and report the failure.")
+        console.log("Agent：好的，我将停止重试并报告失败。")
         return 0
       }
-      console.log(`Agent: ${intent.reply ?? "I need a clear decision before adding retries."}`)
+      console.log(`Agent：${intent.reply ?? "增加重试前我需要一个明确的决定。"}`)
     }
   } finally {
     ql.close()
@@ -395,18 +395,18 @@ async function applyDecision(
   state: ConversationState
 ): Promise<ConversationState> {
   if (decision.action === "answer" || decision.action === "ask") {
-    console.log(`Agent: ${decision.reply}`)
+    console.log(`Agent：${decision.reply}`)
     memoryStore.addMessage(sessionId, "agent", decision.reply)
     return state.mode === "awaiting_plan_confirmation" ? state : { mode: "idle" }
   }
 
   if (decision.action === "cancel") {
-    console.log(`Agent: ${decision.reply || "Cancelled."}`)
+    console.log(`Agent：${decision.reply ?? "已取消。"}`)
     return { mode: "idle" }
   }
 
   if (decision.action === "exit") {
-    console.log(`Agent: ${decision.reply || "bye."}`)
+    console.log(`Agent：${decision.reply ?? "再见。"}`)
     return { mode: "exit" }
   }
 
@@ -416,12 +416,12 @@ async function applyDecision(
       printPlan(decision.reply, plan)
       return { mode: "awaiting_plan_confirmation", plan }
     } catch (error) {
-      console.log(`Agent: I cannot start yet because ${formatError(error)}`)
+      console.log(`Agent：暂时无法启动，因为 ${formatError(error)}`)
       return state
     }
   }
 
-  console.log("Agent: I did not understand that. Tell me a source file path or ask what I can do.")
+  console.log("Agent：我没理解。请告诉我源文件路径或问我能做什么。")
   return state
 }
 
@@ -448,7 +448,7 @@ async function runGeneration(inputData: {
     lastLlmRetries: inputData.llmRetries,
   })
 
-  console.log("Agent: confirmed. Starting test generation and printing each step.")
+  console.log("Agent：已确认。开始测试生成，逐步打印进度。")
 
   const restoreEnv = applyTemporaryEnv(inputData.env)
   if (inputData.interactive) {
@@ -472,8 +472,8 @@ async function runGeneration(inputData: {
 
     if (result.status !== "success") {
       const message = result.status === "failed" ? result.error.message : JSON.stringify(result, null, 2)
-      console.log(`Agent: generation failed: ${message}`)
-      memoryStore.addMessage(inputData.sessionId, "agent", `generation failed: ${message}`)
+      console.log(`Agent：生成失败：${message}`)
+      memoryStore.addMessage(inputData.sessionId, "agent", `生成失败：${message}`)
       process.exitCode = 1
       return undefined
     }
@@ -483,10 +483,10 @@ async function runGeneration(inputData: {
       lastRunSummary: {
         passed: outputData.passed,
         exportedFiles: outputData.exported_files,
-        message: `${outputData.language} workflow passed=${outputData.passed}`,
+        message: `${outputData.language} 工作流通过=${outputData.passed}`,
       },
     })
-    memoryStore.addMessage(inputData.sessionId, "agent", "generation finished", {
+    memoryStore.addMessage(inputData.sessionId, "agent", "生成完成", {
       language: outputData.language,
       passed: outputData.passed,
       diagnosis: outputData.diagnosis,
@@ -494,27 +494,27 @@ async function runGeneration(inputData: {
     })
 
     if (inputData.interactive && outputData.diagnosis?.next_action === "INSTALL_DEPENDENCY") {
-      console.log("Agent: workflow paused during test execution.")
-      console.log(`- Language: ${outputData.language}`)
-      console.log(`- Test cases designed: ${outputData.test_cases_count}`)
-      console.log("- AI diagnosis:")
-      console.log(outputData.diagnosis.report_text ?? outputData.diagnosis.summary ?? "Environment or dependency action is needed.")
+      console.log("Agent：工作流在测试执行期间暂停。")
+      console.log(`- 语言：${outputData.language}`)
+      console.log(`- 设计的测试用例数：${outputData.test_cases_count}`)
+      console.log("- AI 诊断：")
+      console.log(outputData.diagnosis.report_text ?? outputData.diagnosis.summary ?? "需要环境或依赖操作。")
       return outputData
     }
 
-    console.log("Agent: task finished.")
-    console.log(`- Language: ${outputData.language}`)
-    console.log(`- Tests passed: ${outputData.passed ? "yes" : "no"}`)
-    console.log(`- Test cases: ${outputData.test_cases_count}`)
-    if (outputData.quality) console.log(`- Quality: ${outputData.quality.ok ? "passed" : "failed"}`)
+    console.log("Agent：任务完成。")
+    console.log(`- 语言：${outputData.language}`)
+    console.log(`- 测试是否通过：${outputData.passed ? "是" : "否"}`)
+    console.log(`- 测试用例数：${outputData.test_cases_count}`)
+    if (outputData.quality) console.log(`- 质量检查：${outputData.quality.ok ? "通过" : "未通过"}`)
     if (outputData.coverage) {
-      console.log(`- Coverage: ${outputData.coverage.symbol_coverage}% symbols (${outputData.coverage.covered_symbols.length}/${outputData.coverage.total_symbols})`)
+      console.log(`- 覆盖率：${outputData.coverage.symbol_coverage}% 符号（${outputData.coverage.covered_symbols.length}/${outputData.coverage.total_symbols}）`)
     }
     if (outputData.diagnosis) {
-      console.log("- AI diagnosis:")
-      console.log(outputData.diagnosis.report_text ?? outputData.diagnosis.summary ?? "Diagnosis written to report.")
+      console.log("- AI 诊断：")
+      console.log(outputData.diagnosis.report_text ?? outputData.diagnosis.summary ?? "诊断结果已写入报告。")
     }
-    console.log("- Exported files:")
+    console.log("- 导出文件列表：")
     for (const file of outputData.exported_files) console.log(`  - ${file}`)
 
     return outputData
@@ -533,10 +533,10 @@ async function maybeAskNextAction(
   const command = diagnosis?.suggested_commands?.[0]
 
   if (diagnosis?.next_action === "INSTALL_DEPENDENCY") {
-    console.log("Agent: workflow is paused because the AI diagnosis says an environment or dependency action is needed.")
-    if (command) console.log(`Suggested action: ${command}`)
-    console.log("You can provide a tool path, ask me to run a command, say you fixed it, change the plan, or cancel.")
-    memoryStore.addMessage(sessionId, "agent", "workflow paused for follow-up", { diagnosis, command })
+    console.log("Agent：工作流已暂停，因为 AI 诊断认为需要环境或依赖操作。")
+    if (command) console.log(`建议操作：${command}`)
+    console.log("你可以提供工具路径、让我运行命令、说已经修复了、修改计划或取消。")
+    memoryStore.addMessage(sessionId, "agent", "工作流暂停，等待用户跟进", { diagnosis, command })
     return {
       mode: "awaiting_followup",
       followup: {
@@ -551,8 +551,8 @@ async function maybeAskNextAction(
 
   if (result && !result.passed && diagnosis?.next_action === "REGENERATE_TEST_CODE") {
     const nextMaxAttempts = plan.maxAttempts + 2
-    console.log(`Agent: workflow is paused at retry limit ${plan.maxAttempts}. AI still thinks generated test code should be repaired.`)
-    console.log(`You can continue with more attempts, change the plan, or cancel.`)
+    console.log(`Agent：工作流在重试上限 ${plan.maxAttempts} 处暂停。AI 仍然认为生成的测试代码需要修复。`)
+    console.log("你可以继续更多次尝试、修改计划或取消。")
     return {
       mode: "awaiting_followup",
       followup: {
@@ -574,32 +574,32 @@ async function applyFollowupDecision(
   sessionId: string
 ): Promise<ConversationState> {
   if (decision.action === "answer") {
-    console.log(`Agent: ${decision.reply ?? "I am waiting for your next instruction."}`)
+    console.log(`Agent：${decision.reply ?? "我正等待你的下一步指示。"}`)
     return { mode: "awaiting_followup", followup }
   }
 
   if (decision.action === "cancel") {
-    console.log(`Agent: ${decision.reply ?? "Okay, I will stop this paused workflow."}`)
+    console.log(`Agent：${decision.reply ?? "好的，我将停止这个暂停的工作流。"}`)
     return { mode: "idle" }
   }
 
   if (decision.action === "exit") {
-    console.log(`Agent: ${decision.reply ?? "bye."}`)
+    console.log(`Agent：${decision.reply ?? "再见。"}`)
     return { mode: "exit" }
   }
 
   if (decision.action === "run_command") {
     const command = decision.command?.trim()
     if (!command || !looksExecutableCommand(command)) {
-      console.log(`Agent: ${decision.reply ?? "I need a concrete shell command before I can ask for execution permission."}`)
+      console.log(`Agent：${decision.reply ?? "我需要一个具体的 shell 命令才能请求执行权限。"}`)
       return { mode: "awaiting_followup", followup }
     }
     const risk = assessCommandRisk(command)
-    console.log(`Agent: ${decision.reply ?? "I can run this command in a visible PowerShell window."}`)
-    console.log(`Command: ${command}`)
-    console.log(`Risk: ${risk.level}`)
+    console.log(`Agent：${decision.reply ?? "我可以在一个可见的 PowerShell 窗口中运行此命令。"}`)
+    console.log(`命令：${command}`)
+    console.log(`风险等级：${risk.level}`)
     for (const reason of risk.reasons) console.log(`- ${reason}`)
-    console.log("Allow me to open a new PowerShell window to run it?")
+    console.log("允许我打开一个新的 PowerShell 窗口来运行它吗？")
     return {
       mode: "awaiting_command_confirmation",
       command: {
@@ -620,7 +620,7 @@ async function applyFollowupDecision(
         ? { ...followup.plan, maxAttempts: followup.nextMaxAttempts }
         : followup.plan
 
-  console.log(`Agent: ${decision.reply ?? "I will continue the same workflow now."}`)
+  console.log(`Agent：${decision.reply ?? "现在我将继续执行同一个工作流。"}`)
   if (followup.pausedResult && followup.reason === "environment_or_dependency_action_needed" && decision.action !== "update_plan") {
     return await resumePausedWorkflow(followup.pausedResult, updatedPlan, sessionId)
   }
@@ -634,7 +634,7 @@ async function resumePausedWorkflow(
   sessionId: string
 ): Promise<ConversationState> {
   if (!pausedResult.test_cases?.length) {
-    console.log("Agent: I do not have the generated test cases in memory, so I have to restart the workflow.")
+    console.log("Agent：内存中没有已生成的测试用例，因此需要重新启动工作流。")
     const result = await runGeneration({ ...plan, sessionId, interactive: true })
     return await maybeAskNextAction(result, plan, sessionId)
   }
@@ -652,27 +652,27 @@ async function resumePausedWorkflow(
     })
 
     if (result.diagnosis?.next_action === "INSTALL_DEPENDENCY") {
-      console.log("Agent: workflow is still paused during test execution.")
-      console.log(`- Language: ${result.language}`)
-      console.log(`- Test cases kept in memory: ${result.test_cases_count}`)
-      console.log("- AI diagnosis:")
-      console.log(result.diagnosis.report_text ?? result.diagnosis.summary ?? "Environment or dependency action is still needed.")
+      console.log("Agent：工作流在测试执行期间仍然暂停。")
+      console.log(`- 语言：${result.language}`)
+      console.log(`- 内存中的测试用例数：${result.test_cases_count}`)
+      console.log("- AI 诊断：")
+      console.log(result.diagnosis.report_text ?? result.diagnosis.summary ?? "仍然需要环境或依赖操作。")
       return await maybeAskNextAction(result, plan, sessionId)
     }
 
-    console.log("Agent: resumed workflow finished.")
-    console.log(`- Language: ${result.language}`)
-    console.log(`- Tests passed: ${result.passed ? "yes" : "no"}`)
-    console.log(`- Test cases: ${result.test_cases_count}`)
-    if (result.quality) console.log(`- Quality: ${result.quality.ok ? "passed" : "failed"}`)
+    console.log("Agent：恢复的工作流已完成。")
+    console.log(`- 语言：${result.language}`)
+    console.log(`- 测试是否通过：${result.passed ? "是" : "否"}`)
+    console.log(`- 测试用例数：${result.test_cases_count}`)
+    if (result.quality) console.log(`- 质量检查：${result.quality.ok ? "通过" : "未通过"}`)
     if (result.coverage) {
-      console.log(`- Coverage: ${result.coverage.symbol_coverage}% symbols (${result.coverage.covered_symbols.length}/${result.coverage.total_symbols})`)
+      console.log(`- 覆盖率：${result.coverage.symbol_coverage}% 符号（${result.coverage.covered_symbols.length}/${result.coverage.total_symbols}）`)
     }
     if (result.diagnosis) {
-      console.log("- AI diagnosis:")
-      console.log(result.diagnosis.report_text ?? result.diagnosis.summary ?? "Diagnosis written to report.")
+      console.log("- AI 诊断：")
+      console.log(result.diagnosis.report_text ?? result.diagnosis.summary ?? "诊断结果已写入报告。")
     }
-    console.log("- Exported files:")
+    console.log("- 导出文件列表：")
     for (const file of result.exported_files) console.log(`  - ${file}`)
 
     return await maybeAskNextAction(result, plan, sessionId)
@@ -682,19 +682,19 @@ async function resumePausedWorkflow(
 }
 
 async function runVisibleCommand(command: PendingCommand, sessionId: string) {
-  console.log("Agent: opening a new PowerShell window so you can watch the command.")
+  console.log("Agent：正在打开一个新的 PowerShell 窗口，你可以观察命令执行情况。")
   const result = runCommandInVisibleTerminal({ command: command.command, cwd: command.cwd, keepOpen: true })
-  memoryStore.addMessage(sessionId, "tool", `command executed: ${command.command}`, { ...result })
-  console.log(`Agent: command finished, exit code: ${result.exitCode}, log file: ${result.logFile}`)
+  memoryStore.addMessage(sessionId, "tool", `已执行命令：${command.command}`, { ...result })
+  console.log(`Agent：命令执行完毕，退出码：${result.exitCode}，日志文件：${result.logFile}`)
   return result
 }
 
 function resolvePlan(plan: AgentDecision["plan"], sessionId: string): PendingPlan {
   const sessionState = getSessionState(sessionId)
   const filePath = plan?.file_path ?? sessionState.lastSourceFile
-  if (!filePath) throw new Error("source file path is missing")
+  if (!filePath) throw new Error("缺少源文件路径")
   const sourceFile = path.resolve(filePath)
-  if (!fs.existsSync(sourceFile)) throw new Error(`source file does not exist: ${sourceFile}`)
+  if (!fs.existsSync(sourceFile)) throw new Error(`源文件不存在：${sourceFile}`)
 
   const outputDir = path.resolve(plan?.output_dir ?? sessionState.lastOutputDir ?? "./output/exports")
   const language = detectLanguage(sourceFile, plan?.language ?? sessionState.lastLanguage ?? "auto")
@@ -707,7 +707,7 @@ function resolvePlan(plan: AgentDecision["plan"], sessionId: string): PendingPla
 function applyPlanDelta(base: PendingPlan, delta?: AgentDecision["plan"]): PendingPlan {
   if (!delta) return base
   const filePath = delta.file_path ? path.resolve(delta.file_path) : base.filePath
-  if (!fs.existsSync(filePath)) throw new Error(`source file does not exist: ${filePath}`)
+  if (!fs.existsSync(filePath)) throw new Error(`源文件不存在：${filePath}`)
   return {
     filePath,
     outputDir: delta.output_dir ? path.resolve(delta.output_dir) : base.outputDir,
@@ -745,26 +745,26 @@ function applyTemporaryEnv(env?: Record<string, string>): () => void {
 }
 
 function printPlan(reply: string, plan: PendingPlan): void {
-  console.log(`Agent: ${reply}`)
-  console.log("Plan:")
-  console.log(`1. Read source: ${plan.filePath}`)
-  console.log(`2. Detect language: ${plan.language}`)
-  console.log("3. Parse source and call LLM to design test cases")
-  console.log("4. Call LLM to generate unit test code")
-  console.log("5. Execute tests and run quality checks")
-  console.log("6. If failing, send source, tests, cases, and execution output to LLM for diagnosis")
-  console.log("7. If AI says test code is wrong, regenerate until the retry limit")
-  console.log(`8. Export tests, report, and version records to: ${plan.outputDir}`)
-  console.log(`Max attempts: ${plan.maxAttempts}`)
-  console.log(`LLM retries per call: ${plan.llmRetries}`)
-  if (plan.requirementsText) console.log(`Extra requirements: ${plan.requirementsText}`)
-  console.log("Confirm when you want me to start.")
+  console.log(`Agent：${reply}`)
+  console.log("执行计划：")
+  console.log(`1. 读取源文件：${plan.filePath}`)
+  console.log(`2. 检测语言：${plan.language}`)
+  console.log("3. 解析源代码并调用 LLM 设计测试用例")
+  console.log("4. 调用 LLM 生成单元测试代码")
+  console.log("5. 执行测试并进行质量检查")
+  console.log("6. 如果失败，将源代码、测试代码、用例和执行输出发送给 LLM 进行诊断")
+  console.log("7. 如果 AI 认为测试代码有误，重新生成直到达到重试上限")
+  console.log(`8. 导出测试代码、报告和版本记录到：${plan.outputDir}`)
+  console.log(`最大尝试次数：${plan.maxAttempts}`)
+  console.log(`每次 LLM 调用的重试次数：${plan.llmRetries}`)
+  if (plan.requirementsText) console.log(`额外需求：${plan.requirementsText}`)
+  console.log("确认后我将开始执行。")
 }
 
 function parseDecision(text: string): AgentDecision {
   const raw = parseJsonObject(text)
   if (!raw || typeof raw !== "object") {
-    return { action: "answer", reply: text.trim() || "I did not understand. Please say it again." }
+    return { action: "answer", reply: text.trim() || "我没理解，请再说一遍。" }
   }
   const item = raw as Partial<AgentDecision>
   const action = item.action && ["answer", "ask", "propose_plan", "cancel", "exit"].includes(item.action)
@@ -780,14 +780,14 @@ function parseDecision(text: string): AgentDecision {
 function parseDecisionStrict(text: string): AgentDecision {
   const raw = parseJsonObject(text)
   if (!raw || typeof raw !== "object") {
-    throw new Error(`CLI agent returned non-JSON output. Preview: ${preview(text)}`)
+    throw new Error(`CLI Agent 返回了非 JSON 输出。预览：${preview(text)}`)
   }
   const item = raw as Partial<AgentDecision>
   if (!item.action || !["answer", "ask", "propose_plan", "cancel", "exit"].includes(item.action)) {
-    throw new Error(`CLI agent returned invalid action. Preview: ${preview(text)}`)
+    throw new Error(`CLI Agent 返回了无效的 action。预览：${preview(text)}`)
   }
   if (typeof item.reply !== "string") {
-    throw new Error(`CLI agent returned missing reply. Preview: ${preview(text)}`)
+    throw new Error(`CLI Agent 返回缺少 reply。预览：${preview(text)}`)
   }
   return {
     action: item.action,
@@ -799,11 +799,11 @@ function parseDecisionStrict(text: string): AgentDecision {
 function parsePendingIntentStrict(text: string): PendingIntent {
   const raw = parseJsonObject(text)
   if (!raw || typeof raw !== "object") {
-    throw new Error(`CLI intent agent returned non-JSON output. Preview: ${preview(text)}`)
+    throw new Error(`CLI 意图 Agent 返回了非 JSON 输出。预览：${preview(text)}`)
   }
   const item = raw as Partial<PendingIntent>
   if (!item.intent || !["confirm", "cancel", "exit", "other"].includes(item.intent)) {
-    throw new Error(`CLI intent agent returned invalid intent. Preview: ${preview(text)}`)
+    throw new Error(`CLI 意图 Agent 返回了无效的 intent。预览：${preview(text)}`)
   }
   return {
     intent: item.intent,
@@ -814,11 +814,11 @@ function parsePendingIntentStrict(text: string): PendingIntent {
 function parseFollowupDecisionStrict(text: string): FollowupDecision {
   const raw = parseJsonObject(text)
   if (!raw || typeof raw !== "object") {
-    throw new Error(`Follow-up agent returned non-JSON output. Preview: ${preview(text)}`)
+    throw new Error(`跟进 Agent 返回了非 JSON 输出。预览：${preview(text)}`)
   }
   const item = raw as Partial<FollowupDecision>
   if (!item.action || !["answer", "continue", "run_command", "update_env", "update_plan", "cancel", "exit"].includes(item.action)) {
-    throw new Error(`Follow-up agent returned invalid action. Preview: ${preview(text)}`)
+    throw new Error(`跟进 Agent 返回了无效的 action。预览：${preview(text)}`)
   }
   return {
     action: item.action,
@@ -859,7 +859,7 @@ async function withRetries<T>(label: string, retries: number, task: () => Promis
     } catch (error) {
       lastError = error
       if (attempt < attempts) {
-        console.log(`Agent: ${label} failed on attempt ${attempt}/${attempts}; retrying. Reason: ${formatError(error)}`)
+        console.log(`Agent：${label} 在第 ${attempt}/${attempts} 次尝试中失败，正在重试。原因：${formatError(error)}`)
       }
     }
   }
@@ -900,27 +900,27 @@ function parseArgs(argv: string[]): CliArgs {
 }
 
 function printHelp(): void {
-  console.log(`Unit-test generation Agent
+  console.log(`单元测试生成 Agent
 
-Usage:
+使用方法：
   npm run generate -- --interactive
-  npm run generate -- --input <source-file> --output <output-dir>
-  npm run generate -- <source-file> <output-dir>
+  npm run generate -- --input <源文件> --output <输出目录>
+  npm run generate -- <源文件> <输出目录>
 
-Options:
-  --input, -i            source file, supports .py/.java/.cpp/.cc/.hpp/.h
-  --output, -o           output directory, default ./output/exports
-  --language, -l         python/java/cpp
-  --max-attempts         max self-healing attempts, default 3
-  --llm-retries          retries for each LLM request, default 2
-  --requirements         extra requirements text
-  --requirements-file    read extra requirements from file
-  --interactive, -I      natural language interaction
-  --help, -h             show help
+选项：
+  --input, -i            源文件路径，支持 .py/.java/.cpp/.cc/.hpp/.h
+  --output, -o           输出目录，默认为 ./output/exports
+  --language, -l         语言：python/java/cpp
+  --max-attempts         最大自愈尝试次数，默认为 3
+  --llm-retries          每次 LLM 请求的重试次数，默认为 2
+  --requirements         额外需求文本
+  --requirements-file    从文件读取额外需求
+  --interactive, -I      自然语言交互模式
+  --help, -h             显示帮助信息
 `)
 }
 
 main().catch((error) => {
-  console.error(`Agent startup failed: ${formatError(error)}`)
+  console.error(`Agent 启动失败：${formatError(error)}`)
   process.exitCode = 1
 })

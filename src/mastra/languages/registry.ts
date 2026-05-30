@@ -27,13 +27,13 @@ export function detectLanguage(filePath: string, explicit?: string): SupportedLa
     if (normalized === "python" || normalized === "py") return "python"
     if (normalized === "java") return "java"
     if (normalized === "cpp" || normalized === "c++" || normalized === "cc") return "cpp"
-    throw new Error(`LANGUAGE_UNSUPPORTED: ${explicit}`)
+    throw new Error(`LANGUAGE_UNSUPPORTED: 不支持的语言 ${explicit}`)
   }
 
   const ext = path.extname(filePath).toLowerCase()
   const language = extensionMap.get(ext)
   if (!language) {
-    throw new Error(`LANGUAGE_UNSUPPORTED: cannot detect language from ${ext || "unknown extension"}`)
+    throw new Error(`LANGUAGE_UNSUPPORTED: 无法从扩展名 ${ext || "未知扩展名"} 检测语言`)
   }
   return language
 }

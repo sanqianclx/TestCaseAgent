@@ -68,7 +68,7 @@ function resolvePythonRuntimeDir(): string {
   }
 
   throw new Error(
-    `PYTHON_RUNTIME_DIR_NOT_FOUND: cannot find python-runtime from ${anchors
+    `PYTHON_RUNTIME_DIR_NOT_FOUND: 无法找到 python-runtime 目录，搜索路径：${anchors
       .map((item) => path.resolve(item))
       .join(", ")}`
   )
@@ -104,7 +104,7 @@ export function callPythonScript<T>(
     return {
       ok: false,
       data: null,
-      error: { code: "SCRIPT_NOT_FOUND", message: `Python script not found: ${scriptPath}` },
+      error: { code: "SCRIPT_NOT_FOUND", message: `找不到 Python 脚本：${scriptPath}` },
     }
   }
 
@@ -137,7 +137,7 @@ export function callPythonScript<T>(
         data: null,
         error: {
           code: "PYTHON_RUNTIME_ERROR",
-          message: output.stderr || `Python script exited with code ${output.status}`,
+          message: output.stderr || `Python 脚本退出码为 ${output.status}`,
         },
       }
     }

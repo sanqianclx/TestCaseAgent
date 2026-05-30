@@ -105,7 +105,7 @@ function executeJavaTests(input: {
       failed: 0,
       errors: 1,
       stdout: "",
-      stderr: "Maven is not available. Provide MAVEN_HOME or add Maven bin to PATH.",
+      stderr: "Maven 不可用。请设置 MAVEN_HOME 或将 Maven bin 目录添加到 PATH。",
       exit_code: -1,
       duration_ms: 0,
       timeout: false,
