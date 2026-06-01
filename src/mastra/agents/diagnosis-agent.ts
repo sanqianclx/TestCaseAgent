@@ -1,5 +1,6 @@
 import { Agent } from "@mastra/core/agent"
 import "../runtime/env.js"
+import { readFileTool } from "../tools/read-file-tool.js"
 
 const instructions = `你是 Python、Java 和 C++ 单元测试失败诊断专家。
 
@@ -15,6 +16,7 @@ const instructions = `你是 Python、Java 和 C++ 单元测试失败诊断专�
 export const diagnosisAgent = new Agent({
   id: "diagnosis-agent",
   name: "失败诊断 Agent",
+  tools: { readFile: readFileTool },
   instructions,
   model: "deepseek/deepseek-chat",
 })
@@ -22,6 +24,7 @@ export const diagnosisAgent = new Agent({
 export const diagnosisAgentPro = new Agent({
   id: "diagnosis-agent-pro",
   name: "失败诊断 Agent Pro",
+  tools: { readFile: readFileTool },
   instructions,
   model: "deepseek/deepseek-v4-pro",
 })
@@ -29,6 +32,7 @@ export const diagnosisAgentPro = new Agent({
 export const diagnosisDecisionAgent = new Agent({
   id: "diagnosis-decision-agent",
   name: "失败诊断决策 Agent",
+  tools: { readFile: readFileTool },
   instructions: `你将自然语言的单元测试失败诊断转换为用于自动化的简短 JSON 决策。
 这个 JSON 是内部使用的，不会写入用户的最终报告。
 

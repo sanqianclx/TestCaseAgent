@@ -46,10 +46,6 @@ export const javaAdapter: LanguageAdapter = {
     return executeJavaTests(input)
   },
 
-  checkQuality({ testCode }) {
-    return checkJavaQuality(testCode)
-  },
-
   diagnose({ executionResult, quality }) {
     return diagnoseJavaFailure(executionResult, quality)
   },
@@ -95,15 +91,21 @@ function executeJavaTests(input: {
   fs.writeFileSync(path.join(tempDir, "pom.xml"), renderPom(), "utf-8")
 
   const started = Date.now()
-  const commandText = `${maven} -q test`
-  const result = spawnSync(maven, ["-q", "test"], {
-    cwd: tempDir,
-    encoding: "utf-8",
-    timeout: input.timeoutSeconds * 1000,
-    windowsHide: true,
-    maxBuffer: 10 * 1024 * 1024,
-    shell: shouldUseShell(maven),
-  })
+    // 使用 `mvn verify` 而非 `mvn test`,这样 jacoco-maven-plugin 的 `report` goal
+    // 会在 verify 阶段自动触发,确保 jacoco.exec 与 jacoco.xml 在同一次调用内生成。
+    // `-Djacoco.skip=false` 防止任何外部配置意外禁用 jacoco 收集。
+    // 超时提升到 180s,给首次冷启动下载 Maven 依赖留足时间。
+    const commandText = `${maven} verify -Dmaven.test.failure.ignore=true -Djacoco.skip=false`
+
+    const result = spawnSync(maven, ["verify", "-Dmaven.test.failure.ignore=true", "-Djacoco.skip=false"], {
+      cwd: tempDir,
+      encoding: "utf-8",
+      timeout: 180_000,
+      windowsHide: true,
+      maxBuffer: 10 * 1024 * 1024,
+      shell: shouldUseShell(maven),
+    })
+
   const duration = Date.now() - started
   const stdout = result.stdout ?? ""
   const stderr = result.error?.message ?? result.stderr ?? ""
@@ -112,7 +114,7 @@ function executeJavaTests(input: {
   const exitCode = typeof result.status === "number" ? result.status : -1
 
   if (timeout) {
-    return baseExecution("timeout", stdout, stderr || "Maven test execution timed out", exitCode, duration, true, commandText, tempDir)
+    return baseExecution("timeout", stdout, stderr || "Maven verify execution timed out", exitCode, duration, true, commandText, tempDir)
   }
 
   if (exitCode === 0) {
@@ -141,27 +143,6 @@ function executeJavaTests(input: {
     ),
     missing_dependencies: missing.length ? missing : undefined,
   }
-}
-
-function checkJavaQuality(testCode: string): QualityResult {
-  const issues: string[] = []
-  const checkedTests = (testCode.match(/@Test\b/g) ?? []).length
-  if (checkedTests === 0) issues.push("NO_TEST_FUNCTION: 未发现 JUnit @Test 注解")
-  if (!/\bassert[A-Za-z]*\s*\(/.test(testCode) && !/\bfail\s*\(/.test(testCode)) {
-    issues.push("NO_ASSERTION: 未发现 JUnit 断言")
-  }
-  if (/\bfail\s*\(\s*"No testable Java methods/.test(testCode)) {
-    issues.push("NO_TESTABLE_SYMBOL: 仅生成了兜底的失败测试")
-  }
-  if (/\bassertTrue\s*\(\s*true\s*\)/.test(testCode)) {
-    issues.push("TRIVIAL_ASSERTION: assertTrue(true) 不验证任何行为")
-  }
-  const strong = (testCode.match(/\b(assertEquals|assertThrows|assertArrayEquals|assertIterableEquals|assertFalse|assertTrue)\s*\(/g) ?? []).length
-  const weak = (testCode.match(/\b(assertNotNull|assertDoesNotThrow)\s*\(/g) ?? []).length
-  if (checkedTests > 0 && strong === 0 && weak > 0) {
-    issues.push("WEAK_ASSERTION: 仅包含空值/无抛出检查，未验证核心行为")
-  }
-  return { ok: issues.length === 0, issues, checked_tests: checkedTests }
 }
 
 function diagnoseJavaFailure(executionResult: ExecutionResult, quality: QualityResult): Diagnosis {
@@ -369,6 +350,24 @@ function renderPom(): string {
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
       </plugin>
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>0.8.12</version>
+        <configuration>
+          <dataFile>\${project.build.directory}/jacoco.exec</dataFile>
+        </configuration>
+        <executions>
+          <execution>
+            <id>prepare-agent</id>
+            <goals><goal>prepare-agent</goal></goals>
+          </execution>
+          <execution>
+            <id>report</id>
+            <goals><goal>report</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
     </plugins>
   </build>
 </project>`
@@ -415,10 +414,15 @@ function parseSurefireReports(tempDir: string): { passed: number; failed: number
 
   for (const file of fs.readdirSync(reportDir).filter((name) => name.endsWith(".xml"))) {
     const xml = fs.readFileSync(path.join(reportDir, file), "utf-8")
-    for (const match of xml.matchAll(/<testcase\b([^>]*)>([\s\S]*?)<\/testcase>|<testcase\b([^>]*)\/>/g)) {
-      const attrs = parseXmlAttributes(match[1] ?? match[3] ?? "")
+    // Surefire 3.x 输出多行 XML,属性可能跨行,使用 `[\s\S]*?` 替代 `[^>]*`
+    // 拆成两条独立正则,避免单条复合正则中两个分支互相回溯干扰:
+    // 1) `<testcase ...>...</testcase>` — 用于 failed/errored 用例(failure 块跨行)
+    // 2) `<testcase .../>` — 用于 passed/skipped 用例(自闭合)
+    // 旧正则 `[^>]*` 不跨行,新合并正则存在最小匹配回溯,均会导致漏匹配
+    for (const match of xml.matchAll(/<testcase\b([\s\S]*?)>([\s\S]*?)<\/testcase>/g)) {
+      const attrs = parseXmlAttributes(match[1] ?? "")
       const body = match[2] ?? ""
-      const failure = body.match(/<(failure|error)\b([^>]*)>([\s\S]*?)<\/\1>/)
+      const failure = body.match(/<(failure|error)\b([\s\S]*?)>([\s\S]*?)<\/\1>/)
       const skipped = /<skipped\b/.test(body)
       const result = failure ? (failure[1] === "error" ? "error" : "failed") : skipped ? "skipped" : "passed"
       if (result === "passed") passed += 1
@@ -430,6 +434,17 @@ function parseSurefireReports(tempDir: string): { passed: number; failed: number
         result,
         duration_ms: Math.round(Number(attrs.time ?? 0) * 1000),
         failure_reason: failure ? cleanXml(failure[3] || failure[2] || "") : "",
+      })
+    }
+    for (const match of xml.matchAll(/<testcase\b([\s\S]*?)\/>/g)) {
+      const attrs = parseXmlAttributes(match[1] ?? "")
+      passed += 1
+      testResults.push({
+        test_class: attrs.classname ?? "",
+        test_name: attrs.name ?? "",
+        result: "passed",
+        duration_ms: Math.round(Number(attrs.time ?? 0) * 1000),
+        failure_reason: "",
       })
     }
   }

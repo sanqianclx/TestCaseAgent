@@ -1,9 +1,11 @@
 import { Agent } from "@mastra/core/agent"
 import "../runtime/env.js"
+import { readFileTool } from "../tools/read-file-tool.js"
 
 export const cliAgent = new Agent({
   id: "cli-agent",
   name: "CLI 统一 Agent",
+  tools: { readFile: readFileTool },
   instructions: `你是命令行单元测试生成 Agent 的决策引擎。
 根据调用方指定的 mode 决定输出格式和行为。
 

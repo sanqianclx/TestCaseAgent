@@ -1,9 +1,11 @@
 import { Agent } from "@mastra/core/agent"
 import "../runtime/env.js"
+import { readFileTool } from "../tools/read-file-tool.js"
 
 export const testCaseAgent = new Agent({
   id: "test-case-agent",
   name: "单元测试用例生成 Agent",
+  tools: { readFile: readFileTool },
   instructions: `你为 Python、Java 和 C++ 设计单元测试用例。
 
 只返回与提示词模式匹配的有效 JSON。不要使用 Markdown、注释或解释性文本。

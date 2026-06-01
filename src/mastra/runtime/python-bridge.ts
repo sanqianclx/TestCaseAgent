@@ -6,7 +6,7 @@ import { fileURLToPath } from "url"
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const REQUIRED_RUNTIME_FILES = ["parse_source.py", "run_pytest.py", "export_cases.py"]
+const REQUIRED_RUNTIME_FILES = ["parse_source.py", "run_pytest.py", "export_cases.py", "coverage_runner.py"]
 
 export interface PythonCallResult<T = unknown> {
   ok: boolean

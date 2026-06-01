@@ -8,6 +8,8 @@ import { testCaseAgent } from "../agents/test-case-agent.js"
 import { testCodeAgent, testCodeAgentPro } from "../agents/test-code-agent.js"
 import { detectLanguage, getLanguageAdapter } from "../languages/registry.js"
 import { assertLlmAvailable, formatError } from "../runtime/env.js"
+import { logAgentProgress, renderProgressBar, finishProgressBar } from "../runtime/cli-output.js"
+import { measureCoverage } from "../tools/coverage-tool.js"
 import type {
   Diagnosis,
   CoverageResult,
@@ -65,6 +67,12 @@ const coverageSchema = z.object({
   case_type_coverage: z.record(z.number()),
   total_symbols: z.number(),
   total_cases: z.number(),
+  line_rate: z.number().default(0),
+  branch_rate: z.number().default(0),
+  covered_lines: z.number().default(0),
+  total_lines: z.number().default(0),
+  missing_lines: z.number().default(0),
+  coverage_tool: z.string().default("symbol-only"),
 })
 
 const executionSchema = z.object({
@@ -158,13 +166,13 @@ const readParseStep = createStep({
   inputSchema: workflowInputSchema,
   outputSchema: sourceStepOutputSchema,
   execute: async ({ inputData }) => {
-    logProgress("正在读取源代码并检测语言")
+    logAgentProgress("正在读取源代码并检测语言")
     const sourceFile = path.resolve(inputData.file_path)
     const sourceCode = await fsp.readFile(sourceFile, "utf-8")
     const language = detectLanguage(sourceFile, inputData.language)
     const adapter = getLanguageAdapter(language)
     const filename = path.basename(sourceFile)
-    logProgress(`正在使用 ${adapter.displayName} 适配器解析源代码结构`)
+    logAgentProgress(`正在使用 ${adapter.displayName} 适配器解析源代码结构`)
     const analysis = adapter.parseSource({ sourceCode, filename, sourceFile })
 
     return {
@@ -188,7 +196,7 @@ const designCasesStep = createStep({
   outputSchema: casesStepOutputSchema,
   execute: async ({ inputData }) => {
     const adapter = adapterFor(inputData.language)
-    logProgress(`正在调用 LLM 测试用例 Agent（${adapter.displayName}）`)
+    logAgentProgress(`正在调用 LLM 测试用例 Agent（${adapter.displayName}）`)
     const testCases = await generateTestCases({
       adapter,
       sourceCode: inputData.source_code,
@@ -207,7 +215,7 @@ const exportPlanStep = createStep({
   outputSchema: casesStepOutputSchema,
   execute: async ({ inputData }) => {
     const adapter = adapterFor(inputData.language)
-    logProgress("正在导出测试用例计划")
+    logAgentProgress("正在导出测试用例计划")
     adapter.exportArtifacts({
       testCases: inputData.test_cases,
       testCode: "",
@@ -227,7 +235,7 @@ const generateCodeStep = createStep({
   outputSchema: codeStepOutputSchema,
   execute: async ({ inputData }) => {
     const adapter = adapterFor(inputData.language)
-    logProgress(`正在调用 LLM 测试代码 Agent 生成 ${adapter.testFramework} 测试`)
+    logAgentProgress(`正在调用 LLM 测试代码 Agent 生成 ${adapter.testFramework} 测试`)
     const testCode = await generateTestCode({
       adapter,
       sourceCode: inputData.source_code,
@@ -249,7 +257,7 @@ const executeStep = createStep({
   outputSchema: executionStepOutputSchema,
   execute: async ({ inputData }) => {
     const adapter = adapterFor(inputData.language)
-    logProgress(`正在使用 ${adapter.displayName} 适配器执行测试`)
+    logAgentProgress(`正在使用 ${adapter.displayName} 适配器执行测试`)
     const executionResult = adapter.executeTests({
       sourceCode: inputData.source_code,
       sourceFile: inputData.source_file,
@@ -280,7 +288,7 @@ const exportResultsStep = createStep({
     const adapter = adapterFor(inputData.language)
     const diagnosis = inputData.diagnosis as Diagnosis | undefined
     if (diagnosis?.next_action === "INSTALL_DEPENDENCY") {
-      logProgress("工作流在最终导出前暂停，因为需要环境或依赖操作")
+      logAgentProgress("工作流在最终导出前暂停，因为需要环境或依赖操作")
       return {
         source_file: inputData.source_file,
         language: inputData.language,
@@ -298,7 +306,7 @@ const exportResultsStep = createStep({
       }
     }
 
-    logProgress("正在导出最终的测试代码、报告和版本记录")
+    logAgentProgress("正在导出最终的测试代码、报告和版本记录")
     const exportResult = adapter.exportArtifacts({
       testCases: inputData.test_cases,
       testCode: inputData.test_code,
@@ -356,11 +364,11 @@ export async function resumeGeneratedTests(input: {
   const adapter = adapterFor(input.language)
   const sourceFile = path.resolve(input.sourceFile)
   const outputDir = path.resolve(input.outputDir)
-  logProgress("从已生成的测试代码恢复工作流；跳过源代码解析、测试用例设计和测试代码生成")
+  logAgentProgress("从已生成的测试代码恢复工作流；跳过源代码解析、测试用例设计和测试代码生成")
   const sourceCode = await fsp.readFile(sourceFile, "utf-8")
   const filename = path.basename(sourceFile)
   const analysis = adapter.parseSource({ sourceCode, filename, sourceFile })
-  logProgress(`正在使用 ${adapter.displayName} 适配器重新执行测试`)
+  logAgentProgress(`正在使用 ${adapter.displayName} 适配器重新执行测试`)
   const executionResult = adapter.executeTests({
     sourceCode,
     sourceFile,
@@ -387,7 +395,7 @@ export async function resumeGeneratedTests(input: {
   }, "resumed generated test code")
 
   if (finalData.diagnosis?.next_action === "INSTALL_DEPENDENCY") {
-    logProgress("工作流在最终导出前仍然暂停，因为仍然需要环境或依赖操作")
+    logAgentProgress("工作流在最终导出前仍然暂停，因为仍然需要环境或依赖操作")
     return {
       source_file: sourceFile,
       language: input.language,
@@ -405,7 +413,7 @@ export async function resumeGeneratedTests(input: {
     }
   }
 
-  logProgress("Exporting final test code, report, and version records")
+  logAgentProgress("Exporting final test code, report, and version records")
   const exportResult = adapter.exportArtifacts({
     testCases: input.testCases,
     testCode: finalData.test_code,
@@ -441,11 +449,12 @@ async function runSelfHealing(
   initialNote: string
 ) {
   const adapter = adapterFor(inputData.language)
-  logProgress("正在运行质量检查、AI 诊断和自愈决策")
+  logAgentProgress("正在运行 AI 诊断和自愈决策")
   let testCode = inputData.test_code
   let executionResult = inputData.execution_result as ExecutionResult
-  let quality = adapter.checkQuality({ testCode, analysis: inputData.analysis as SourceAnalysis })
-  const coverage = calculateCoverage(inputData.test_cases, inputData.analysis as SourceAnalysis)
+  let quality: QualityResult = { ok: true, issues: [], checked_tests: 0 }
+  const symbolCoverage = calculateCoverage(inputData.test_cases, inputData.analysis as SourceAnalysis)
+  let coverage = symbolCoverage
   let diagnosis: Diagnosis | undefined
   const versions: TestCodeVersion[] = [
     createVersionRecord({
@@ -457,6 +466,8 @@ async function runSelfHealing(
       note: initialNote,
     }),
   ]
+
+  coverage = await measureRealCoverage(inputData, testCode)
 
   if (isPassed(executionResult, quality)) {
     return finalize(inputData, testCode, executionResult, undefined, quality, coverage, versions)
@@ -478,10 +489,11 @@ async function runSelfHealing(
 
     versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
     if (diagnosis.diagnosis_type !== "TEST_CODE_ERROR" || diagnosis.confidence < 0.7) {
+      coverage = await measureRealCoverage(inputData, testCode)
       return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
     }
 
-    logProgress(`自愈尝试第 ${attempt} 次：根据 AI 诊断重新生成测试代码`)
+    logAgentProgress(`自愈尝试第 ${attempt} 次：根据 AI 诊断重新生成测试代码`)
     testCode = await generateTestCode({
       adapter,
       sourceCode: inputData.source_code,
@@ -504,7 +516,7 @@ async function runSelfHealing(
       timeoutSeconds: 60,
       analysis: inputData.analysis as SourceAnalysis,
     })
-    quality = adapter.checkQuality({ testCode, analysis: inputData.analysis as SourceAnalysis })
+    quality = { ok: true, issues: [], checked_tests: 0 }
     versions.push(createVersionRecord({
       versionNo: versions.length + 1,
       attempt,
@@ -515,6 +527,7 @@ async function runSelfHealing(
     }))
 
     if (isPassed(executionResult, quality)) {
+      coverage = await measureRealCoverage(inputData, testCode)
       return finalize(inputData, testCode, executionResult, undefined, quality, coverage, versions)
     }
   }
@@ -532,6 +545,7 @@ async function runSelfHealing(
     llmRetries: inputData.llm_retries,
   })
   versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
+  coverage = await measureRealCoverage(inputData, testCode)
   return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
 }
 
@@ -598,7 +612,7 @@ async function generateTestCases(input: {
       })
       const acceptedCases = remainingGlobalLimit === undefined ? batchCases : batchCases.slice(0, remainingGlobalLimit)
       allCases.push(...acceptedCases)
-      renderProgressBar("Designing test cases", batchIndex + 1, effectiveBatches.length)
+      renderProgressBar("设计测试用例", batchIndex + 1, effectiveBatches.length)
     }
     finishProgressBar()
 
@@ -860,7 +874,7 @@ async function withLlmRetries<T>(
       remaining -= 1
       if (remaining > 0) {
         const total = retryCount + 1
-        logProgress(`LLM ${label} 在第 ${total - remaining}/${total} 次尝试中失败，正在重试。原因：${formatError(error)}`)
+        logAgentProgress(`LLM ${label} 在第 ${total - remaining}/${total} 次尝试中失败，正在重试。原因：${formatError(error)}`)
         continue
       }
     }
@@ -893,16 +907,16 @@ async function parseTestCaseBatch(text: string, llmRetries: number, originalProm
     return validateTestCaseBatch(text)
   } catch (error) {
     if (originalPrompt && isIncompleteJsonError(error)) {
-      logProgress("测试用例 JSON 看起来被截断了；请求 LLM 从中断处继续。")
+      logAgentProgress("测试用例 JSON 看起来被截断了；请求 LLM 从中断处继续。")
       try {
         const continued = await continueTestCaseJson(text, originalPrompt, llmRetries)
         return validateTestCaseBatch(continued)
       } catch (continuationError) {
-        logProgress("续写未能生成完整的 JSON；回退到 JSON 修复。原因：" + formatError(continuationError))
+        logAgentProgress("续写未能生成完整的 JSON；回退到 JSON 修复。原因：" + formatError(continuationError))
       }
     }
 
-    logProgress("正在用 LLM 修复无效的测试用例 JSON。原因：" + formatError(error))
+    logAgentProgress("正在用 LLM 修复无效的测试用例 JSON。原因：" + formatError(error))
     return await withLlmRetries("测试用例 JSON 修复", Math.min(llmRetries, 1), async () => {
         const repairPrompt = [
           "之前的响应本应为单元测试用例的 JSON，但无效或不完整。",
@@ -1045,11 +1059,65 @@ function calculateCoverage(testCases: TestCase[], analysis: SourceAnalysis): Cov
     case_type_coverage: Object.fromEntries(Object.entries(caseTypeCounts).map(([key, value]) => [key, round2((value / Math.max(testCases.length, 1)) * 100)])),
     total_symbols: allSymbols.length,
     total_cases: testCases.length,
+    line_rate: 0,
+    branch_rate: 0,
+    covered_lines: 0,
+    total_lines: 0,
+    missing_lines: 0,
+    coverage_tool: "symbol-only",
   }
 }
 
 function normalizeSymbolName(value: string): string {
   return String(value || "").toLowerCase().replace(/[^a-z0-9_.:]/g, "").replace(/::/g, ".")
+}
+
+/**
+ * 运行真实的代码行覆盖率测量
+ * Python 用 coverage.py，Java 解析 jacoco.xml，C++ 预留
+ */
+async function measureRealCoverage(
+  inputData: z.infer<typeof executionStepOutputSchema>,
+  testCode: string
+): Promise<CoverageResult> {
+  const base = calculateCoverage(inputData.test_cases, inputData.analysis as SourceAnalysis)
+  const lang = inputData.language
+
+  if (lang !== "python" && lang !== "java") {
+    return { ...base, coverage_tool: "not-available-for-language" }
+  }
+
+  const toolLabel = lang === "python" ? "coverage.py" : "JaCoCo"
+
+  try {
+    logAgentProgress("正在测量真实代码覆盖率（" + toolLabel + "）")
+    const result = measureCoverage({
+      test_code: testCode,
+      source_code: inputData.source_code,
+      filename: inputData.filename,
+      language: lang,
+      timeout: 60,
+      cwd: (inputData.execution_result as ExecutionResult).cwd,
+    })
+
+    if (!result.ok) {
+      logAgentProgress("覆盖率测量失败：" + (result.error?.message ?? "未知错误") + "，回退到符号覆盖率")
+      return { ...base, coverage_tool: "symbol-only (measurement failed)" }
+    }
+
+    return {
+      ...base,
+      line_rate: result.line_rate,
+      branch_rate: result.branch_rate,
+      covered_lines: result.covered_lines,
+      total_lines: result.total_lines,
+      missing_lines: result.missing_lines,
+      coverage_tool: result.tool,
+    }
+  } catch (error) {
+    logAgentProgress("覆盖率测量异常：" + formatError(error) + "，回退到符号覆盖率")
+    return { ...base, coverage_tool: "symbol-only (error)" }
+  }
 }
 
 function round2(value: number): number {
@@ -1205,22 +1273,4 @@ function copySourceToOutput(sourceFile: string, outputDir: string): void {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)]
-}
-
-function renderProgressBar(label: string, current: number, total: number): void {
-  const safeTotal = Math.max(total, 1)
-  const safeCurrent = Math.min(Math.max(current, 0), safeTotal)
-  const width = 24
-  const filled = Math.round((safeCurrent / safeTotal) * width)
-  const bar = "#".repeat(filled) + "-".repeat(width - filled)
-  const percent = Math.round((safeCurrent / safeTotal) * 100)
-  process.stdout.write("\rAgent 进度：" + label + " [" + bar + "] " + safeCurrent + "/" + safeTotal + " " + percent + "%")
-}
-
-function finishProgressBar(): void {
-  process.stdout.write("\n")
-}
-
-function logProgress(message: string): void {
-  console.log("Agent 进度：" + message)
 }

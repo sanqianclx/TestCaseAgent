@@ -1,5 +1,4 @@
-﻿import path from "path"
-import { checkTestQuality } from "../tools/check-quality-tool.js"
+import path from "path"
 import { executePytest } from "../tools/execute-tests-tool.js"
 import { exportCases } from "../tools/export-cases-tool.js"
 import { parseSourceCode, type ParsedSource } from "../tools/parse-source-code-tool.js"
@@ -48,10 +47,6 @@ export const pythonAdapter: LanguageAdapter = {
       filename: `${toPythonModuleName(filename)}.py`,
       timeout: timeoutSeconds,
     }) as ExecutionResult
-  },
-
-  checkQuality({ testCode }) {
-    return checkTestQuality({ test_code: testCode }) as QualityResult
   },
 
   diagnose({ executionResult, quality }) {

@@ -262,7 +262,45 @@ Mastra Studio 是开发调试利器：`npx mastra dev`
 | 恒真检查 | TRIVIAL_ASSERTION | `assert True`、`assert 1==1` 等永不失败的断言 |
 | 函数检查 | NO_ASSERTION_IN_TEST | 某个 test 函数没有断言或异常检测 |
 | 弱断言检查 | WEAK_ASSERTION | 仅检查 `is not None`、`callable`，未验证核心行为 |
-| 覆盖率统计 | Symbol Coverage | 统计每个函数/方法是否被至少一个用例覆盖 |
+| 符号覆盖率 | Symbol Coverage | 统计每个函数/方法是否被至少一个用例覆盖（LLM 自报） |
+| 真实行覆盖率 | Real Line Coverage | 通过 coverage.py / JaCoCo 真实测量行/分支覆盖率（V2.2+） |
+
+### 覆盖率工具
+
+| 语言 | 工具 | 状态 | 报告路径 |
+| :---: | :--- | :---: | :--- |
+| Python | [coverage.py](https://coverage.readthedocs.io/) | ✅ 已实现 | 临时目录 `coverage.json` |
+| Java | [JaCoCo](https://www.jacoco.org/) Maven Plugin 0.8.12 | ✅ 已实现 | `target/site/jacoco/jacoco.xml` |
+| C++ | gcov (Linux) / OpenCppCoverage (Windows) | 🚧 预留 | 待实现 |
+
+**统一入口**：`src/mastra/tools/coverage-tool.ts` 暴露 `measureCoverage({test_code, source_code, language, cwd})`，工作流在自愈循环的 4 个节点自动调用。失败时优雅降级到符号覆盖率，并在报告中标注 `coverage_tool` 字段。
+
+**典型报告片段**：
+
+```markdown
+## 覆盖率
+- 符号覆盖率：100%（已覆盖 8/8 符号）
+- 真实行覆盖率：85.5%（工具：coverage.py）
+- 已覆盖行数：100/117
+- 分支覆盖率：70.0%
+```
+
+详细设计见 [doc/代码覆盖率设计.md](./doc/代码覆盖率设计.md)。
+
+### CLI 输出与颜色
+
+V2.2 起，CLI 端的彩色输出由 [`src/mastra/runtime/cli-output.ts`](./src/mastra/runtime/cli-output.ts) 提供**显式 API**：
+
+- `logAgent("...")` / `logAgentProgress("...")` — Agent 角色（亮黄加粗）
+- `promptUser()` — 用户提示符（亮青加粗）
+- `logInfo` / `logWarn` / `logError` / `logSuccess` / `logDebug` — 元数据 / 警告 / 错误 / 成功 / 调试
+- `renderProgressBar` / `finishProgressBar` — 进度条辅助
+
+**颜色自动降级**：检测 `NO_COLOR` / `FORCE_COLOR=0` / `CI` / 非 TTY 任一条件即输出无色文本，管道 / 重定向 / CI 环境不会产生 ANSI 乱码。
+
+**对 Studio 友好**：Mastra Studio 进程不调用这些函数，stdout 自然无色，无需特殊配置。
+
+详细设计见 [doc/CLI输出与颜色机制设计.md](./doc/CLI输出与颜色机制设计.md)。
 
 ***
 
@@ -274,6 +312,8 @@ Mastra Studio 是开发调试利器：`npx mastra dev`
 | [需求规格说明书 2.0](./doc/需求规格说明书2.0.md) | 详细需求规格 |
 | [概要设计文档](./doc/概要设计文档.md) | 系统架构、模块划分、Agent 运行机制 |
 | [详细设计文档](./doc/详细设计文档.md) | 数据结构、诊断逻辑、版本管理 |
+| [CLI 输出与颜色机制设计](./doc/CLI输出与颜色机制设计.md) | 显式日志 API、TTY/NO_COLOR 降级、与 Studio 的边界（V2.2+） |
+| [代码覆盖率设计](./doc/代码覆盖率设计.md) | 三语言真实覆盖率（coverage.py / JaCoCo / gcov）的实现细节（V2.2+） |
 
 ***
 
@@ -284,12 +324,15 @@ Mastra Studio 是开发调试利器：`npx mastra dev`
 | **V1.0** | 单文件 Python → AST 解析 → pytest 生成 → 沙箱执行 → 导出 | ✅ 已完成 |
 | **V2.0** | 失败诊断 + 自愈循环 + 测试代码版本管理 + 质量检查 | ✅ 已完成 |
 | **V2.1** | 多语言支持（Java + C++）+ 自然语言 CLI 交互 + 内存记忆 | ✅ 已完成 |
+| **V2.2** | 真实覆盖率接入（Python coverage.py + Java JaCoCo）+ CLI 输出重构（消除 monkey-patch） | ✅ 已完成 |
+| **V2.3** | C++ 真实覆盖率（gcov / OpenCppCoverage）+ 覆盖率阈值触发自愈 | 📅 规划中 |
 | **V3.0** | Web 面板 + 历史记录 + MySQL/Redis 持久化 | 📅 规划中 |
 
 ***
 
 ## 后续优化
-1. 覆盖率（暂时是符号覆盖）需要外接工具来测试
-2. 源码解析也可以用工具
-3. 写一个真正的agent  
+1. C++ 真实覆盖率接入（gcov / OpenCppCoverage）
+2. 覆盖率阈值触发自愈（line_rate < 80% 即触发诊断）
+3. 写一个真正的 Agent
+4. 需求文档变更
 ***

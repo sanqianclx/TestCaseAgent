@@ -69,6 +69,16 @@ def export_cases(
             f"- 已覆盖符号：{len(coverage.get('covered_symbols', []))}/{coverage.get('total_symbols', 0)}",
             f"- 总测试用例数：{coverage.get('total_cases', len(test_cases))}",
         ])
+        line_rate = coverage.get("line_rate", 0)
+        coverage_tool = coverage.get("coverage_tool", "symbol-only")
+        if line_rate > 0:
+            md_lines.extend([
+                f"- 真实行覆盖率：{line_rate}%（工具：{coverage_tool}）",
+                f"- 已覆盖行数：{coverage.get('covered_lines', 0)}/{coverage.get('total_lines', 0)}",
+                f"- 分支覆盖率：{coverage.get('branch_rate', 0)}%",
+            ])
+        else:
+            md_lines.append(f"- 行覆盖率：{coverage_tool}（目前仅有符号覆盖率）")
         case_type_coverage = coverage.get("case_type_coverage") or {}
         if case_type_coverage:
             md_lines.append("- 用例类型分布：")
@@ -100,38 +110,27 @@ def export_cases(
                 "",
                 "## 逐用例结果",
                 "",
-                "| # | 测试 | 结果 | 失败原因 |",
-                "| --- | --- | --- | --- |",
+                "| # | 测试 | 结果 |",
+                "| --- | --- | --- |",
             ])
             for idx, tr in enumerate(test_results, 1):
                 test_class = tr.get("test_class", "")
                 test_name = tr.get("test_name", "?")
                 name = f"{test_class}.{test_name}" if test_class else test_name
                 md_lines.append(
-                    f"| {idx} | {clean_text(name)} | {clean_text(tr.get('result', '?'))} | "
-                    f"{clean_text(tr.get('failure_reason', '-') or '-')} |"
+                    f"| {idx} | {clean_text(name)} | {clean_text(tr.get('result', '?'))} |"
                 )
 
-    if quality:
-        md_lines.extend([
-            "",
-            "## 质量检查",
-            "",
-            f"- 结果：{'通过' if quality.get('ok') else '未通过'}",
-            f"- 检查的测试数：{quality.get('checked_tests', '')}",
-        ])
-        issues = quality.get("issues", [])
-        if issues:
-            md_lines.append("- 问题列表：")
-            for item in issues:
-                md_lines.append(f"  - {clean_text(item)}")
-
     if diagnosis:
+        diagnosis_text = diagnosis.get("report_text") or diagnosis.get("summary") or json.dumps(diagnosis, ensure_ascii=False, indent=2)
+        # 直接插入 LLM 原始输出,让 markdown 渲染器自然处理(LLM 自带的
+        # ### 标题、表格、列表、``` 代码块全部正常解析为对应 HTML)
+        # 不再用 <pre> 等宽字体(丑)+ 不用 clean_text 把 \n 换成 <br>(会破坏段落)
         md_lines.extend([
             "",
             "## AI 失败诊断",
             "",
-            clean_text(diagnosis.get("report_text") or diagnosis.get("summary") or json.dumps(diagnosis, ensure_ascii=False, indent=2)),
+            diagnosis_text,
         ])
 
     if versions:

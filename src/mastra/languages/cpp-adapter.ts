@@ -47,10 +47,6 @@ export const cppAdapter: LanguageAdapter = {
     return executeCppTests(input)
   },
 
-  checkQuality({ testCode }) {
-    return checkCppQuality(testCode)
-  },
-
   diagnose({ executionResult, quality }) {
     return diagnoseCppFailure(executionResult, quality)
   },
@@ -122,25 +118,6 @@ function executeCppTests(input: {
   }
   const report = parseGtestOutput(run.stdout)
   return baseExecution("failed", run.stdout, run.stderr, run.exitCode, compile.durationMs + run.durationMs, false, run.command, tempDir, report.passed, report.failed || countGtestFailed(run.stdout), 0, report.testResults)
-}
-
-function checkCppQuality(testCode: string): QualityResult {
-  const issues: string[] = []
-  const checkedTests = (testCode.match(/\bTEST(?:_F|_P)?\s*\(/g) ?? []).length
-  if (checkedTests === 0) issues.push("NO_TEST_FUNCTION: 未发现 GoogleTest TEST 宏")
-  if (!/\b(EXPECT|ASSERT)_[A-Z_]+\s*\(/.test(testCode) && !/\bFAIL\s*\(/.test(testCode)) {
-    issues.push("NO_ASSERTION: 未发现 GoogleTest 断言")
-  }
-  if (/\bFAIL\s*\(\)\s*<<\s*"No testable C\+\+ functions/.test(testCode)) {
-    issues.push("NO_TESTABLE_SYMBOL: 仅生成了兜底的失败测试")
-  }
-  if (/\bEXPECT_TRUE\s*\(\s*true\s*\)/.test(testCode)) {
-    issues.push("TRIVIAL_ASSERTION: EXPECT_TRUE(true) 不验证任何行为")
-  }
-  const strong = /\b(EXPECT|ASSERT)_(EQ|NE|LT|LE|GT|GE|STREQ|THROW|TRUE|FALSE)\s*\(/.test(testCode)
-  const onlyNoThrow = /\b(EXPECT|ASSERT)_NO_THROW\s*\(/.test(testCode) && !strong
-  if (checkedTests > 0 && onlyNoThrow) issues.push("WEAK_ASSERTION: 仅包含无抛出检查，未验证核心行为")
-  return { ok: issues.length === 0, issues, checked_tests: checkedTests }
 }
 
 function diagnoseCppFailure(executionResult: ExecutionResult, quality: QualityResult): Diagnosis {

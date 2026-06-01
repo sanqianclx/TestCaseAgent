@@ -64,12 +64,21 @@ export interface QualityResult {
 }
 
 export interface CoverageResult {
+  /** 符号覆盖率（用例设计阶段） */
   symbol_coverage: number
   covered_symbols: string[]
   uncovered_symbols: string[]
   case_type_coverage: Record<string, number>
   total_symbols: number
   total_cases: number
+  /** 真实行覆盖率（coverage.py / JaCoCo / gcov 测量结果） */
+  line_rate: number
+  branch_rate: number
+  covered_lines: number
+  total_lines: number
+  missing_lines: number
+  /** 覆盖率工具名称 */
+  coverage_tool: string
 }
 
 export interface Diagnosis {
@@ -139,7 +148,6 @@ export interface LanguageAdapter {
     timeoutSeconds: number
     analysis: SourceAnalysis
   }): ExecutionResult
-  checkQuality(input: { testCode: string; analysis: SourceAnalysis }): QualityResult
   diagnose(input: {
     sourceCode: string
     testCode: string
