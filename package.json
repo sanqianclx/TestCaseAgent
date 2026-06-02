@@ -6,7 +6,8 @@
     "dev": "mastra dev",
     "build": "tsc",
     "generate": "node dist/cli.js",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "agent": "node dist/cli.js --autonomous"
   },
   "dependencies": {
     "@ai-sdk/deepseek": "^2.0.35",

@@ -3,7 +3,7 @@ import path from "path"
 import readline from "readline/promises"
 import { stdin as input, stdout as output } from "process"
 import { canUseLLM, formatError, getLlmUnavailableReason, loadProjectEnv } from "./mastra/runtime/env.js"
-import { logAgent, logInfo, logError, promptUser } from "./mastra/runtime/cli-output.js"
+import { logAgent, logInfo, logError, promptUser, installFrameworkLogFilter } from "./mastra/runtime/cli-output.js"
 import { cliAgent } from "./mastra/agents/cli-conversation-agent.js"
 import { generateTestWorkflow, resumeGeneratedTests, setLlmRetriesExhaustedHandler } from "./mastra/workflows/generate-test-workflow.js"
 import { detectLanguage, type SupportedLanguage } from "./mastra/languages/registry.js"
@@ -11,6 +11,7 @@ import { assessCommandRisk, runCommandInVisibleTerminal } from "./mastra/runtime
 import { memoryStore } from "./mastra/memory/in-memory-store.js"
 import { getSessionState, updateSessionState } from "./mastra/memory/session-state.js"
 import { logger, flushLogger } from "./mastra/runtime/logger.js"
+import { runAutonomousRepl, AUTONOMOUS_MODE_DESCRIPTION, AUTONOMOUS_TOOL_NAMES } from "./autonomous/index.js"
 
 type WorkflowResult = {
   source_file: string
@@ -31,6 +32,7 @@ type CliArgs = {
   language?: string
   interactive: boolean
   help: boolean
+  autonomous: boolean
 }
 
 type PendingPlan = {
@@ -108,10 +110,20 @@ type ConversationState =
 
 async function main(): Promise<void> {
   loadProjectEnv()
+  // V2.6.2: 启动早期装上 framework 噪音过滤器,拦截 Mastra 框架 console.error
+  // 里的内部错误(JSON parse 失败 / tool validation 失败等)。
+  // 框架会把这些错误当 tool-result 回灌给 LLM,LLM 会自纠;
+  // 对用户而言,看到这堆 JSON 噪音只是干扰。
+  installFrameworkLogFilter()
   const args = parseArgs(process.argv.slice(2))
 
   if (args.help) {
     printHelp()
+    return
+  }
+
+  if (args.autonomous) {
+    await runAutonomousRepl({ llmRetries: args.llmRetries })
     return
   }
 
@@ -1000,7 +1012,7 @@ function looksExecutableCommand(command: string): boolean {
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { maxAttempts: 3, llmRetries: 2, interactive: false, help: false }
+  const args: CliArgs = { maxAttempts: 3, llmRetries: 2, interactive: false, help: false, autonomous: false }
   const positional: string[] = []
   for (let index = 0; index < argv.length; index += 1) {
     const current = argv[index]
@@ -1014,6 +1026,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (current === "--requirements") { args.requirementsText = next; index += 1 }
     else if (current === "--requirements-file") { args.requirementsText = fs.readFileSync(path.resolve(next ?? ""), "utf-8"); index += 1 }
     else if (current === "--language" || current === "-l") { args.language = next; index += 1 }
+    else if (current === "--autonomous" || current === "--agent") { args.autonomous = true }
     else positional.push(current)
   }
   args.input ??= positional[0]
@@ -1040,6 +1053,7 @@ function printHelp(): void {
   --requirements         额外需求文本
   --requirements-file    从文件读取额外需求
   --interactive, -I      自然语言交互模式
+  --autonomous, --agent  启动自主 Agent REPL（独立于工作流；LLM 自主调用工具）
   --help, -h             显示帮助信息
 `)
 }

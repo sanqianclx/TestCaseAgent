@@ -180,9 +180,80 @@ export function logDebug(message: string): void {
   }
 }
 
+/**
+ * 输出 LLM 思维链(暗灰色,带"思考:"前缀,逐字流式)
+ *
+ * 与 `logAgent` 区别:这是 LLM 的内部推理,不是给用户的最终答案。
+ * 选用 DIM(暗灰)+"思考:"前缀,让用户能区分"这是 LLM 在想"和"这是 LLM 在答"。
+ *
+ * 设计原因:用户希望看到 LLM "想什么"而不只是"做什么",便于信任 LLM 的判断。
+ * 关闭方式:DEBUG 开启时已经被 logDebug 接管?不对,这里是普通可见,关闭方式是注释掉。
+ *
+ * @param delta 思维链增量(可能很短,几个 token 一组)
+ */
+export function logReasoning(delta: string): void {
+  if (typeof delta !== "string" || delta.length === 0) return
+  process.stdout.write(paint(DIM, `💭 ${delta}`))
+}
+
 // ============================================================
 // 进度条辅助(内嵌 renderProgressBar)
 // ============================================================
+
+// ============================================================
+// 流式 Agent 输出(V2.6):保持 `Agent：` 前缀开着,逐字追加 delta
+// ============================================================
+
+/**
+ * 流式输出状态机标记
+ *
+ * true:已写 `Agent：` 前缀,后续 writeAgentStream 直接追加 delta
+ * false:未开,下一次 writeAgentStream 会先写前缀
+ *
+ * 模块级状态在 REPL 多 turn 场景下需要正确重置——endAgentStream 把它置回 false,
+ * 审批 y/n 期间不调 writeAgentStream 即可(readline 接管了 stdin 输出)。
+ */
+let agentStreamOpen = false
+
+/**
+ * 开启一段流式 Agent 文本(写 `Agent：` 黄色加粗前缀)
+ *
+ * 多次调用是幂等的:只在未开时写前缀。
+ */
+export function startAgentStream(): void {
+  if (!agentStreamOpen) {
+    const prefix = COLOR_ENABLED ? `${BOLD}${YELLOW}Agent：${RESET}` : "Agent："
+    process.stdout.write(prefix)
+    agentStreamOpen = true
+  }
+}
+
+/**
+ * 追加一段 LLM 流式文本到 stdout
+ *
+ * 内部保证前缀已开,直接 write delta,不换行;Node TTY 默认 line-buffered,
+ * 不带 `\n` 的 write 也会立即 flush 字符,达到"逐字"效果。
+ *
+ * @param delta LLM 这一 chunk 的文本增量(可能为空串)
+ */
+export function writeAgentStream(delta: string): void {
+  if (typeof delta !== "string" || delta.length === 0) return
+  startAgentStream()
+  process.stdout.write(delta)
+}
+
+/**
+ * 结束流式段(补一个换行并重置状态)
+ *
+ * 必须在每段 LLM 文本结束(无论是正常 text-end 还是异常跳出)时调用一次,
+ * 否则下一次 startAgentStream 会接到上一段尾部。
+ */
+export function endAgentStream(): void {
+  if (agentStreamOpen) {
+    process.stdout.write("\n")
+    agentStreamOpen = false
+  }
+}
 
 /**
  * 在终端当前行打印一行进度条,使用 CR(\r) 覆盖之前内容
@@ -210,4 +281,89 @@ export function renderProgressBar(label: string, current: number, total: number)
  */
 export function finishProgressBar(): void {
   process.stdout.write("\n")
+}
+
+// ============================================================
+// Framework 噪音过滤(V2.6.2):拦截 Mastra 框架主动打到 console 的内部错误
+// ============================================================
+
+/**
+ * 框架内部打 console 时包含的"已知噪音"关键词
+ *
+ * 这些是 Mastra 1.0 框架在以下情况会主动 console.error / console.log 的内容:
+ * 1. LLM 工具入参 JSON parse 失败(框架重试时打印)
+ * 2. 工具入参 schema 校验失败(把 error 当 tool-result 回灌给 LLM)
+ * 3. 工具输出 schema 校验失败
+ *
+ * 这些都是**框架内部自纠**的标志,LLM 会看到完整 tool-result 并自动重试。
+ * 对用户而言,看到这堆 JSON 噪音只会怀疑 Agent 出了问题。
+ *
+ * 过滤策略:在 `console.error` / `console.log` 上 monkey-patch,
+ * 如果首个参数(可能是 string 或 object)含这些关键词,就**静默掉**,不再打到终端。
+ * 其他 console.error / console.log 行为不变。
+ */
+const FRAMEWORK_NOISE_KEYWORDS = [
+  "Error converting tool call input to JSON",
+  "Tool input validation failed",
+  "Tool output validation failed",
+  "Tool suspension data validation failed",
+] as const
+
+/**
+ * 检查首个参数是否是 framework 已知噪音
+ *
+ * - string:包含任一关键词
+ * - object:序列化后含任一关键词
+ */
+function isFrameworkNoise(firstArg: unknown): boolean {
+  if (typeof firstArg === "string") {
+    return FRAMEWORK_NOISE_KEYWORDS.some((kw) => firstArg.includes(kw))
+  }
+  if (firstArg && typeof firstArg === "object") {
+    try {
+      const serialized = JSON.stringify(firstArg)
+      return FRAMEWORK_NOISE_KEYWORDS.some((kw) => serialized.includes(kw))
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
+/**
+ * 已安装标记
+ *
+ * 模块级状态,避免重复 patch 同一个 console 方法。
+ */
+let filterInstalled = false
+
+/**
+ * 安装 framework 噪音过滤器
+ *
+ * 在 cli 启动早期调用一次即可。会影响所有 console.error / console.log 调用,
+ * 建议**只在 CLI 进程**调用,不要在 Studio / 测试进程里调用(避免吞掉业务日志)。
+ *
+ * 实现:
+ * - 保留原始 console.error / console.log 引用
+ * - patch 后如果检测到 framework 噪音,**直接 return**,不调原始方法
+ * - 其他情况正常转发到原始方法
+ *
+ * 关闭方式:`process.env.DEBUG_NOISE=1` 时跳过过滤,framework 噪音会恢复显示。
+ */
+export function installFrameworkLogFilter(): void {
+  if (filterInstalled) return
+  if (env.DEBUG_NOISE) return
+  filterInstalled = true
+
+  const originalError = console.error.bind(console)
+  const originalLog = console.log.bind(console)
+  // 用 unknown[] 兼容 console.error(...args) 的 rest 参数
+  console.error = (...args: unknown[]) => {
+    if (args.length > 0 && isFrameworkNoise(args[0])) return
+    originalError(...(args as Parameters<typeof originalError>))
+  }
+  console.log = (...args: unknown[]) => {
+    if (args.length > 0 && isFrameworkNoise(args[0])) return
+    originalLog(...(args as Parameters<typeof originalLog>))
+  }
 }

@@ -33,6 +33,7 @@ export type LogEvent =
   | "llm.response"     // 收到 LLM 原始回复（完整 text 落盘）
   | "llm.retry"        // LLM 重试
   | "llm.failed"       // LLM 失败且不再重试
+  | "llm.stream.error" // LLM 流式 chunk 报告的内部错误(框架会内部重试,仅审计)
   | "workflow.step"    // Workflow 步骤迁移
   | "tool.invoke"      // 工具调用
   | "agent.run"        // Agent 决策结果

@@ -336,3 +336,79 @@ V2.2 起，CLI 端的彩色输出由 [`src/mastra/runtime/cli-output.ts`](./src/
 3. 写一个真正的 Agent
 4. 需求文档变更
 ***
+
+## 自主 Agent 模式（Autonomous Agent REPL）
+
+与"工作流驱动"模式（`--input` / `--interactive`）并行存在的另一种使用方式：
+**LLM 自己规划、自己调用工具**，用户负责在关键步骤上做 y/n 审批。
+
+### 启动
+
+```bash
+npm run build       # 编译
+npm run agent       # 等价于 node dist/cli.js --autonomous
+# 或：node dist/cli.js --autonomous
+```
+
+进入后你会看到：
+
+```
+Agent：自主测试代码 Agent 已启动。直接告诉我你想做什么。
+  - 工具数：9（read/write/parse/execute/coverage/export/logger/shell/ask）
+  - 日志文件：.../output/logs/agent.log
+  - 当前工作目录：...
+  - 输入 exit 退出
+User：
+```
+
+直接用自然语言告诉 Agent 你想做什么，比如：
+
+- "帮我把 `tests/test_foo.py` 里的断言都改成 `pytest.approx`"
+- "看看 `src/utils.py` 第 30 行为什么 `KeyError`，修一下"
+- "给 `Calculator.div` 写 3 个 pytest 用例并跑一下"
+
+### 可用工具
+
+| 工具 | 用途 | 审批策略 |
+|---|---|---|
+| `readFile` | 读取任意文本文件 | 自动放行 |
+| `writeFile` | 写文件（CWD 内自动，外则需确认） | 路径检查 |
+| `parseSourceCode` | AST 解析 Python/Java/C++ | 自动放行 |
+| `executeTests` | 跑 pytest 并返回每个用例结果 | 自动放行 |
+| `measureCoverage` | coverage.py / jacoco.xml 解析 | 自动放行 |
+| `exportCases` | 导出测试代码 + 报告 | 路径检查 |
+| `logger` | 写入 output/logs/agent.log | 自动放行 |
+| `shellRun` | 同步执行 shell 命令 | 总是走 y/n 审批 |
+| `askUser` | 主动向用户澄清 | 挂起并展示问题 |
+
+### shell 命令审批
+
+当 Agent 想跑 `shellRun` 时，CLI 会显示：
+
+```
+Agent 请求调用工具：shellRun
+  参数：command=ls *.py
+  风险等级：low
+  风险原因：该命令看起来像是普通的检查或测试命令。
+  工作目录：D:\...
+  允许执行？[y/n/always/never]：User：
+```
+
+| 输入 | 动作 |
+|---|---|
+| `y` / `yes` / `是` / `确认` | 放行一次 |
+| `n` / `no` / `否` / `取消` | 拒绝一次 |
+| `always` / `auto` / `总是` | 放行 + 记住（本会话内该命令首词自动通过） |
+| `never` / `block` / `拒绝` | 拒绝 + 记住（本会话内该命令首词自动拒绝） |
+
+### 与工作流模式的关系
+
+| 维度 | 工作流模式 (`--input` / `--interactive`) | 自主模式 (`--autonomous` / `--agent`) |
+|---|---|---|
+| LLM 角色 | 流程中的一颗螺丝钉（设计 / 写代码 / 诊断） | 自主决策大脑 |
+| 执行路径 | 固定 Step 链 | LLM 多轮工具调用 |
+| 用户角色 | 启动时给参数 | 持续对话 + 关键步骤审批 |
+| 适用场景 | 一次性"为这个文件生成测试" | 反复迭代修改、调试、探索代码 |
+| 记忆 | 一次性会话 | 进程内持续累积（80 条上限） |
+
+**完全独立**：自主模式不引用 `generate-test-workflow` 的任何代码，仅复用日志、CLI 输出、记忆、工具工厂等基础设施。
