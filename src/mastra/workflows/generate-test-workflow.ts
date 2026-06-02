@@ -9,6 +9,7 @@ import { testCodeAgent, testCodeAgentPro } from "../agents/test-code-agent.js"
 import { detectLanguage, getLanguageAdapter } from "../languages/registry.js"
 import { assertLlmAvailable, formatError } from "../runtime/env.js"
 import { logAgentProgress, renderProgressBar, finishProgressBar } from "../runtime/cli-output.js"
+import { logger } from "../runtime/logger.js"
 import { measureCoverage } from "../tools/coverage-tool.js"
 import type {
   Diagnosis,
@@ -487,8 +488,15 @@ async function runSelfHealing(
       llmRetries: inputData.llm_retries,
     })
 
+    // 校正 next_action：LLM 给出的 next_action 经常与 diagnosis_type 不一致（例如把源代码缺陷
+    // 归类为 REGENERATE_TEST_CODE）。这里以 diagnosis_type 为准重新映射一次，保证下游 CLI
+    // 提示与诊断语义一致。
+    diagnosis = reconcileNextAction(diagnosis)
     versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
     if (diagnosis.diagnosis_type !== "TEST_CODE_ERROR" || diagnosis.confidence < 0.7) {
+      logAgentProgress(
+        `AI 诊断为 ${describeDiagnosisType(diagnosis.diagnosis_type)}（置信度 ${diagnosis.confidence.toFixed(2)}），不是测试代码缺陷，跳过自愈。`
+      )
       coverage = await measureRealCoverage(inputData, testCode)
       return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
     }
@@ -544,7 +552,11 @@ async function runSelfHealing(
     attempt: inputData.max_attempts,
     llmRetries: inputData.llm_retries,
   })
+  diagnosis = reconcileNextAction(diagnosis)
   versions[versions.length - 1] = { ...versions[versions.length - 1], diagnosis }
+  logAgentProgress(
+    `自愈尝试上限（${inputData.max_attempts - 1} 次）已用完，最后一次诊断为 ${describeDiagnosisType(diagnosis.diagnosis_type)}。`
+  )
   coverage = await measureRealCoverage(inputData, testCode)
   return finalize(inputData, testCode, executionResult, diagnosis, quality, coverage, versions)
 }
@@ -608,6 +620,13 @@ async function generateTestCases(input: {
           fence,
         ].join("\n")
         const response = await testCaseAgent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 12000 } })
+        logger.info("llm.response", {
+          scope: "workflow.generateTestCases",
+          stage: `test-case-batch-${batchIndex + 1}-of-${effectiveBatches.length}`,
+          text: response.text,
+          model: response.response?.model,
+          usage: response.usage,
+        })
         return await parseTestCaseBatch(response.text, input.llmRetries, prompt)
       })
       const acceptedCases = remainingGlobalLimit === undefined ? batchCases : batchCases.slice(0, remainingGlobalLimit)
@@ -671,6 +690,13 @@ async function generateTestCode(input: {
         fence,
       ].join("\n")
       const response = await agent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 8192 } })
+      logger.info("llm.response", {
+        scope: "workflow.generateTestCode",
+        stage: `test-code-attempt-${input.attempt}`,
+        text: response.text,
+        model: response.response?.model,
+        usage: response.usage,
+      })
       const code = extractCode(response.text, input.adapter.codeFence)
       if (code.trim()) return code
       throw new Error("LLM 返回了空的测试代码。预览：" + preview(response.text))
@@ -743,6 +769,13 @@ async function diagnoseFailure(input: {
         fence,
       ].join("\n")
       const response = await agent.generate(prompt, { modelSettings: { temperature: 0.1, maxOutputTokens: 8192 } })
+      logger.info("llm.response", {
+        scope: "workflow.diagnoseFailure",
+        stage: `diagnose-attempt-${input.attempt}`,
+        text: response.text,
+        model: response.response?.model,
+        usage: response.usage,
+      })
       const text = response.text.trim()
       if (!text) throw new Error("LLM 返回了空的诊断。")
       return text
@@ -797,6 +830,54 @@ async function classifyDiagnosisDecision(
     }
     return parsed.data as Diagnosis
   })
+}
+
+/**
+ * 将 LLM 给出的 diagnosis 校正一次，让 next_action 与 diagnosis_type 语义一致。
+ *
+ * LLM 经常在 next_action 上"偷懒"：无论诊断类型是什么，都倾向于返回 REGENERATE_TEST_CODE。
+ * 但语义上：
+ * - TEST_CODE_ERROR + 置信度足够 → 重新生成测试代码
+ * - SOURCE_RUNTIME_ERROR / BEHAVIOR_MISMATCH → 报告给用户（自愈不会修复源代码）
+ * - ENVIRONMENT_ERROR → 建议安装依赖
+ * - 其他 / 置信度不足 → 询问用户
+ */
+function reconcileNextAction(diagnosis: Diagnosis): Diagnosis {
+  const type = diagnosis.diagnosis_type
+  const confidence = Number(diagnosis.confidence) || 0
+  let nextAction: Diagnosis["next_action"]
+
+  if (type === "TEST_CODE_ERROR" && confidence >= 0.7) {
+    nextAction = "REGENERATE_TEST_CODE"
+  } else if (type === "SOURCE_RUNTIME_ERROR" || type === "BEHAVIOR_MISMATCH") {
+    nextAction = "REPORT_TO_USER"
+  } else if (type === "ENVIRONMENT_ERROR") {
+    nextAction = "INSTALL_DEPENDENCY"
+  } else {
+    nextAction = "ASK_USER_CONFIRMATION"
+  }
+
+  if (nextAction === diagnosis.next_action) return diagnosis
+  return { ...diagnosis, next_action: nextAction }
+}
+
+/**
+ * 给诊断类型起一个中文名，用于在控制台/日志中提示用户。
+ */
+function describeDiagnosisType(type: Diagnosis["diagnosis_type"]): string {
+  switch (type) {
+    case "TEST_CODE_ERROR":
+      return "测试代码缺陷"
+    case "SOURCE_RUNTIME_ERROR":
+      return "源代码运行错误"
+    case "BEHAVIOR_MISMATCH":
+      return "源代码行为与预期不符"
+    case "ENVIRONMENT_ERROR":
+      return "环境或依赖问题"
+    case "UNKNOWN":
+    default:
+      return "未知原因"
+  }
 }
 
 
@@ -874,9 +955,22 @@ async function withLlmRetries<T>(
       remaining -= 1
       if (remaining > 0) {
         const total = retryCount + 1
-        logAgentProgress(`LLM ${label} 在第 ${total - remaining}/${total} 次尝试中失败，正在重试。原因：${formatError(error)}`)
+        logger.warn("llm.retry", {
+          scope: "workflow.withLlmRetries",
+          stage: label,
+          attempt: total - remaining,
+          total_attempts: total,
+          error: formatError(error),
+        })
         continue
       }
+      logger.error("llm.failed", {
+        scope: "workflow.withLlmRetries",
+        stage: label,
+        attempt: retryCount + 1,
+        total_attempts: retryCount + 1,
+        error: formatError(error),
+      })
     }
 
     if (llmRetriesExhaustedHandler) {
@@ -908,15 +1002,30 @@ async function parseTestCaseBatch(text: string, llmRetries: number, originalProm
   } catch (error) {
     if (originalPrompt && isIncompleteJsonError(error)) {
       logAgentProgress("测试用例 JSON 看起来被截断了；请求 LLM 从中断处继续。")
+      logger.warn("llm.retry", {
+        scope: "workflow.parseTestCaseBatch",
+        stage: "json-truncated-continue",
+        error: formatError(error),
+      })
       try {
         const continued = await continueTestCaseJson(text, originalPrompt, llmRetries)
         return validateTestCaseBatch(continued)
       } catch (continuationError) {
-        logAgentProgress("续写未能生成完整的 JSON；回退到 JSON 修复。原因：" + formatError(continuationError))
+        logAgentProgress("续写未能生成完整的 JSON；回退到 JSON 修复。")
+        logger.warn("llm.retry", {
+          scope: "workflow.parseTestCaseBatch",
+          stage: "json-continue-failed-fallback",
+          error: formatError(continuationError),
+        })
       }
     }
 
-    logAgentProgress("正在用 LLM 修复无效的测试用例 JSON。原因：" + formatError(error))
+    logAgentProgress("正在用 LLM 修复无效的测试用例 JSON。")
+    logger.warn("llm.retry", {
+      scope: "workflow.parseTestCaseBatch",
+      stage: "json-repair",
+      error: formatError(error),
+    })
     return await withLlmRetries("测试用例 JSON 修复", Math.min(llmRetries, 1), async () => {
         const repairPrompt = [
           "之前的响应本应为单元测试用例的 JSON，但无效或不完整。",
@@ -934,6 +1043,13 @@ async function parseTestCaseBatch(text: string, llmRetries: number, originalProm
           text,
         ].join("\n")
       const response = await testCaseAgent.generate(repairPrompt, { modelSettings: { temperature: 0, maxOutputTokens: 12000 } })
+      logger.info("llm.response", {
+        scope: "workflow.repairTestCaseJson",
+        stage: "json-repair",
+        text: response.text,
+        model: response.response?.model,
+        usage: response.usage,
+      })
       return validateTestCaseBatch(response.text)
     })
   }
@@ -971,6 +1087,13 @@ async function continueTestCaseJson(partialText: string, originalPrompt: string,
       ].join("\n")
       const response = await testCaseAgent.generate(prompt, {
         modelSettings: { temperature: 0, maxOutputTokens: 12000 },
+      })
+      logger.info("llm.response", {
+        scope: "workflow.continueTestCaseJson",
+        stage: `continuation-round-${round}-of-${rounds}`,
+        text: response.text,
+        model: response.response?.model,
+        usage: response.usage,
       })
       return response.text
     })
@@ -1101,7 +1224,14 @@ async function measureRealCoverage(
     })
 
     if (!result.ok) {
-      logAgentProgress("覆盖率测量失败：" + (result.error?.message ?? "未知错误") + "，回退到符号覆盖率")
+      logAgentProgress("覆盖率测量失败，回退到符号覆盖率。")
+      logger.warn("llm.failed", {
+        scope: "workflow.measureCoverage",
+        stage: "coverage-tool-failed",
+        language: lang,
+        tool: toolLabel,
+        error: result.error?.message ?? "未知错误",
+      })
       return { ...base, coverage_tool: "symbol-only (measurement failed)" }
     }
 
@@ -1115,7 +1245,14 @@ async function measureRealCoverage(
       coverage_tool: result.tool,
     }
   } catch (error) {
-    logAgentProgress("覆盖率测量异常：" + formatError(error) + "，回退到符号覆盖率")
+    logAgentProgress("覆盖率测量异常，回退到符号覆盖率。")
+    logger.error("llm.failed", {
+      scope: "workflow.measureCoverage",
+      stage: "coverage-threw",
+      language: lang,
+      tool: toolLabel,
+      error: formatError(error),
+    })
     return { ...base, coverage_tool: "symbol-only (error)" }
   }
 }

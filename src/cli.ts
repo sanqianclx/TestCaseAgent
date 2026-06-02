@@ -3,13 +3,14 @@ import path from "path"
 import readline from "readline/promises"
 import { stdin as input, stdout as output } from "process"
 import { canUseLLM, formatError, getLlmUnavailableReason, loadProjectEnv } from "./mastra/runtime/env.js"
-import { logAgent, logInfo, logWarn, logError, promptUser } from "./mastra/runtime/cli-output.js"
+import { logAgent, logInfo, logError, promptUser } from "./mastra/runtime/cli-output.js"
 import { cliAgent } from "./mastra/agents/cli-conversation-agent.js"
 import { generateTestWorkflow, resumeGeneratedTests, setLlmRetriesExhaustedHandler } from "./mastra/workflows/generate-test-workflow.js"
 import { detectLanguage, type SupportedLanguage } from "./mastra/languages/registry.js"
 import { assessCommandRisk, runCommandInVisibleTerminal } from "./mastra/runtime/command-runner.js"
 import { memoryStore } from "./mastra/memory/in-memory-store.js"
 import { getSessionState, updateSessionState } from "./mastra/memory/session-state.js"
+import { logger, flushLogger } from "./mastra/runtime/logger.js"
 
 type WorkflowResult = {
   source_file: string
@@ -269,6 +270,13 @@ ${JSON.stringify({
 用户最新消息：
 ${userMessage}
 `, { modelSettings: { temperature: 0, maxOutputTokens: 2048 } })
+      logger.info("llm.response", {
+        scope: "cli.conversation",
+        stage: "conversation",
+        text: response.text,
+        model: response.response?.model,
+        usage: response.usage,
+      })
       const decision = parseConversationDecision(response.text)
       return recoverPlanFromText(decision, response.text, userMessage)
     })
@@ -371,6 +379,13 @@ ${memoryStore.summarize(sessionId)}
 用户最新回复：
 ${userMessage}
 `, { modelSettings: { temperature: 0, maxOutputTokens: 1024 } })
+    logger.info("llm.response", {
+      scope: "cli.conversation",
+      stage: "pending-intent",
+      text: response.text,
+      model: response.response?.model,
+      usage: response.usage,
+    })
     return parseIntentDecision(response.text)
   })
 }
@@ -401,6 +416,13 @@ ${memoryStore.summarize(sessionId)}
 用户最新回复：
 ${userMessage}
 `, { modelSettings: { temperature: 0, maxOutputTokens: 2048 } })
+    logger.info("llm.response", {
+      scope: "cli.conversation",
+      stage: "followup",
+      text: response.text,
+      model: response.response?.model,
+      usage: response.usage,
+    })
     return parseFollowupDecision(response.text)
   })
 }
@@ -420,6 +442,13 @@ async function askRetryExtensionWithAI(label: string, errorText: string, llmRetr
           "最后错误：" + errorText,
           "用户回复：" + answer,
         ].join("\n"), { modelSettings: { temperature: 0, maxOutputTokens: 512 } })
+        logger.info("llm.response", {
+          scope: "cli.conversation",
+          stage: "retry-extension",
+          text: response.text,
+          model: response.response?.model,
+          usage: response.usage,
+        })
         return parseIntentDecision(response.text)
       })
       if (intent.intent === "confirm") return 3
@@ -569,6 +598,26 @@ async function runGeneration(inputData: {
   }
 }
 
+/**
+ * 把 diagnosis_type 翻译成中文标签，仅用于 CLI 提示文本。
+ * 真正的诊断类型到 next_action 的映射在工作流里完成；这里只是兜底文案。
+ */
+function describeDiagnosisTypeForCli(type: string | undefined): string {
+  switch (type) {
+    case "TEST_CODE_ERROR":
+      return "测试代码缺陷"
+    case "SOURCE_RUNTIME_ERROR":
+      return "源代码运行错误"
+    case "BEHAVIOR_MISMATCH":
+      return "源代码行为与预期不符"
+    case "ENVIRONMENT_ERROR":
+      return "环境或依赖问题"
+    case "UNKNOWN":
+    default:
+      return "未知原因"
+  }
+}
+
 async function maybeAskNextAction(
   result: Awaited<ReturnType<typeof runGeneration>>,
   plan: PendingPlan,
@@ -596,7 +645,23 @@ async function maybeAskNextAction(
 
   if (result && !result.passed && diagnosis?.next_action === "REGENERATE_TEST_CODE") {
     const nextMaxAttempts = plan.maxAttempts + 2
-    logAgent(`工作流在重试上限 ${plan.maxAttempts} 处暂停。AI 仍然认为生成的测试代码需要修复。`)
+    const versions = result.versions ?? []
+    const selfHealCount = Math.max(versions.length - 1, 0)
+    const diagnosisType = diagnosis.diagnosis_type
+    if (diagnosisType === "TEST_CODE_ERROR") {
+      logAgent(
+        `工作流在自愈上限 ${plan.maxAttempts} 处暂停（已尝试 ${selfHealCount} 次）。` +
+        `AI 仍然认为生成的测试代码有缺陷。`
+      )
+    } else {
+      // 兜底：理论上 runSelfHealing 应当把 next_action 校正到 REPORT_TO_USER / ASK_USER_CONFIRMATION，
+      // 但万一没校正或外部数据传了原始诊断，这里给一个不会误导用户的回退消息。
+      const typeLabel = describeDiagnosisTypeForCli(diagnosisType)
+      logAgent(
+        `工作流在自愈上限 ${plan.maxAttempts} 处暂停（已尝试 ${selfHealCount} 次）。` +
+        `AI 把失败归类为「${typeLabel}」，不是测试代码缺陷；自愈跳过。`
+      )
+    }
     logInfo("你可以继续更多次尝试、修改计划或取消。")
     return {
       mode: "awaiting_followup",
@@ -904,7 +969,21 @@ async function withRetries<T>(label: string, retries: number, task: () => Promis
     } catch (error) {
       lastError = error
       if (attempt < attempts) {
-        logAgent(`${label} 在第 ${attempt}/${attempts} 次尝试中失败，正在重试。原因：${formatError(error)}`)
+        logger.warn("llm.retry", {
+          scope: "cli.withRetries",
+          stage: label,
+          attempt,
+          total_attempts: attempts,
+          error: formatError(error),
+        })
+      } else {
+        logger.error("llm.failed", {
+          scope: "cli.withRetries",
+          stage: label,
+          attempt,
+          total_attempts: attempts,
+          error: formatError(error),
+        })
       }
     }
   }
@@ -967,5 +1046,12 @@ function printHelp(): void {
 
 main().catch((error) => {
   logError(`Agent 启动失败：${formatError(error)}`)
-  process.exitCode = 1
+  logger.error("system", {
+    scope: "cli.main",
+    stage: "fatal",
+    error: formatError(error),
+  })
+  flushLogger().finally(() => {
+    process.exitCode = 1
+  })
 })
