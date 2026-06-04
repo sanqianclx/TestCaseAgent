@@ -1,0 +1,119 @@
+/* 全局样式 */
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  width: 100%;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: #f5f7fa;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 让 Ant Design 组件铺满全屏 */
+.ant-layout {
+  background: transparent !important;
+}
+
+.ant-layout-sider {
+  background: #fff !important;
+}
+
+.ant-layout-header {
+  background: #fff !important;
+  padding: 0 !important;
+  height: 64px;
+  line-height: 64px;
+}
+
+.ant-layout-content {
+  background: #f5f7fa;
+  height: 100%;
+  overflow: auto;
+}
+
+/* 内容区不允许出现页面级滚动条 */
+body {
+  overflow: hidden;
+}
+
+/* 卡片美化 */
+.ant-card {
+  border-radius: 8px;
+  border: 1px solid #f0f0f0;
+}
+
+.ant-card:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+/* 表格美化 */
+.ant-table {
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* 输入框美化 */
+.ant-input,
+.ant-input-affix-wrapper {
+  border-radius: 6px;
+}
+
+/* 按钮美化 */
+.ant-btn {
+  border-radius: 6px;
+}
+
+/* 标签美化 */
+.ant-tag {
+  border-radius: 4px;
+  padding: 2px 8px;
+}
+
+/* 滚动条美化 - 细长但可见 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d9d9d9;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #bfbfbf;
+}
+
+/* 响应式 */
+@media (max-width: 768px) {
+  .ant-layout-sider {
+    width: 64px !important;
+    min-width: 64px !important;
+    max-width: 64px !important;
+  }
+
+  .ant-layout-sider .ant-menu-item .ant-menu-title-content {
+    display: none;
+  }
+}
+
+/* 隐藏特定元素的滚动条 */
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}

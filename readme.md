@@ -137,6 +137,7 @@ testgenerate-agent/
 ### 1. 环境要求
 
 - **Node.js** >= 22
+- **MySQL** >= 8.0
 - **Python** >= 3.10，已安装 pytest
 - **LLM API Key**（DeepSeek / OpenAI 等）
 - （可选）Java 17+ + Maven（用于 Java 测试）
@@ -150,42 +151,63 @@ npm install
 
 # Python 依赖
 pip install pytest
+
+# 前端依赖
+cd client && npm install
 ```
 
-### 3. 配置 API Key
+### 3. 配置环境变量
 
-在项目根目录创建 `.env` 文件：
+复制 `.env.example` 为 `.env` 并配置：
 
 ```env
-# DeepSeek（默认推荐）
+# 数据库
+DATABASE_URL="mysql://root:123456@localhost:3306/testgenerate"
+
+# LLM
 DEEPSEEK_API_KEY=sk-你的Key
 
-# 或使用 OpenAI
-# OPENAI_API_KEY=sk-你的Key
+# JWT
+JWT_SECRET="your-secret-key"
 ```
 
-### 4. CLI 交互模式
+### 4. 初始化数据库
 
-一句话让 Agent 干活：
+```bash
+# 执行数据库初始化脚本
+mysql -u root -p < docs/init-database.sql
+
+# 生成 Prisma Client
+npm run prisma:generate
+```
+
+### 5. 启动 Web 界面
+
+```bash
+# 一键启动（Windows）
+start.bat
+
+# 或手动启动
+npm run server:dev      # 后端 API 服务器
+cd client && npm run dev  # 前端开发服务器
+```
+
+访问 http://localhost:5173 使用 Web 界面。
+
+### 6. CLI 交互模式
 
 ```bash
 npm run build
 npm run generate -- --interactive
 ```
 
-进入交互模式后，你可以直接说：
-- "为 src/utils.py 生成测试"
-- "给我的 calculator.java 写单元测试"
-- "测试 cpp/sort.cpp，只生成前 5 个用例"
-- "换个输出目录"
-
-### 5. CLI 命令行模式
+### 7. CLI 命令行模式
 
 ```bash
 npm run generate -- --input ./src/example.py --output ./my-tests
 ```
 
-### 6. 启动 Mastra Studio（可视化调试）
+### 8. 启动 Mastra Studio（可视化调试）
 
 ```bash
 npx mastra dev
@@ -326,7 +348,7 @@ V2.2 起，CLI 端的彩色输出由 [`src/mastra/runtime/cli-output.ts`](./src/
 | **V2.1** | 多语言支持（Java + C++）+ 自然语言 CLI 交互 + 内存记忆 | ✅ 已完成 |
 | **V2.2** | 真实覆盖率接入（Python coverage.py + Java JaCoCo）+ CLI 输出重构（消除 monkey-patch） | ✅ 已完成 |
 | **V2.3** | C++ 真实覆盖率（gcov / OpenCppCoverage）+ 覆盖率阈值触发自愈 | 📅 规划中 |
-| **V3.0** | Web 面板 + 历史记录 + MySQL/Redis 持久化 | 📅 规划中 |
+| **V3.0** | Web 面板 + 历史记录 + MySQL 持久化 + 前后端分离 | ✅ 已完成 |
 
 ***
 
@@ -336,6 +358,45 @@ V2.2 起，CLI 端的彩色输出由 [`src/mastra/runtime/cli-output.ts`](./src/
 3. 写一个真正的 Agent
 4. 需求文档变更
 ***
+
+## Web 界面
+
+V3.0 新增完整的 Web 管理界面，支持：
+
+- 📊 **仪表盘** - 统计概览、快速操作
+- 💬 **对话界面** - 支持 Agent 和 Workflow 两种模式
+- 📁 **文件管理** - 上传源代码文件
+- 🗂️ **工作空间** - 管理项目工作目录
+- 📋 **会话历史** - 查看历史对话
+- ⚡ **任务管理** - 监控任务执行状态
+- 🔑 **API Key** - 管理 API 密钥
+
+### 启动 Web 界面
+
+```bash
+# 启动后端
+npm run server:dev
+
+# 启动前端（新终端）
+cd client && npm run dev
+```
+
+访问 http://localhost:5173
+
+### API 端点
+
+| 模块 | 端点 | 说明 |
+|------|------|------|
+| 认证 | POST /api/v1/auth/register | 用户注册 |
+| 认证 | POST /api/v1/auth/login | 用户登录 |
+| 会话 | GET/POST /api/v1/sessions | 会话管理 |
+| 消息 | POST /api/v1/sessions/:id/messages | 发送消息 |
+| 任务 | GET/POST /api/v1/tasks | 任务管理 |
+| 文件 | POST /api/v1/files/upload | 文件上传 |
+| 工作空间 | GET/POST /api/v1/workspaces | 工作空间管理 |
+| API Key | GET/POST /api/v1/api-keys | API Key 管理 |
+
+---
 
 ## 自主 Agent 模式（Autonomous Agent REPL）
 

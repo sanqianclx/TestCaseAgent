@@ -1,0 +1,885 @@
+# 前后端 + 用户账户管理系统实施计划
+
+## 📋 项目概述
+
+为 TestGenerate Agent 添加完整的前后端系统，包含：
+- ✅ 用户账户管理（注册/登录/个人中心）
+- ✅ API Key 管理（创建/删除/使用统计）
+- ✅ 工作空间管理（工作目录指定/配置）
+- ✅ 会话与对话管理（历史记录/上下文）
+- ✅ 文件上传管理（源代码上传/分析）
+- ✅ 任务管理（测试生成任务/实时状态）
+
+---
+
+## 📚 相关文档
+
+| 文档 | 路径 | 说明 |
+|------|------|------|
+| 数据库设计 | [docs/database-design.md](database-design.md) | 10 张表详细设计 |
+| API 设计 | [docs/api-design.md](api-design.md) | 完整 API 接口定义 |
+
+---
+
+## 🎯 技术栈选择
+
+### 后端 (Backend)
+| 技术 | 用途 | 版本 |
+|------|------|------|
+| **Express** | Web 框架 | ^4.18 |
+| **TypeScript** | 类型安全 | ^5.5 |
+| **MySQL2** | 数据库驱动 | ^3.6 |
+| **Prisma** | ORM | ^5.0 |
+| **JWT** | 身份认证 | ^9.0 |
+| **bcryptjs** | 密码加密 | ^2.4 |
+| **Zod** | 参数校验（复用现有） | ^3.23 |
+| **cors** | 跨域处理 | ^2.8 |
+| **helmet** | 安全头 | ^7.0 |
+| **express-rate-limit** | 限流 | ^7.0 |
+
+### 前端 (Frontend)
+| 技术 | 用途 | 版本 |
+|------|------|------|
+| **React** | UI 框架 | ^18.2 |
+| **TypeScript** | 类型安全 | ^5.5 |
+| **Vite** | 构建工具 | ^5.0 |
+| **Ant Design** | UI 组件库 | ^5.12 |
+| **React Router** | 路由 | ^6.20 |
+| **Axios** | HTTP 客户端 | ^1.6 |
+| **Zustand** | 状态管理 | ^4.4 |
+| **React Query** | 数据请求 | ^3.39 |
+
+---
+
+## 🗄️ 数据库设计
+
+### 完整表结构（10 张表）
+
+| 表名 | 用途 | 核心字段 |
+|------|------|----------|
+| `users` | 用户表 | username, email, password_hash, role |
+| `api_keys` | API Key 表 | key_hash, prefix, permissions, usage_count |
+| `workspaces` | 工作空间表 | name, base_path, settings |
+| `sessions` | 会话表 | title, status, context, model_config |
+| `messages` | 消息表 | role, content, message_type, token_usage |
+| `tasks` | 任务表 | task_id, status, mode, result |
+| `task_logs` | 任务日志表 | level, step, message |
+| `uploaded_files` | 上传文件表 | filename, path, hash, purpose |
+| `file_contents` | 文件内容表 | content (LONGBLOB) |
+| `usage_stats` | 使用统计表 | task_count, token_usage, storage_used |
+
+> 详细表结构见 [docs/database-design.md](database-design.md)
+
+### ER 图概览
+
+```
+┌─────────────┐       ┌──────────────┐       ┌─────────────────┐
+│    users     │       │   api_keys   │       │  workspaces     │
+├─────────────┤       ├──────────────┤       ├─────────────────┤
+│ id (PK)     │──┐    │ id (PK)      │       │ id (PK)         │
+│ username    │  │    │ user_id (FK) │       │ user_id (FK)    │
+│ email       │  │    │ name         │       │ name            │
+│ password    │  │    │ key_hash     │       │ base_path       │
+│ avatar      │  │    │ prefix       │       │ description     │
+│ role        │  │    │ permissions  │       │ settings (JSON) │
+│ status      │  │    │ expires_at   │       │ created_at      │
+│ created_at  │  │    │ usage_count  │       └─────────────────┘
+│ updated_at  │  │    │ created_at   │               │
+└─────────────┘  │    └──────────────┘               │
+       │         │           │                        │
+       │         │    ┌──────────────┐                │
+       │         │    │    tasks     │                │
+       │         │    ├──────────────┤                │
+       │         └────│ id (PK)      │                │
+       │              │ user_id (FK) │                │
+       │              │ workspace_id │────────────────┘
+       │              │ session_id   │──────────────────┐
+       │              │ status       │                  │
+       │              │ mode         │       ┌──────────────────┐
+       │              │ source_file  │       │    sessions      │
+       │              │ language     │       ├──────────────────┤
+       │              │ result       │       │ id (PK)          │
+       │              │ created_at   │       │ user_id (FK)     │
+       │              └──────────────┘       │ workspace_id     │
+       │                     │               │ title            │
+       │              ┌──────────────┐       │ status           │
+       │              │  task_logs   │       │ context (JSON)   │
+       │              ├──────────────┤       │ model_config     │
+       │              │ id (PK)      │       │ created_at       │
+       │              │ task_id (FK) │       └──────────────────┘
+       │              │ level        │               │
+       │              │ step         │               │
+       │              │ message      │       ┌──────────────────┐
+       │              │ created_at   │       │    messages      │
+       │              └──────────────┘       ├──────────────────┤
+       │                                     │ id (PK)          │
+       │         ┌──────────────────┐        │ session_id (FK)  │
+       │         │  uploaded_files  │        │ role             │
+       │         ├──────────────────┤        │ content          │
+       │         │ id (PK)          │        │ message_type     │
+       └─────────│ user_id (FK)     │        │ metadata (JSON)  │
+                 │ workspace_id     │        │ token_usage      │
+                 │ session_id       │        │ created_at       │
+                 │ filename         │        └──────────────────┘
+                 │ path             │
+                 │ hash             │
+                 │ purpose          │
+                 │ created_at       │
+                 └──────────────────┘
+```
+
+### 表结构详细设计
+
+#### 1. users 表 (用户表)
+
+```sql
+CREATE TABLE users (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  username        VARCHAR(50) NOT NULL UNIQUE,
+  email           VARCHAR(100) NOT NULL UNIQUE,
+  password_hash   VARCHAR(255) NOT NULL,
+  avatar_url      VARCHAR(500) DEFAULT NULL,
+  role            ENUM('user', 'admin', 'super_admin') DEFAULT 'user',
+  status          ENUM('active', 'inactive', 'banned') DEFAULT 'active',
+  email_verified  BOOLEAN DEFAULT FALSE,
+  last_login_at   DATETIME DEFAULT NULL,
+  last_login_ip   VARCHAR(45) DEFAULT NULL,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  INDEX idx_email (email),
+  INDEX idx_username (username),
+  INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+#### 2. api_keys 表 (API Key 表)
+
+```sql
+CREATE TABLE api_keys (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id         BIGINT NOT NULL,
+  name            VARCHAR(100) NOT NULL,
+  key_hash        VARCHAR(255) NOT NULL,
+  prefix          VARCHAR(10) NOT NULL,
+  permissions     JSON DEFAULT ('["read", "generate"]'),
+  rate_limit      INT DEFAULT 100,
+  expires_at      DATETIME DEFAULT NULL,
+  last_used_at    DATETIME DEFAULT NULL,
+  last_used_ip    VARCHAR(45) DEFAULT NULL,
+  usage_count     BIGINT DEFAULT 0,
+  is_active       BOOLEAN DEFAULT TRUE,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  INDEX idx_user_id (user_id),
+  INDEX idx_prefix (prefix),
+  INDEX idx_is_active (is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+#### 3. tasks 表 (测试生成任务表)
+
+```sql
+CREATE TABLE tasks (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id         BIGINT NOT NULL,
+  api_key_id      BIGINT DEFAULT NULL,
+  task_id         VARCHAR(36) NOT NULL UNIQUE,
+  status          ENUM('pending', 'running', 'completed', 'failed', 'cancelled') DEFAULT 'pending',
+  mode            ENUM('workflow', 'autonomous') DEFAULT 'workflow',
+  source_file     VARCHAR(500) NOT NULL,
+  language        VARCHAR(20) NOT NULL,
+  requirements    TEXT DEFAULT NULL,
+  output_dir      VARCHAR(500) DEFAULT NULL,
+  result          JSON DEFAULT NULL,
+  error_message   TEXT DEFAULT NULL,
+  execution_time  INT DEFAULT NULL,
+  token_usage     JSON DEFAULT NULL,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  completed_at    DATETIME DEFAULT NULL,
+  
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE SET NULL,
+  INDEX idx_user_id (user_id),
+  INDEX idx_task_id (task_id),
+  INDEX idx_status (status),
+  INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+#### 4. task_logs 表 (任务日志表)
+
+```sql
+CREATE TABLE task_logs (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  task_id         VARCHAR(36) NOT NULL,
+  level           ENUM('info', 'warn', 'error', 'debug') DEFAULT 'info',
+  message         TEXT NOT NULL,
+  metadata        JSON DEFAULT NULL,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  
+  INDEX idx_task_id (task_id),
+  INDEX idx_level (level),
+  INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+---
+
+## 🔌 后端 API 设计
+
+### API 路由结构
+
+```
+/api/v1
+├── /auth                          # 认证接口
+│   ├── POST   /register           # 用户注册
+│   ├── POST   /login              # 用户登录
+│   ├── POST   /logout             # 用户登出
+│   ├── POST   /refresh            # 刷新 Token
+│   ├── GET    /me                 # 获取当前用户信息
+│   ├── PUT    /profile            # 更新个人资料
+│   └── PUT    /password           # 修改密码
+│
+├── /api-keys                      # API Key 管理
+│   ├── GET    /                   # 获取 API Key 列表
+│   ├── POST   /                   # 创建 API Key
+│   ├── GET    /:id                # 获取单个详情
+│   ├── PUT    /:id                # 更新 API Key
+│   ├── DELETE /:id                # 删除 API Key
+│   └── POST   /:id/regenerate     # 重新生成
+│
+├── /workspaces                    # 工作空间管理 ⭐新增
+│   ├── GET    /                   # 获取工作空间列表
+│   ├── POST   /                   # 创建工作空间
+│   ├── GET    /:id                # 获取详情
+│   ├── PUT    /:id                # 更新工作空间
+│   ├── DELETE /:id                # 删除工作空间
+│   ├── POST   /:id/validate       # 验证工作目录
+│   └── GET    /:id/files          # 浏览工作空间文件
+│
+├── /sessions                      # 会话管理 ⭐新增
+│   ├── GET    /                   # 获取会话列表
+│   ├── POST   /                   # 创建会话
+│   ├── GET    /:id                # 获取会话详情
+│   ├── PUT    /:id                # 更新会话
+│   ├── DELETE /:id                # 删除会话
+│   ├── POST   /:id/archive        # 归档会话
+│   ├── GET    /:id/messages       # 获取消息历史
+│   └── POST   /:id/messages       # 发送消息
+│
+├── /files                         # 文件上传管理 ⭐新增
+│   ├── GET    /                   # 获取文件列表
+│   ├── POST   /upload             # 上传文件
+│   ├── POST   /upload-multiple    # 批量上传
+│   ├── GET    /:id                # 获取文件详情
+│   ├── GET    /:id/content        # 获取文件内容
+│   ├── DELETE /:id                # 删除文件
+│   └── POST   /:id/analyze        # 分析文件
+│
+├── /tasks                         # 任务管理
+│   ├── GET    /                   # 获取任务列表
+│   ├── POST   /                   # 创建任务
+│   ├── GET    /:taskId            # 获取任务详情
+│   ├── GET    /:taskId/logs       # 获取任务日志
+│   ├── GET    /:taskId/stream     # 任务状态流 (SSE)
+│   ├── POST   /:taskId/cancel     # 取消任务
+│   ├── POST   /:taskId/retry      # 重试任务
+│   ├── GET    /:taskId/result     # 获取结果
+│   └── GET    /:taskId/export     # 导出结果
+│
+├── /languages                     # 语言支持
+│   ├── GET    /                   # 获取语言列表
+│   └── GET    /:id/frameworks     # 获取语言框架
+│
+└── /admin                         # 管理员接口
+    ├── /users
+    │   ├── GET    /               # 获取用户列表
+    │   ├── GET    /:id            # 获取用户详情
+    │   ├── PUT    /:id            # 更新用户
+    │   └── DELETE /:id            # 删除用户
+    └── /stats
+        ├── GET    /               # 获取系统统计
+        └── GET    /daily          # 获取每日统计
+```
+
+> 详细接口定义见 [docs/api-design.md](api-design.md)
+
+### API 接口详细定义
+
+#### 认证接口
+
+**POST /api/v1/auth/register**
+```typescript
+// 请求
+{
+  username: string;      // 3-50 字符
+  email: string;         // 有效邮箱
+  password: string;      // 8-100 字符，包含大小写和数字
+}
+
+// 响应
+{
+  code: 0;
+  data: {
+    user: User;
+    accessToken: string;
+    refreshToken: string;
+  };
+}
+```
+
+**POST /api/v1/auth/login**
+```typescript
+// 请求
+{
+  email: string;
+  password: string;
+}
+
+// 响应
+{
+  code: 0;
+  data: {
+    user: User;
+    accessToken: string;
+    refreshToken: string;
+  };
+}
+```
+
+#### API Key 接口
+
+**POST /api/v1/api-keys**
+```typescript
+// 请求
+{
+  name: string;              // API Key 名称
+  permissions?: string[];    // 权限列表，默认 ["read", "generate"]
+  rateLimit?: number;        // 每小时请求限制，默认 100
+  expiresIn?: number;        // 过期时间（天），null 表示永不过期
+}
+
+// 响应
+{
+  code: 0;
+  data: {
+    id: number;
+    name: string;
+    key: string;            // 完整的 API Key（仅此一次返回）
+    prefix: string;
+    permissions: string[];
+    expiresAt: string;
+  };
+}
+```
+
+#### 任务接口
+
+**POST /api/v1/tasks**
+```typescript
+// 请求
+{
+  sourceFile: string;        // 源文件路径或内容
+  language?: string;         // 语言，可选（自动检测）
+  mode?: 'workflow' | 'autonomous';
+  requirements?: string;     // 额外需求
+  maxAttempts?: number;      // 最大自愈次数
+}
+
+// 响应
+{
+  code: 0;
+  data: {
+    taskId: string;
+    status: 'pending';
+  };
+}
+```
+
+---
+
+## 🎨 前端页面设计
+
+### 页面结构
+
+```
+src/
+├── pages/
+│   ├── Auth/
+│   │   ├── Login.tsx           # 登录页
+│   │   └── Register.tsx        # 注册页
+│   │
+│   ├── Dashboard/
+│   │   ├── index.tsx           # 仪表盘首页
+│   │   └── Stats.tsx           # 统计卡片
+│   │
+│   ├── Chat/                   # 对话页面 ⭐新增
+│   │   ├── ChatLayout.tsx      # 对话布局（左侧列表+右侧聊天）
+│   │   ├── SessionList.tsx     # 会话列表
+│   │   ├── ChatWindow.tsx      # 聊天窗口
+│   │   ├── MessageBubble.tsx   # 消息气泡
+│   │   └── MessageInput.tsx    # 消息输入框
+│   │
+│   ├── Workspaces/             # 工作空间 ⭐新增
+│   │   ├── WorkspaceList.tsx   # 工作空间列表
+│   │   ├── WorkspaceCreate.tsx # 创建工作空间
+│   │   ├── WorkspaceDetail.tsx # 工作空间详情
+│   │   └── FileBrowser.tsx     # 文件浏览器
+│   │
+│   ├── Files/                  # 文件管理 ⭐新增
+│   │   ├── FileList.tsx        # 文件列表
+│   │   ├── FileUpload.tsx      # 文件上传组件
+│   │   └── FilePreview.tsx     # 文件预览
+│   │
+│   ├── Tasks/
+│   │   ├── TaskList.tsx        # 任务列表
+│   │   ├── TaskCreate.tsx      # 创建任务
+│   │   ├── TaskDetail.tsx      # 任务详情
+│   │   └── TaskLogs.tsx        # 任务日志
+│   │
+│   ├── ApiKeys/
+│   │   ├── ApiKeyList.tsx      # API Key 列表
+│   │   ├── ApiKeyCreate.tsx    # 创建 API Key
+│   │   └── ApiKeyDetail.tsx    # API Key 详情
+│   │
+│   ├── Profile/
+│   │   ├── index.tsx           # 个人资料
+│   │   └── Security.tsx        # 安全设置
+│   │
+│   └── Admin/
+│       ├── UserList.tsx        # 用户管理
+│       └── SystemStats.tsx     # 系统统计
+│
+├── components/
+│   ├── Layout/
+│   │   ├── MainLayout.tsx      # 主布局
+│   │   ├── Sidebar.tsx         # 侧边栏
+│   │   └── Header.tsx          # 顶部导航
+│   │
+│   ├── Chat/                   # 聊天组件 ⭐新增
+│   │   ├── MessageList.tsx     # 消息列表
+│   │   ├── CodeBlock.tsx       # 代码块渲染
+│   │   ├── MarkdownRenderer.tsx# Markdown 渲染
+│   │   └── TypingIndicator.tsx # 打字指示器
+│   │
+│   ├── FileUpload/             # 文件上传组件 ⭐新增
+│   │   ├── UploadZone.tsx      # 拖拽上传区域
+│   │   ├── FileList.tsx        # 文件列表
+│   │   └── UploadProgress.tsx  # 上传进度
+│   │
+│   └── Common/
+│       ├── CodeEditor.tsx      # 代码编辑器
+│       ├── TaskStatus.tsx      # 任务状态组件
+│       └── ApiKeyMask.tsx      # API Key 脱敏显示
+│
+├── stores/
+│   ├── authStore.ts            # 认证状态
+│   ├── sessionStore.ts         # 会话状态 ⭐新增
+│   ├── workspaceStore.ts       # 工作空间状态 ⭐新增
+│   └── taskStore.ts            # 任务状态
+│
+└── hooks/
+    ├── useAuth.ts              # 认证 Hook
+    ├── useSession.ts           # 会话 Hook ⭐新增
+    ├── useWorkspace.ts         # 工作空间 Hook ⭐新增
+    ├── useFileUpload.ts        # 文件上传 Hook ⭐新增
+    └── useSSE.ts               # SSE Hook ⭐新增
+```
+
+### 页面布局设计
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Header                                    [用户头像] [退出]  │
+├──────────┬──────────────────────────────────────────────────┤
+│          │                                                  │
+│  侧边栏   │              主内容区域                           │
+│          │                                                  │
+│ ┌──────┐ │  ┌─────────────────────────────────────────────┐ │
+│ │ 仪表盘│ │  │                                             │ │
+│ ├──────┤ │  │                                             │ │
+│ │ 任务  │ │  │           页面内容                           │ │
+│ ├──────┤ │  │                                             │ │
+│ │ API  │ │  │                                             │ │
+│ │ Keys │ │  │                                             │ │
+│ ├──────┤ │  └─────────────────────────────────────────────┘ │
+│ │ 个人  │ │                                                  │
+│ │ 设置  │ │                                                  │
+│ └──────┘ │                                                  │
+│          │                                                  │
+└──────────┴──────────────────────────────────────────────────┘
+```
+
+---
+
+## 📁 项目目录结构
+
+```
+testgenerate-agent/
+├── src/
+│   ├── server/                    # 后端服务
+│   │   ├── index.ts              # 服务器入口
+│   │   ├── app.ts                # Express 应用配置
+│   │   │
+│   │   ├── config/
+│   │   │   ├── database.ts       # 数据库配置
+│   │   │   ├── jwt.ts            # JWT 配置
+│   │   │   └── env.ts            # 环境变量
+│   │   │
+│   │   ├── middleware/
+│   │   │   ├── auth.ts           # 认证中间件
+│   │   │   ├── validator.ts      # 参数校验中间件
+│   │   │   ├── errorHandler.ts   # 错误处理中间件
+│   │   │   └── rateLimiter.ts    # 限流中间件
+│   │   │
+│   │   ├── routes/
+│   │   │   ├── auth.routes.ts    # 认证路由
+│   │   │   ├── apiKey.routes.ts  # API Key 路由
+│   │   │   ├── task.routes.ts    # 任务路由
+│   │   │   └── admin.routes.ts   # 管理员路由
+│   │   │
+│   │   ├── controllers/
+│   │   │   ├── auth.controller.ts
+│   │   │   ├── apiKey.controller.ts
+│   │   │   ├── task.controller.ts
+│   │   │   └── admin.controller.ts
+│   │   │
+│   │   ├── services/
+│   │   │   ├── auth.service.ts
+│   │   │   ├── apiKey.service.ts
+│   │   │   ├── task.service.ts
+│   │   │   └── user.service.ts
+│   │   │
+│   │   ├── models/
+│   │   │   └── prisma/
+│   │   │       └── schema.prisma # Prisma Schema
+│   │   │
+│   │   └── utils/
+│   │       ├── crypto.ts         # 加密工具
+│   │       ├── jwt.ts            # JWT 工具
+│   │       └── response.ts       # 响应格式化
+│   │
+│   ├── client/                    # 前端应用
+│   │   ├── index.html
+│   │   ├── vite.config.ts
+│   │   ├── tsconfig.json
+│   │   │
+│   │   ├── src/
+│   │   │   ├── main.tsx
+│   │   │   ├── App.tsx
+│   │   │   │
+│   │   │   ├── api/
+│   │   │   │   ├── client.ts     # Axios 实例
+│   │   │   │   ├── auth.ts       # 认证 API
+│   │   │   │   ├── apiKeys.ts    # API Key API
+│   │   │   │   └── tasks.ts      # 任务 API
+│   │   │   │
+│   │   │   ├── pages/
+│   │   │   │   └── ...
+│   │   │   │
+│   │   │   ├── components/
+│   │   │   │   └── ...
+│   │   │   │
+│   │   │   ├── stores/
+│   │   │   │   └── ...
+│   │   │   │
+│   │   │   ├── hooks/
+│   │   │   │   ├── useAuth.ts
+│   │   │   │   └── useApiKeys.ts
+│   │   │   │
+│   │   │   └── styles/
+│   │   │       └── global.css
+│   │   │
+│   │   └── public/
+│   │       └── favicon.ico
+│   │
+│   └── ... (现有代码)
+│
+├── prisma/
+│   ├── schema.prisma              # Prisma Schema 文件
+│   └── migrations/                # 数据库迁移
+│
+├── package.json                   # 后端依赖
+└── docs/
+    └── implementation-plan.md     # 本文档
+```
+
+---
+
+## 🚀 实施步骤
+
+### Phase 1: 基础设施搭建 (预计 2-3 天)
+
+#### Step 1.1: 初始化后端项目
+- [ ] 安装后端依赖 (Express, Prisma, JWT 等)
+- [ ] 配置 TypeScript (server tsconfig)
+- [ ] 配置 Express 基础框架
+- [ ] 配置环境变量 (.env)
+
+#### Step 1.2: 数据库初始化
+- [ ] 安装 MySQL 和 Prisma
+- [ ] 创建 Prisma Schema (10 张表)
+- [ ] 运行数据库迁移
+- [ ] 创建种子数据 (admin 用户)
+
+#### Step 1.3: 初始化前端项目
+- [ ] 使用 Vite 创建 React 项目
+- [ ] 安装前端依赖 (Ant Design, React Router 等)
+- [ ] 配置 Ant Design 主题
+- [ ] 配置路由和布局
+
+---
+
+### Phase 2: 用户认证系统 (预计 2-3 天)
+
+#### Step 2.1: 后端认证
+- [ ] 实现用户注册接口
+- [ ] 实现用户登录接口
+- [ ] 实现 JWT Token 生成和验证
+- [ ] 实现认证中间件
+- [ ] 实现 Token 刷新机制
+
+#### Step 2.2: 前端认证
+- [ ] 实现登录页面
+- [ ] 实现注册页面
+- [ ] 实现 Token 存储和管理
+- [ ] 实现路由守卫
+
+---
+
+### Phase 3: API Key 管理 (预计 2-3 天)
+
+#### Step 3.1: 后端 API Key
+- [ ] 实现 API Key 生成算法
+- [ ] 实现 API Key 创建接口
+- [ ] 实现 API Key 列表查询
+- [ ] 实现 API Key 删除/停用
+- [ ] 实现 API Key 验证中间件
+
+#### Step 3.2: 前端 API Key
+- [ ] 实现 API Key 列表页面
+- [ ] 实现创建 API Key 弹窗
+- [ ] 实现 API Key 脱敏显示
+- [ ] 实现复制 API Key 功能
+
+---
+
+### Phase 4: 工作空间管理 (预计 2-3 天) ⭐新增
+
+#### Step 4.1: 后端工作空间
+- [ ] 实现工作空间 CRUD 接口
+- [ ] 实现工作目录验证（路径存在性、权限检查）
+- [ ] 实现文件浏览器接口
+- [ ] 实现工作空间配置管理
+
+#### Step 4.2: 前端工作空间
+- [ ] 实现工作空间列表页面
+- [ ] 实现创建工作空间表单
+- [ ] 实现文件浏览器组件
+- [ ] 实现工作空间设置页面
+
+---
+
+### Phase 5: 文件上传管理 (预计 2-3 天) ⭐新增
+
+#### Step 5.1: 后端文件管理
+- [ ] 实现文件上传接口（单文件/批量）
+- [ ] 实现文件存储管理
+- [ ] 实现文件内容读取接口
+- [ ] 实现文件分析接口（AST 解析）
+- [ ] 实现文件过期清理机制
+
+#### Step 5.2: 前端文件管理
+- [ ] 实现拖拽上传组件
+- [ ] 实现上传进度显示
+- [ ] 实现文件列表管理
+- [ ] 实现文件预览功能
+
+---
+
+### Phase 6: 会话与对话管理 (预计 3-4 天) ⭐新增
+
+#### Step 6.1: 后端会话管理
+- [ ] 实现会话 CRUD 接口
+- [ ] 实现消息发送接口
+- [ ] 实现消息历史查询（分页）
+- [ ] 实现流式消息接口 (SSE)
+- [ ] 实现会话上下文管理
+- [ ] 实现 Token 使用统计
+
+#### Step 6.2: 前端对话界面
+- [ ] 实现会话列表（左侧栏）
+- [ ] 实现聊天窗口布局
+- [ ] 实现消息气泡组件
+- [ ] 实现 Markdown 渲染
+- [ ] 实现代码块高亮
+- [ ] 实现流式消息显示
+- [ ] 实现消息输入框（支持文件上传）
+
+---
+
+### Phase 7: 任务管理 (预计 3-4 天)
+
+#### Step 7.1: 后端任务管理
+- [ ] 实现任务创建接口
+- [ ] 实现任务状态查询
+- [ ] 实现任务列表分页
+- [ ] 实现任务取消功能
+- [ ] 实现任务结果导出
+- [ ] 集成现有测试生成工作流
+
+#### Step 7.2: 前端任务管理
+- [ ] 实现任务创建页面
+- [ ] 实现任务列表页面
+- [ ] 实现任务详情页面
+- [ ] 实现任务日志查看
+- [ ] 实现实时状态更新 (SSE)
+
+---
+
+### Phase 8: 完善和优化 (预计 2-3 天)
+
+#### Step 8.1: 功能完善
+- [ ] 实现用户个人资料页面
+- [ ] 实现密码修改功能
+- [ ] 实现管理员功能
+- [ ] 实现系统统计
+
+#### Step 8.2: 性能优化
+- [ ] 添加 Redis 缓存（可选）
+- [ ] 实现 API 限流
+- [ ] 优化数据库查询
+- [ ] 添加日志系统
+
+#### Step 8.3: 安全加固
+- [ ] 实现 CORS 配置
+- [ ] 添加 Helmet 安全头
+- [ ] 实现输入验证
+- [ ] 添加 SQL 注入防护
+
+---
+
+## 🔧 关键实现细节
+
+### 1. API Key 生成算法
+
+```typescript
+/**
+ * 生成 API Key
+ * 
+ * 格式: tg_{prefix}_{random}
+ * 示例: tg_abc123_xK9mN2pL5qR8sT1vW3yZ
+ */
+function generateApiKey(): { key: string; hash: string; prefix: string } {
+  const prefix = crypto.randomBytes(4).toString('hex');
+  const random = crypto.randomBytes(24).toString('hex');
+  const key = `tg_${prefix}_${random}`;
+  const hash = bcrypt.hashSync(key, 10);
+  
+  return { key, hash, prefix };
+}
+```
+
+### 2. JWT Token 结构
+
+```typescript
+// Access Token (有效期 2 小时)
+{
+  sub: userId,
+  email: email,
+  role: role,
+  iat: issuedAt,
+  exp: expiresAt
+}
+
+// Refresh Token (有效期 7 天)
+{
+  sub: userId,
+  type: 'refresh',
+  iat: issuedAt,
+  exp: expiresAt
+}
+```
+
+### 3. 任务状态流转
+
+```
+创建任务 → pending → running → completed
+                            → failed
+                            → cancelled
+```
+
+### 4. 错误码设计
+
+```typescript
+enum ErrorCode {
+  // 认证相关 (1xxx)
+  AUTH_INVALID_CREDENTIALS = 1001,
+  AUTH_TOKEN_EXPIRED = 1002,
+  AUTH_TOKEN_INVALID = 1003,
+  AUTH_USER_NOT_FOUND = 1004,
+  AUTH_EMAIL_EXISTS = 1005,
+  AUTH_USERNAME_EXISTS = 1006,
+  
+  // API Key 相关 (2xxx)
+  API_KEY_NOT_FOUND = 2001,
+  API_KEY_EXPIRED = 2002,
+  API_KEY_INVALID = 2003,
+  API_KEY_RATE_LIMIT = 2004,
+  
+  // 任务相关 (3xxx)
+  TASK_NOT_FOUND = 3001,
+  TASK_ALREADY_RUNNING = 3002,
+  TASK_CANCELLED = 3003,
+  
+  // 系统相关 (9xxx)
+  SYSTEM_INTERNAL_ERROR = 9001,
+  SYSTEM_DATABASE_ERROR = 9002,
+}
+```
+
+---
+
+## 📊 预计工期
+
+| 阶段 | 工作内容 | 预计时间 |
+|------|----------|----------|
+| Phase 1 | 基础设施搭建 | 2-3 天 |
+| Phase 2 | 用户认证系统 | 2-3 天 |
+| Phase 3 | API Key 管理 | 2-3 天 |
+| Phase 4 | 工作空间管理 ⭐ | 2-3 天 |
+| Phase 5 | 文件上传管理 ⭐ | 2-3 天 |
+| Phase 6 | 会话与对话管理 ⭐ | 3-4 天 |
+| Phase 7 | 任务管理 | 3-4 天 |
+| Phase 8 | 完善和优化 | 2-3 天 |
+| **总计** | | **18-24 天** |
+
+---
+
+## 🎯 下一步行动
+
+1. **确认技术栈**：Express + React + Ant Design 这个组合 OK 吗？
+2. **确认数据库**：MySQL 版本要求？（建议 8.0+）
+3. **确认部署方式**：Docker 还是直接部署？
+4. **确认 UI 风格**：Ant Design 是否合适？
+5. **确认优先级**：哪些功能先做？
+
+---
+
+## 📝 更新日志
+
+| 日期 | 版本 | 更新内容 |
+|------|------|----------|
+| 2026-06-04 | v1.0 | 初始版本 |
+| 2026-06-04 | v1.1 | 新增工作空间、会话、文件上传管理 |
+
+---
+
+*文档版本: 1.1*
+*创建时间: 2026-06-04*
+*最后更新: 2026-06-04*
+*作者: TestGenerate Agent*
