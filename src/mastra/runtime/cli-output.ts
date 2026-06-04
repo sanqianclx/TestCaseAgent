@@ -181,19 +181,22 @@ export function logDebug(message: string): void {
 }
 
 /**
- * 输出 LLM 思维链(暗灰色,带"思考:"前缀,逐字流式)
+ * 输出 LLM 思维链(暗灰色,缩进 2 空格,接收完整句子)
  *
  * 与 `logAgent` 区别:这是 LLM 的内部推理,不是给用户的最终答案。
- * 选用 DIM(暗灰)+"思考:"前缀,让用户能区分"这是 LLM 在想"和"这是 LLM 在答"。
+ * 选用 DIM(暗灰)+ 2 空格缩进,让用户能区分"这是 LLM 在想"和"这是 LLM 在答"。
  *
- * 设计原因:用户希望看到 LLM "想什么"而不只是"做什么",便于信任 LLM 的判断。
- * 关闭方式:DEBUG 开启时已经被 logDebug 接管?不对,这里是普通可见,关闭方式是注释掉。
+ * V2.7.7 改动:
+ * - 去掉 💭 emoji(用户偏好,减少视觉噪音)
+ * - 接收完整句子而非逐 token(autonomous-loop 端做聚合后整句传过来)
+ * - 句末强制 \n,避免多句连成一段"用户要求X。让我看Y。让我看Z"难读
+ * - DEBUG 控制由调用方(autonomous-loop)决定是否调用本函数
  *
- * @param delta 思维链增量(可能很短,几个 token 一组)
+ * @param sentence 完整句子(autonomous-loop 端攒到句末标点再传)
  */
-export function logReasoning(delta: string): void {
-  if (typeof delta !== "string" || delta.length === 0) return
-  process.stdout.write(paint(DIM, `💭 ${delta}`))
+export function logReasoning(sentence: string): void {
+  if (typeof sentence !== "string" || sentence.length === 0) return
+  process.stdout.write(paint(DIM, `  ${sentence}\n`))
 }
 
 // ============================================================
@@ -304,7 +307,9 @@ export function finishProgressBar(): void {
  */
 const FRAMEWORK_NOISE_KEYWORDS = [
   "Error converting tool call input to JSON",
-  "Tool input validation failed",
+  // V2.7.3 取消过滤:这个错误意味着 LLM 工具入参构造错误(必填字段缺失/类型不对)
+  // 静默掉会让 LLM 看不到反馈、用户也看不到,导致死循环(LLM 反复调同工具但入参依然错)
+  // "Tool input validation failed",
   "Tool output validation failed",
   "Tool suspension data validation failed",
 ] as const

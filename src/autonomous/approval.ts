@@ -63,14 +63,18 @@ function resolveRiskForDisplay(
 /**
  * 把工具入参格式化为可读摘要
  *
- * V2.6.1 改动：长字符串（>120 字符或含换行）改为多行缩进显示，
- * 而不是挤成单行省略号——避免 code/JSON 类内容完全不可读。
+ * V2.7.2 改动：所有内容字段全部折叠为单行
+ * - 原因:之前长 content(8000字符)会展开 600 字符到 y/n 框,糊脸;
+ *   writeFile 一次审批就喷一坨,用户看花了眼,体验很差
+ * - 策略:
+ *   - 大字段(content / message / payload)完全折叠为 `<N 字符>` 单行,不展开
+ *   - 其他长字符串(>120 或含 \n)只取前 80 字符 + 总数,不再 6 空格缩进展开
+ *   - 短字符串原样
+ *   - 数字/布尔原样
+ *   - 对象/数组 JSON 化后按上述规则
  *
- * 策略：
- * - 短字符串（≤120 且无 \n）：`key=value` 一行
- * - 长字符串或含换行：`key=` 标题一行，下面 6 空格缩进 + 内容（限前 600 字符）
- * - 数字 / 布尔：原样
- * - 对象 / 数组：JSON 序列化后，短的 200 字符，长的也按长字符串处理
+ * 用户要查看完整内容:审批后 LLM 会把结果流式显示(text-delta),
+ * 或者用户去 output/exports/agent/java2/ 目录看实际写入的文件。
  */
 function formatArgsSummary(args: Record<string, unknown>): string {
   const parts: string[] = []
@@ -93,13 +97,17 @@ function formatArgsSummary(args: Record<string, unknown>): string {
       }
     }
 
+    // V2.7.2: 大字段(content / message / payload)完全折叠为字符数,不展开
+    if (key === "content" || key === "message" || key === "payload") {
+      parts.push(`  ${key}=<${display.length} 字符>`)
+      continue
+    }
+
     const isLong = display.length > 120 || display.includes("\n")
     if (isLong) {
-      const MAX_PREVIEW = 600
-      const head = display.length > MAX_PREVIEW ? display.slice(0, MAX_PREVIEW) + "\n... [truncated]" : display
-      // 缩进展示：标题行 + 内容行（6 空格缩进，便于阅读但不过分靠右）
-      parts.push(`  ${key}:`)
-      parts.push(head.split("\n").map((line) => `      ${line}`).join("\n"))
+      // 改为前 80 字符 + 总数,不再 6 空格缩进展开
+      const head = display.slice(0, 80).replace(/\s+/g, " ").trim()
+      parts.push(`  ${key}=${head}... [共 ${display.length} 字符]`)
     } else {
       parts.push(`  ${key}=${display}`)
     }
@@ -253,17 +261,29 @@ export async function promptForApproval(
     logWarn(`⚠ 工具 ${pending.toolName} 目标越界：${pathRisk}`)
   }
 
+  // V2.7.2: 视觉分离"LLM 真实的话"与"系统自动提示"
+  //
+  // 之前:用 logAgent("Agent 准备...") 会被喷成 "Agent：Agent 准备..."
+  //      跟 LLM 自己的 text-delta("Agent：xxx") 长一样,用户分不清
+  //      以为 LLM 在解释,其实系统在冒充 LLM。
+  // 现在:用 [系统] 前缀 + logInfo(无色) 跟 LLM 的"Agent：黄色文本流"
+  //      视觉上立刻区分 —— 黄色 + Agent: = LLM 自己的话;[系统] = CLI 生成。
+  //
+  // 副作用:用户能立刻看出"LLM 调工具前有没有真的说话"
+  //      (如果 LLM 沉默,只有 [系统] 那行;如果 LLM 说话,会有 黄色 Agent: 行 + [系统] 行)
+
   // V2.6.2: 自动动作摘要(不依赖 LLM 主动说 text-delta)
   // 设计原因:LLM 经常"懒得说",直接调工具,导致用户看不到 Agent 在准备做什么。
   // 这里根据 toolName + args 自动生成一行可读的"准备做什么"摘要,
   // 放在 y/n 框之前,让用户始终有反馈。
   const intent = describeAgentIntent(pending.toolName, pending.args)
   if (intent) {
-    logAgent(`Agent 准备${intent}`)
+    // 注意:这里用 logInfo(无色)而非 logAgent(黄色),与 LLM 文本流视觉差异最大化
+    logInfo(`[系统] 准备调用 ${pending.toolName}: ${intent}`)
   }
 
   // 显示审批面板
-  logAgent(`Agent 请求调用工具：${pending.toolName}`)
+  logInfo(`[系统] 工具: ${pending.toolName}`)
   logInfo(`  参数：${formatArgsSummary(pending.args)}`)
   if (isShell && command) {
     // V2.4 双轨风险显示：LLM 自评优先；未传则降级到 assessCommandRisk 兜底

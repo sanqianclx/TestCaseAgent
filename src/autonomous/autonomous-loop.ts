@@ -36,9 +36,6 @@ import type { Agent } from "@mastra/core/agent"
  * - 长历史保护：> 80 条时只保留最近 60 + 一个 system 摘要
  * - LLM 重试：复用现有 `withLlmRetries` 包装层
  *
- * 关键优化（V2.4）：
- * - 关闭 agent 级 requireToolApproval，工具级声明（shellRun/writeFile/exportCases 自挂审批）
- * - resume 后只打印"本轮新 step"的 text，避免重复 "好的，我先读取源文件..." 这类开场白
  */
 
 const MAX_STEPS = 25
@@ -46,6 +43,13 @@ const MAX_HISTORY = 80
 const KEEP_HISTORY = 60
 const MAX_ASK_USER_PER_TURN = 3
 const SHELL_AUTONOMOUS_PROMPT_PREVIEW_CHARS = 200
+/**
+ * V2.7.3 循环保护:同一工具连续 N 次入参校验失败,强制结束本轮
+ *
+ * 场景:LLM 反复调 shellRun 但不传 command,框架每次打回 "command: Required",
+ *      LLM 收到错误依然构造空入参,陷入死循环。本机制在第 3 次同错误时强制 abort。
+ */
+const MAX_CONSECUTIVE_VALIDATION_FAILURES = 3
 
 /**
  * 模块级 wired agent 引用（带 storage 的 Mastra 实例上的 Agent）
@@ -83,12 +87,10 @@ export async function runAutonomousRepl(args: CliArgs = {}): Promise<void> {
   const rl = createDefaultReadline()
   let state: AutonomousState = { mode: "idle", lastStepCount: 0 }
 
-  logAgent("自主测试代码 Agent 已启动。直接告诉我你想做什么。")
-  logInfo("  - 工具数：9（read/write/parse/execute/coverage/export/logger/shell/ask）")
+  logAgent("测试代码 Agent 已启动,有什么我可以帮你的吗。")
   logInfo("  - 日志文件：" + logger.path)
   logInfo("  - 当前工作目录：" + process.cwd())
   logInfo("  - 输入 exit 退出")
-  logInfo("  - 只读工具（read/parse/execute/coverage/logger）自动放行；写入/导出/shell 需 y/n 审批")
 
   try {
     while (true) {
@@ -218,6 +220,12 @@ async function driveAgentTurn(ctx: {
     let lastRunId: string | null = null
     let suspendPayloadFromChunk: Record<string, unknown> | null = null
     let firstToolCallNames: string[] = []
+    // V2.7.5 reasoning 聚合缓冲:攒到句末标点再整句喷,避免逐 token 流时每个字都被 💭 围住
+    // 触发 flush 的标点:中文句号"。"、英文句号". "、问号"?"、感叹号"!"、换行"\n"
+    let reasoningBuffer = ""
+    const REASONING_FLUSH_PATTERN = /[。.!?！?\n]/
+    // V2.7.3 循环保护状态:key=toolName,value=连续失败次数
+    const consecutiveValidationFailures = new Map<string, { count: number; lastError: string }>()
     let errorChunksSeen = 0
 
     for await (const chunk of stream.fullStream) {
@@ -243,10 +251,30 @@ async function driveAgentTurn(ctx: {
           stepTextBuffer = ""
         }
       } else if (t === "reasoning-delta") {
-        // 思维链(DeepSeek 走 OpenAI 兼容协议时有,Anthropic 也有)
+        // 思维链(DeepSeek v4-flash / Anthropic 都有,OpenAI 兼容协议下逐 token 流)
+        // V2.7.6: 默认显示,聚合后整句喷(避免逐 token 流时每个字都被 💭 围住的视觉霾)
+        // - 开关:HIDE_REASONING=1 才折叠(默认显示)
+        // - 聚合:把 delta 累加到 reasoningBuffer,攒到句末标点(。/!/?. / 换行)再整句 flush
+        //        没攒够时静默(不喷)——避免半句话被截断
         const text = (pl as { text?: string }).text
         if (typeof text === "string" && text.length > 0) {
-          logReasoning(text)
+          reasoningBuffer += text
+          if (process.env.HIDE_REASONING !== "1") {
+            // 默认显示:检测是否有完整句子结束;有则 flush,无则继续攒
+            const match = reasoningBuffer.match(REASONING_FLUSH_PATTERN)
+            if (match && match.index !== undefined) {
+              const flushEnd = match.index + 1
+              const toFlush = reasoningBuffer.slice(0, flushEnd).trim()
+              reasoningBuffer = reasoningBuffer.slice(flushEnd)
+              if (toFlush.length > 0) {
+                logReasoning(toFlush)
+              }
+            }
+            // 还没攒够:不喷
+          } else {
+            // 用户主动隐藏:整段 reasoning 在 memoryStore 里,这里只 logDebug
+            logDebug(`[reasoning] ${text.slice(0, 200)}`)
+          }
         }
       } else if (t === "error") {
         // 框架内部错误:静默到 logDebug(框架会内部重试)
@@ -255,7 +283,8 @@ async function driveAgentTurn(ctx: {
         logDebug(`[llm] 流式错误（框架内部重试）：${errText}`)
         logger.warn("llm.stream.error", { scope: "autonomous.driveAgentTurn", error: errText, session_id: ctx.sessionId })
       } else if (t === "tool-call-input-streaming-start") {
-        // 工具入参开始流式
+        // 工具入参开始流式 —— 不喷提示(LLM 自己会说"接下来要 X"),
+        // 避免和 LLM 文本流重复;只留 logDebug 供 DEBUG=1 时排查
         const name = (pl as { toolName?: string }).toolName
         if (typeof name === "string") {
           logDebug(`[llm] 工具入参流式开始: ${name}`)
@@ -269,12 +298,65 @@ async function driveAgentTurn(ctx: {
       } else if (t === "tool-call") {
         // 工具调用完整(对应 createTool 工具的入参已就绪)
         const name = (pl as { toolName?: string }).toolName
-        if (typeof name === "string" && firstToolCallNames.length < 10) {
-          firstToolCallNames.push(name)
+        if (typeof name === "string") {
+          if (firstToolCallNames.length < 10) {
+            firstToolCallNames.push(name)
+          }
+          // V2.7.1 极简: 只打一行 "→ ${toolName} (N字符)"
+          // - 工具名 + 入参大小足够让用户判断"系统在跑什么"
+          // - 不喷 "框架开始执行"、不喷 "LLM 正在决策" 这类废话
+          // - 完整 args 走 logger 记录(供 DEBUG=1 / 审计用)
+          const args = (pl as { args?: unknown }).args
+          const argsLen = args !== undefined ? JSON.stringify(args).length : 0
+          logInfo(`→ ${name} (${argsLen} 字符)`)
+          logger.debug("system", {
+            scope: "autonomous.driveAgentTurn",
+            sub_kind: "tool_call_args_captured",
+            tool: name,
+            args: redactSecrets(JSON.stringify(args ?? {})).slice(0, SHELL_AUTONOMOUS_PROMPT_PREVIEW_CHARS),
+            session_id: ctx.sessionId,
+          })
         }
       } else if (t === "tool-result") {
-        // 工具执行结果 chunk
+        // 工具执行结果 chunk —— 完全静默
+        // (工具自己的 execute 已经通过 logInfo 打了 ✓/✗ 行,这里不重复)
         logDebug(`[llm] 工具结果已返回`)
+
+        // V2.7.3 循环保护:同一工具连续 N 次入参校验失败 → 强制 abort
+        // 检测方式:序列化整个 payload,grep "validation failed" / "validation_error" / "Required"
+        // 命中即累计;连续 3 次同 tool → 强制结束本轮,避免 LLM 卡死在工具调用上
+        const outputStr = JSON.stringify(pl)
+        const isValidationError =
+          outputStr.includes("validation failed") ||
+          outputStr.includes("validation_error") ||
+          (outputStr.includes("Required") && outputStr.includes("Tool input"))
+        if (isValidationError) {
+          const plForName = pl as { toolName?: string }
+          const toolName = typeof plForName.toolName === "string" ? plForName.toolName : "unknown"
+          const prev = consecutiveValidationFailures.get(toolName) ?? { count: 0, lastError: "" }
+          const next = {
+            count: prev.count + 1,
+            lastError: outputStr.slice(0, 300),
+          }
+          consecutiveValidationFailures.set(toolName, next)
+          // 完整错误直接喷给用户看(V2.7.3 已取消 framework 噪音过滤)
+          logWarn(`[系统] 工具 ${toolName} 入参校验失败 (连续 ${next.count} 次): ${next.lastError.slice(0, 200)}`)
+          if (next.count >= MAX_CONSECUTIVE_VALIDATION_FAILURES) {
+            logError(
+              `✗ LLM 在 ${toolName} 工具上反复构造错误入参(连续 ${next.count} 次),强制结束本轮,避免死循环。`
+            )
+            logError(`  最近一次错误: ${next.lastError.slice(0, 400)}`)
+            logError(`  建议:重启 session,或在 prompt 里明确该工具的必填字段`)
+            // 直接结束本 turn,不再让 LLM 继续尝试
+            currentState = { mode: "idle", lastStepCount: ctx.lastStepCount }
+            return currentState
+          }
+        } else {
+          // 正常结果:重置所有工具的失败计数(避免之前累积的计数污染后续调用)
+          if (consecutiveValidationFailures.size > 0) {
+            consecutiveValidationFailures.clear()
+          }
+        }
       } else if (t === "step-start") {
         // step 开始
       } else if (t === "start") {
@@ -288,6 +370,22 @@ async function driveAgentTurn(ctx: {
         const rid = (chunk as { runId?: string }).runId
         if (typeof rid === "string") {
           lastRunId = rid
+        }
+        // V2.7.1: 智能补空行 —— 只在"LLM 说过话 + 上一次输出不是 \n"时才补
+        // (解决"Agent 的话紧贴工具事件 / 有时换两行有时不换"的脏乱问题)
+        // 注:这里用 accText.length > 0 而不是 LLM 自己的 \n 字符判断,
+        //     避免 LLM 输出 \n\n 引发叠加换行
+        if (accText.length > 0) {
+          process.stdout.write("\n")
+        }
+        // V2.7.6: turn 结束 flush 剩余 reasoning buffer(防止半句话被吞掉)
+        // 默认显示 reasoning;HIDE_REASONING=1 才跳过
+        if (reasoningBuffer.length > 0 && process.env.HIDE_REASONING !== "1") {
+          const tail = reasoningBuffer.trim()
+          if (tail.length > 0) {
+            logReasoning(tail)
+          }
+          reasoningBuffer = ""
         }
       } else {
         // 未知 chunk:仅 debug 记录

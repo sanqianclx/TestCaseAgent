@@ -57,5 +57,5 @@ followup 模式必须输出：mode, action（answer/continue/run_command/update_
     "requirements_text": "额外需求，可选"
   }
 }`,
-  model: "deepseek/deepseek-chat",
+  model: "deepseek/deepseek-v4-flash",
 })

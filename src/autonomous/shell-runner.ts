@@ -5,6 +5,7 @@ import path from "path"
 import { assessCommandRisk, type CommandRisk } from "../mastra/runtime/command-runner.js"
 import { logger } from "../mastra/runtime/logger.js"
 import { firstToken, redactSecrets, truncateForLog } from "./safety.js"
+import { logInfo, logWarn, logError } from "../mastra/runtime/cli-output.js"
 
 /**
  * 同步 shell 命令执行器
@@ -51,7 +52,7 @@ export interface CommandSyncResult {
   risk: CommandRisk
 }
 
-const DEFAULT_TIMEOUT_MS = 30_000
+const DEFAULT_TIMEOUT_MS = 300_000  // 默认 5 分钟(Maven 编译+测试典型时长)
 const DEFAULT_MAX_BYTES = 1_000_000
 const LLM_COMBINED_LIMIT = 4_000
 
@@ -157,8 +158,8 @@ export const shellRunTool = createTool({
   inputSchema: z.object({
     command: z.string().min(1).describe("一条 shell 命令（单行），不写 shell 脚本"),
     cwd: z.string().optional().describe("工作目录；默认当前项目根目录"),
-    timeout_ms: z.number().int().min(1_000).max(180_000).default(DEFAULT_TIMEOUT_MS)
-      .describe("最长执行毫秒；默认 30000，上限 180000"),
+    timeout_ms: z.number().int().min(1_000).max(1_800_000).default(DEFAULT_TIMEOUT_MS)
+      .describe("最长执行毫秒；默认 300000(5分钟)，上限 1800000(30分钟)"),
     // V2.4 新增：LLM 调用前自评的风险，CLI 优先显示这里；未传降级到 assessCommandRisk 兜底
     risk: z.object({
       level: z.enum(["low", "medium", "high"])
@@ -182,11 +183,43 @@ export const shellRunTool = createTool({
   }),
   execute: async (inputData) => {
     const startedAt = Date.now()
+
+    // V2.7.1 极简启动提示 —— 只保留"命令 + 风险等级",砍掉 cwd/超时/cwd 路径
+    // (cwd 在 LLM 的 args 里能看到,超时由入参决定,无需重复)
+    const cmdPreview = inputData.command.length > 100
+      ? inputData.command.slice(0, 97) + "..."
+      : inputData.command
+    const timeoutMs = inputData.timeout_ms ?? DEFAULT_TIMEOUT_MS
+    const riskLevel = inputData.risk?.level ?? "(未评估)"
+    logInfo(`→ 启动: ${cmdPreview} [${riskLevel}]`)
+
     const result = runCommandSync({
       command: inputData.command,
       cwd: inputData.cwd,
-      timeoutMs: inputData.timeout_ms,
+      timeoutMs,
     })
+
+    // V2.7: 执行完的边界提示 —— 三种状态分别处理
+    const elapsed = (result.durationMs / 1000).toFixed(1)
+    if (result.timedOut) {
+      logWarn(`⏱ shell-run 超时 (${elapsed}s, 超过 ${(timeoutMs / 1000).toFixed(0)}s 上限,已 SIGTERM)`)
+    } else if (result.exitCode === 0) {
+      logInfo(`✓ shell-run 完成 (${elapsed}s, exit=0)`)
+    } else {
+      logError(`✗ shell-run 失败 (${elapsed}s, exit=${result.exitCode ?? "null"})`)
+      // V2.7.2: 把 stderr 前 200 字符也喷给用户看,让用户能立即定位失败原因
+      // (LLM 会看到完整 stderr 决策,用户看摘要就够)
+      // 优先用 stderr,没有的话用 stdout 末尾(有些工具把错误打到 stdout)
+      const errSource = result.stderr && result.stderr.trim().length > 0 ? result.stderr : result.stdout
+      if (errSource && errSource.trim().length > 0) {
+        const errPreview = errSource
+          .slice(0, 200)
+          .replace(/\s+/g, " ")
+          .trim()
+        logInfo(`  ↳ ${errPreview}${errSource.length > 200 ? "..." : ""}`)
+      }
+    }
+
     logger.info("tool.invoke", {
       scope: "autonomous.shellRun",
       tool: "shell-run",

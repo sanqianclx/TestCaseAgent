@@ -18,7 +18,7 @@ export const diagnosisAgent = new Agent({
   name: "失败诊断 Agent",
   tools: { readFile: readFileTool },
   instructions,
-  model: "deepseek/deepseek-chat",
+  model: "deepseek/deepseek-v4-flash",
 })
 
 export const diagnosisAgentPro = new Agent({
@@ -52,5 +52,5 @@ export const diagnosisDecisionAgent = new Agent({
 - BEHAVIOR_MISMATCH -> ASK_USER_CONFIRMATION
 - ENVIRONMENT_ERROR -> INSTALL_DEPENDENCY
 - UNKNOWN -> REPORT_TO_USER`,
-  model: "deepseek/deepseek-chat",
+  model: "deepseek/deepseek-v4-flash",
 })
