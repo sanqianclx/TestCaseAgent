@@ -85,7 +85,7 @@ export async function executeAgentNonInteractive(
   const addLog = (message: string) => {
     logs.push(`[${new Date().toISOString()}] ${message}`);
     onLog?.(message);
-    logger.info('agent-executor', { message });
+    logger.info('system', { scope: 'agent-executor', message });
   };
 
   try {

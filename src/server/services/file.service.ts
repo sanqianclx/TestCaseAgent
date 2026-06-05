@@ -185,7 +185,7 @@ export async function uploadFile(
   if (existingFile) {
     await fs.unlink(filePath);
     return {
-      id: existingFile.id,
+      id: Number(existingFile.id),
       filename: existingFile.filename,
       originalName: existingFile.originalName,
       mimeType: existingFile.mimeType,
@@ -225,7 +225,7 @@ export async function uploadFile(
   });
 
   return {
-    id: uploadedFile.id,
+    id: Number(uploadedFile.id),
     filename: uploadedFile.filename,
     originalName: uploadedFile.originalName,
     mimeType: uploadedFile.mimeType,

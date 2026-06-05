@@ -22,9 +22,9 @@ export const createSession = asyncHandler(async (req: Request, res: Response) =>
 
   console.log('[createSession] 完整 req.body:', JSON.stringify(req.body));
 
-  const { title, workspaceId, modelConfig, mode, outputDir } = req.body;
+  const { title, workspaceId, modelConfig, mode } = req.body;
 
-  console.log('[createSession] 解析后:', { title, workspaceId, mode, modelConfig, outputDir });
+  console.log('[createSession] 解析后:', { title, workspaceId, mode, modelConfig });
 
   // 合并 mode 到 modelConfig
   const finalMode = mode || 'autonomous';
@@ -38,7 +38,6 @@ export const createSession = asyncHandler(async (req: Request, res: Response) =>
     workspaceId,
     mode: finalMode,
     modelConfig: finalModelConfig,
-    outputDir,
   });
 
   sendSuccess(res, result, '会话创建成功', 201);

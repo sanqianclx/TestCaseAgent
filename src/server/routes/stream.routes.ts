@@ -7,8 +7,10 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth.js';
 import { streamAutonomousAgent, streamWorkflow } from '../services/stream.service.js';
+import { registerGeneratedFile } from '../services/file.service.js';
 import prisma from '../config/database.js';
 import { logger } from '../../mastra/runtime/logger.js';
+import { generateUUID } from '../utils/crypto.js';
 
 const router = Router();
 
@@ -72,22 +74,110 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
+  const resolvedMode = mode === 'workflow' ? 'workflow' : 'autonomous';
+  const createdTaskId = taskId || generateUUID();
+  const resolvedWorkspaceId = workspaceId ? Number(workspaceId) : undefined;
+  const resolvedSessionId = sessionId ? Number(sessionId) : undefined;
+  const resolvedLanguage = language || 'python';
+  const resolvedSourceFile = sourceFile || 'chat-input';
+
+  try {
+    await prisma.task.create({
+      data: {
+        userId,
+        workspaceId: resolvedWorkspaceId,
+        sessionId: resolvedSessionId,
+        taskId: createdTaskId,
+        status: 'running',
+        mode: resolvedMode as any,
+        sourceFile: resolvedSourceFile,
+        sourceContent: sourceCode || content || '',
+        language: resolvedLanguage,
+        requirements: content || '',
+        attemptCount: 0,
+        startedAt: new Date(),
+      },
+    });
+    await prisma.taskLog.create({
+      data: {
+        taskId: createdTaskId,
+        sessionId: resolvedSessionId,
+        level: 'info',
+        step: 'start',
+        message: `开始 ${resolvedMode === 'workflow' ? 'Workflow' : 'Agent'} 流式执行`,
+      },
+    });
+  } catch (e: any) {
+    logger.warn('system', { scope: 'stream/agent', event_name: 'task.create.failed', error: e?.message });
+  }
+
+  let askSent = false;
   const callbacks = {
     onProgress: (e: any) => {
       sendEvent('progress', e);
     },
-    onComplete: (e: any) => {
-      sendEvent('complete', { ...e, taskId });
+    onComplete: async (e: any) => {
+      try {
+        await prisma.task.update({
+          where: { taskId: createdTaskId },
+          data: {
+            status: 'completed',
+            result: {
+              testCode: e.testCode || '',
+              testFile: e.testFile || '',
+              previewFileId: e.previewFileId ?? null,
+              outputDir: e.outputDir,
+            },
+            executionTime: null,
+            completedAt: new Date(),
+          },
+        });
+        await prisma.taskLog.create({
+          data: {
+            taskId: createdTaskId,
+            sessionId: resolvedSessionId,
+            level: 'info',
+            step: 'complete',
+            message: '流式执行完成',
+            metadata: { previewFileId: e.previewFileId ?? null, testFile: e.testFile || '' },
+          },
+        });
+      } catch (err: any) {
+        logger.warn('system', { scope: 'stream/agent', event_name: 'task.complete.failed', error: err?.message });
+      }
+      sendEvent('complete', { ...e, taskId: createdTaskId });
       res.end();
     },
-    onError: (e: Error) => {
-      sendEvent('error', { message: e.message, taskId });
+    onError: async (e: Error) => {
+      try {
+        await prisma.task.update({
+          where: { taskId: createdTaskId },
+          data: {
+            status: 'failed',
+            errorMessage: e.message,
+            completedAt: new Date(),
+          },
+        });
+        await prisma.taskLog.create({
+          data: {
+            taskId: createdTaskId,
+            sessionId: resolvedSessionId,
+            level: 'error',
+            step: 'error',
+            message: e.message,
+          },
+        });
+      } catch (err: any) {
+        logger.warn('system', { scope: 'stream/agent', event_name: 'task.error.failed', error: err?.message });
+      }
+      sendEvent('error', { message: e.message, taskId: createdTaskId });
       res.end();
     },
     onAsk: (info: any) => {
       // Agent 调用了 ask-user 工具：发 ask 事件给前端弹窗
-      // 不 res.end() —— 弹窗会让用户回答，回答后前端发新请求继续 stream
-      sendEvent('ask', { ...info, taskId });
+      // 本次 SSE 在 stream 返回后结束；前端回答后通过 /resume 继续。
+      askSent = true;
+      sendEvent('ask', { ...info, taskId: createdTaskId });
     },
   };
 
@@ -103,8 +193,8 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
   }
 
   const streamOptions = {
-    sessionId: sessionId ? Number(sessionId) : undefined,
-    workspaceId: workspaceId ? Number(workspaceId) : undefined,
+    sessionId: resolvedSessionId,
+    workspaceId: resolvedWorkspaceId,
     outputDir,
     sourceFile,
     language,
@@ -125,6 +215,9 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
     // Agent 模式
     await streamAutonomousAgent(userId, enrichedContent, callbacks, streamOptions);
   }
+  if (askSent && !res.writableEnded) {
+    res.end();
+  }
 });
 
 /**
@@ -134,7 +227,8 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
  * Body: { runId, toolCallId, decision: 'approve' | 'decline', answer?: string }
  */
 router.post('/agent/resume', authenticate, async (req: Request, res: Response) => {
-  const { runId, toolCallId, decision, answer } = req.body || {};
+  const userId = (req as any).user.id;
+  const { runId, toolCallId, decision, answer, toolName: pendingToolName, taskId, sessionId, workspaceId, sourceFile, language } = req.body || {};
 
   if (!runId || !toolCallId) {
     res.status(400).write(`event: error\ndata: ${JSON.stringify({ message: '缺少 runId 或 toolCallId' })}\n\n`);
@@ -165,7 +259,7 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
     // 这与 CLI 的 resumeAfterAskUser / resolveApproval 一致
     try {
       const toolMsg = JSON.stringify({
-        tool: toolName,
+        tool: pendingToolName || 'tool',
         decision,
         answer: answer || '(no answer)',
       });
@@ -173,12 +267,12 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
       // memoryStore 注入只是辅助上下文
       const sessionId = `api-agent-resume-${runId}`;
       memoryStore.addMessage(sessionId, 'tool', toolMsg, {
-        toolName,
+        toolName: pendingToolName || 'tool',
         toolCallId,
         decision,
       });
     } catch (e: any) {
-      logger.warn?.('stream/agent/resume: memoryStore addMessage failed', { error: e?.message });
+      logger.warn('system', { scope: 'stream/agent/resume', event_name: 'memoryStore.addMessage.failed', error: e?.message });
     }
 
     const resumeStream =
@@ -198,6 +292,12 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
     let suspendPayloadFromChunk: any = null;
     let lastRunId: string | null = null;
     let lastFinishReason: string | null = null;
+    let progress = 30;
+    let writtenFileContent: string | null = null;
+    let writtenFilePath: string | null = null;
+    let testCode = '';
+    let testFile = '';
+    const toolCalls: Array<{ toolName: string; args: any; result: any }> = [];
     for await (const chunk of (resumeStream as any).fullStream) {
       const type = (chunk as any).type;
       const payload = (chunk as any).payload;
@@ -209,10 +309,14 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
         });
       } else if (type === 'tool-call') {
         const toolName = payload?.toolName || 'unknown';
+        const args = payload?.args || payload?.input || {};
+        toolCalls.push({ toolName, args, result: null });
+        progress = Math.min(progress + 8, 88);
         sendEvent('progress', {
           type: 'tool',
           step: toolName,
           message: `🔧 调用工具: ${toolName}`,
+          progress,
         });
       } else if (type === 'tool-call-suspended' || type === 'tool-suspended') {
         const sp = payload?.suspendPayload || payload;
@@ -220,10 +324,37 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
           suspendPayloadFromChunk = sp;
         }
       } else if (type === 'tool-result') {
+        const lastCall = toolCalls[toolCalls.length - 1];
+        const result = payload?.result ?? payload?.output ?? null;
+        if (lastCall && lastCall.result === null) {
+          lastCall.result = result;
+        }
+        if (lastCall && (lastCall.toolName === 'writeFile' || lastCall.toolName === 'write-file')) {
+          const r: any = result;
+          if (r && typeof r === 'object') {
+            if (typeof r.path === 'string') writtenFilePath = r.path;
+            if (typeof r.filePath === 'string') writtenFilePath = r.filePath;
+            if (typeof r.file_path === 'string') writtenFilePath = r.file_path;
+            if (typeof r.content === 'string') writtenFileContent = r.content;
+          }
+          if (!writtenFileContent && typeof lastCall.args?.content === 'string') {
+            writtenFileContent = lastCall.args.content;
+          }
+          if (!writtenFilePath) {
+            writtenFilePath =
+              typeof lastCall.args?.path === 'string'
+                ? lastCall.args.path
+                : typeof lastCall.args?.filePath === 'string'
+                ? lastCall.args.filePath
+                : null;
+          }
+        }
+        progress = Math.min(progress + 4, 92);
         sendEvent('progress', {
           type: 'tool-result',
           step: 'tool',
           message: '✅ 工具执行完成',
+          progress,
         });
       } else if (type === 'finish') {
         const finishPayload = payload || chunk;
@@ -246,7 +377,7 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
     try {
       fullOutput = await (resumeStream as any).getFullOutput?.();
     } catch (e: any) {
-      logger.warn?.('stream/agent/resume: getFullOutput failed', { error: e?.message });
+      logger.warn('system', { scope: 'stream/agent/resume', event_name: 'getFullOutput.failed', error: e?.message });
     }
 
     const finalFinishReason = (fullOutput?.finishReason as string | undefined) ?? lastFinishReason ?? '';
@@ -282,14 +413,82 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
         }
 
         sendEvent('ask', { question, runId, toolCallId, toolName, args });
-        // 不 res.end() —— 等待用户再次审批
+        res.end();
         return;
       }
     }
 
-    sendEvent('complete', { success: true });
+    if (writtenFileContent) {
+      testCode = writtenFileContent;
+      testFile = writtenFilePath ? writtenFilePath.split(/[\\/]/).pop() || writtenFilePath : '';
+    }
+
+    let previewFileId: number | null = null;
+    if (testCode) {
+      try {
+        const lang = language || 'python';
+        const ext = lang === 'python' ? 'py' : lang === 'java' ? 'java' : lang === 'cpp' ? 'cpp' : 'txt';
+        const reg = await registerGeneratedFile({
+          userId,
+          sessionId: sessionId ? Number(sessionId) : undefined,
+          workspaceId: workspaceId ? Number(workspaceId) : undefined,
+          filename: testFile || `test_output_${Date.now()}.${ext}`,
+          content: testCode,
+          purpose: 'test_output',
+          metadata: { language: lang, sourceFile, kind: 'unit_test', resumedFrom: runId },
+        });
+        previewFileId = reg.id;
+      } catch (e: any) {
+        logger.warn('system', { scope: 'stream/agent/resume', event_name: 'registerGeneratedFile.failed', error: e?.message });
+      }
+    }
+
+    if (taskId) {
+      try {
+        await prisma.task.update({
+          where: { taskId },
+          data: {
+            status: 'completed',
+            result: {
+              testCode,
+              testFile,
+              previewFileId,
+            },
+            completedAt: new Date(),
+          },
+        });
+        await prisma.taskLog.create({
+          data: {
+            taskId,
+            sessionId: sessionId ? Number(sessionId) : undefined,
+            level: 'info',
+            step: 'complete',
+            message: '审批后继续执行完成',
+            metadata: { previewFileId, testFile },
+          },
+        });
+      } catch (e: any) {
+        logger.warn('system', { scope: 'stream/agent/resume', event_name: 'task.complete.failed', error: e?.message });
+      }
+    }
+
+    sendEvent('complete', { success: true, testCode, testFile, previewFileId, taskId });
     res.end();
   } catch (err: any) {
+    if (taskId) {
+      try {
+        await prisma.task.update({
+          where: { taskId },
+          data: {
+            status: 'failed',
+            errorMessage: err?.message || 'resume 失败',
+            completedAt: new Date(),
+          },
+        });
+      } catch {
+        // ignore task update failure while reporting the original stream error
+      }
+    }
     sendEvent('error', { message: err?.message || 'resume 失败' });
     res.end();
   }

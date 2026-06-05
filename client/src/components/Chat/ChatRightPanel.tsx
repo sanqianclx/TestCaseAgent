@@ -44,6 +44,8 @@ export interface ToolEvent {
   runId?: string;
   /** 工具调用 ID */
   toolCallId?: string;
+  /** 关联任务 ID */
+  taskId?: string;
   /** 审批状态 */
   status?: ToolEventStatus;
   /** 用户填写的附加说明 */

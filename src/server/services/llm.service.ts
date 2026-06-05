@@ -81,10 +81,13 @@ async function addTaskLog(
   step?: string,
   metadata?: Record<string, any>
 ) {
+  const normalizedLevel = ['info', 'warn', 'error', 'debug', 'step'].includes(level.toLowerCase())
+    ? level.toLowerCase()
+    : 'info';
   await prisma.taskLog.create({
     data: {
       taskId,
-      level: level.toLowerCase(),
+      level: normalizedLevel as any,
       step,
       message,
       metadata: metadata ? JSON.stringify(metadata) : undefined,

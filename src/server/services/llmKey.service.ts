@@ -118,7 +118,7 @@ export async function createApiKey(
   });
 
   return {
-    id: record.id,
+    id: Number(record.id),
     name: record.name,
     prefix,
     preview,

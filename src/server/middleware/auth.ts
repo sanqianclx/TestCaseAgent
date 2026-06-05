@@ -166,12 +166,12 @@ export async function authenticateApiKey(
     });
 
     req.user = {
-      id: apiKeyRecord.user.id,
+      id: Number(apiKeyRecord.user.id),
       email: apiKeyRecord.user.email,
       role: apiKeyRecord.user.role,
       username: apiKeyRecord.user.username,
     };
-    req.apiKeyId = apiKeyRecord.id;
+    req.apiKeyId = Number(apiKeyRecord.id);
 
     next();
   } catch (error) {

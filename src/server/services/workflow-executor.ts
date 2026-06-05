@@ -75,7 +75,7 @@ export async function executeWorkflow(
     const logEntry = `[${new Date().toISOString()}] ${step ? `[${step}] ` : ''}${message}`;
     logs.push(logEntry);
     onLog?.(message);
-    logger.info('workflow-executor', { message, step });
+    logger.info('system', { scope: 'workflow-executor', message, step });
   };
 
   try {
@@ -106,7 +106,7 @@ export async function executeWorkflow(
     addLog('调用 generateTestWorkflow...', 'start');
     onStep?.('start', 5);
 
-    const result = await generateTestWorkflow.execute(workflowInput) as any;
+    const result = await (generateTestWorkflow as any).execute(workflowInput) as any;
 
     addLog('工作流执行完成', 'complete');
     onStep?.('complete', 100);
@@ -125,7 +125,7 @@ export async function executeWorkflow(
   } catch (error: any) {
     const executionTime = Date.now() - startTime;
     addLog(`Workflow 执行失败: ${error.message}`, 'error');
-    logger.error('workflow-executor', { error: error.message, stack: error.stack });
+    logger.error('system', { scope: 'workflow-executor', error: error.message, stack: error.stack });
 
     return {
       success: false,

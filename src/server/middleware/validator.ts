@@ -243,7 +243,6 @@ export const createSessionSchema = z.object({
   title: z.string().max(200).optional().default('新会话'),
   workspaceId: z.number().int().positive().optional(),
   mode: z.enum(['workflow', 'autonomous']).optional().default('autonomous'),
-  outputDir: z.string().max(500).optional(),
   modelConfig: z.object({
     provider: z.string().optional(),
     model: z.string().optional(),

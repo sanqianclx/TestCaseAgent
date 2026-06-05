@@ -25,8 +25,8 @@ export interface StreamCallbacks {
     taskId?: string;
     previewFileId?: number | null;
     outputDir?: string;
-  }) => void;
-  onError: (error: Error) => void;
+  }) => void | Promise<void>;
+  onError: (error: Error) => void | Promise<void>;
   /**
    * Agent 调用了 ask-user 工具，需要用户输入。
    * 调用方应该弹出对话框收集用户输入后，把答案作为新消息重发。
@@ -56,7 +56,7 @@ export async function streamAutonomousAgent(
     // 1. 检查 API Key
     const apiKey = await getActiveApiKey(userId);
     if (!apiKey) {
-      callbacks.onError(new Error('未配置 DeepSeek API Key，请先在 LLM 设置中添加'));
+      await callbacks.onError(new Error('未配置 DeepSeek API Key，请先在 LLM 设置中添加'));
       return;
     }
 
@@ -73,8 +73,8 @@ export async function streamAutonomousAgent(
     // 2. 获取 Agent
     const { agent } = getWiredAutonomousAgent();
 
-    // 3. 创建会话
-    const sessionId = `api-agent-${Date.now()}`;
+    // 3. 使用稳定会话 ID，避免 Web 端每轮追问都丢失上下文。
+    const sessionId = options.sessionId ? `api-agent-session-${options.sessionId}` : `api-agent-${Date.now()}`;
     memoryStore.getOrCreate(sessionId);
     memoryStore.addMessage(sessionId, 'system', 'API Agent session started');
 
@@ -88,9 +88,15 @@ export async function streamAutonomousAgent(
     // 4. 记录用户消息
     memoryStore.addMessage(sessionId, 'user', input);
 
-    // 5. 构建消息
+    // 5. 构建消息：把最近会话记忆交还给 Agent，避免反复读取/解析已处理文件。
+    const memorySummary = memoryStore.summarize(sessionId, 10);
     const messages = [
-      { role: 'user', content: input },
+      {
+        role: 'user',
+        content: memorySummary
+          ? `以下是本 Web 会话的近期上下文。若源文件内容和附件未变化，不要重复读取或解析已经完成过的内容，直接基于已有结论继续。\n\n${memorySummary}\n\n当前用户消息：\n${input}`
+          : input,
+      },
     ];
 
     callbacks.onProgress({
@@ -216,7 +222,7 @@ export async function streamAutonomousAgent(
         const args = payload?.args || payload?.input || {};
         toolCalls.push({ toolName, args, result: null });
         // 服务端日志：方便排查为什么没触发 ask
-        logger.info('streamAutonomousAgent', { event: 'tool-call', toolName, argsKeys: Object.keys(args) });
+        logger.info('system', { scope: 'streamAutonomousAgent', event_name: 'tool-call', toolName, argsKeys: Object.keys(args) });
         callbacks.onProgress({
           type: 'tool',
           step: toolName,
@@ -228,8 +234,9 @@ export async function streamAutonomousAgent(
         const sp = (payload as any)?.suspendPayload || payload;
         if (sp && typeof sp === 'object') {
           suspendPayloadFromChunk = sp;
-          logger.info('streamAutonomousAgent', {
-            event: 'tool-call-suspended',
+          logger.info('system', {
+            scope: 'streamAutonomousAgent',
+            event_name: 'tool-call-suspended',
             toolName: (sp as any).toolName,
             toolCallId: (sp as any).toolCallId,
             runId: (sp as any).runId,
@@ -247,6 +254,9 @@ export async function streamAutonomousAgent(
 
         // 检测 ask-user 工具被调用：兜底发 ask 事件（如果 LLM 没输出 <<ASK_USER:..>> 标记）
         // 实际前端弹窗主要由文本标记 <<ASK_USER:...>> 触发
+        const lastCall = toolCalls[toolCalls.length - 1];
+        const toolName = lastCall?.toolName || '';
+        const args = lastCall?.args || {};
         if (
           callbacks.onAsk &&
           (toolName === 'askUser' || toolName === 'ask-user' || toolName === 'ask_user')
@@ -284,7 +294,19 @@ export async function streamAutonomousAgent(
           if (r && typeof r === 'object') {
             if (typeof r.path === 'string') writtenFilePath = r.path;
             if (typeof r.filePath === 'string') writtenFilePath = r.filePath;
+            if (typeof r.file_path === 'string') writtenFilePath = r.file_path;
             if (typeof r.content === 'string') writtenFileContent = r.content;
+          }
+          if (!writtenFileContent && typeof lastCall.args?.content === 'string') {
+            writtenFileContent = lastCall.args.content;
+          }
+          if (!writtenFilePath) {
+            writtenFilePath =
+              typeof lastCall.args?.path === 'string'
+                ? lastCall.args.path
+                : typeof lastCall.args?.filePath === 'string'
+                ? lastCall.args.filePath
+                : null;
           }
         }
 
@@ -304,7 +326,7 @@ export async function streamAutonomousAgent(
     try {
       fullOutput = await (stream as any).getFullOutput?.();
     } catch (e: any) {
-      logger.warn('streamAutonomousAgent: getFullOutput failed', { error: e?.message });
+      logger.warn('system', { scope: 'streamAutonomousAgent', event_name: 'getFullOutput.failed', error: e?.message });
     }
 
     const finalFinishReason = (fullOutput?.finishReason as string | undefined) ?? lastFinishReason ?? '';
@@ -350,7 +372,7 @@ export async function streamAutonomousAgent(
           toolName,
           args,
         });
-        logger.info('streamAutonomousAgent: ask', { toolName, toolCallId, runId });
+        logger.info('system', { scope: 'streamAutonomousAgent', event_name: 'ask', toolName, toolCallId, runId });
         // 不 res.end()，让前端 keep-alive
         // 走 early return 跳过 onComplete
         callbacks.onProgress({
@@ -415,7 +437,7 @@ export async function streamAutonomousAgent(
         });
         previewFileId = reg.id;
       } catch (regErr: any) {
-        logger.warn('streamAutonomousAgent: register generated file failed', { error: regErr.message });
+        logger.warn('system', { scope: 'streamAutonomousAgent', event_name: 'registerGeneratedFile.failed', error: regErr.message });
       }
     }
 
@@ -426,15 +448,19 @@ export async function streamAutonomousAgent(
       progress: 100,
     });
 
-    callbacks.onComplete({
+    await callbacks.onComplete({
       success: true,
       testCode,
       testFile,
+      previewFileId,
     });
+    if (fullText.trim()) {
+      memoryStore.addMessage(sessionId, 'agent', fullText.trim(), { previewFileId, testFile });
+    }
 
   } catch (error: any) {
-    logger.error('streamAutonomousAgent', { error: error.message, stack: error.stack });
-    callbacks.onError(error);
+    logger.error('system', { scope: 'streamAutonomousAgent', error: error.message, stack: error.stack });
+    await callbacks.onError(error);
   }
 }
 
@@ -456,7 +482,7 @@ export async function streamWorkflow(
     // 1. 检查 API Key
     const apiKey = await getActiveApiKey(userId);
     if (!apiKey) {
-      callbacks.onError(new Error('未配置 DeepSeek API Key'));
+      await callbacks.onError(new Error('未配置 DeepSeek API Key'));
       return;
     }
 
@@ -513,12 +539,12 @@ export async function streamWorkflow(
     let testFile = '';
 
     try {
-      const result: any = await generateTestWorkflow.execute(workflowInput);
+      const result: any = await (generateTestWorkflow as any).execute(workflowInput);
       testCode = result.testCode || result.test_code || '';
       testFile = result.testFile || result.test_file || 'test_output.py';
     } catch (wfError: any) {
       // 如果工作流失败，生成简单的占位测试
-      logger.warn('Workflow 执行失败，使用占位输出', { error: wfError.message });
+      logger.warn('system', { scope: 'streamWorkflow', event_name: 'workflow.failed_fallback', error: wfError.message });
       testCode = `# 测试代码生成占位\n# Workflow 执行失败: ${wfError.message}\n`;
       testFile = 'test_placeholder.py';
 
@@ -553,7 +579,7 @@ export async function streamWorkflow(
         });
         previewFileId = reg.id;
       } catch (regErr: any) {
-        logger.warn('streamWorkflow: register generated file failed', { error: regErr.message });
+        logger.warn('system', { scope: 'streamWorkflow', event_name: 'registerGeneratedFile.failed', error: regErr.message });
       }
     }
 
@@ -564,7 +590,7 @@ export async function streamWorkflow(
       progress: 100,
     });
 
-    callbacks.onComplete({
+    await callbacks.onComplete({
       success: true,
       testCode,
       testFile,
@@ -573,7 +599,7 @@ export async function streamWorkflow(
     });
 
   } catch (error: any) {
-    logger.error('streamWorkflow', { error: error.message });
-    callbacks.onError(error);
+    logger.error('system', { scope: 'streamWorkflow', error: error.message });
+    await callbacks.onError(error);
   }
 }

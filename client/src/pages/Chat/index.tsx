@@ -31,7 +31,6 @@ import {
   message,
   Collapse,
   Upload,
-  Tooltip,
 } from 'antd';
 import {
   SendOutlined,
@@ -45,7 +44,6 @@ import {
   MessageOutlined,
   PaperClipOutlined,
   InboxOutlined,
-  FolderOpenOutlined,
   FileTextOutlined,
 } from '@ant-design/icons';
 import { useLocation, useNavigate } from 'react-router-dom';
@@ -55,7 +53,6 @@ import MarkdownMessage from '../../components/Common/MarkdownMessage';
 import ChatRightPanel, {
   type ToolEvent,
 } from '../../components/Chat/ChatRightPanel';
-import DirectoryBrowser from '../Workspaces/DirectoryBrowser';
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -77,6 +74,7 @@ interface Session {
   messageCount: number;
   createdAt: string;
   lastMessageAt: string | null;
+  workspace?: { id: number; name: string } | null;
 }
 
 interface AttachedFile {
@@ -98,8 +96,9 @@ const Chat: React.FC = () => {
   const [inputValue, setInputValue] = useState('');
   const [taskMode, setTaskMode] = useState<'workflow' | 'autonomous'>('autonomous');
   const [selectedFile, setSelectedFile] = useState<any>(null);
+  const [currentWorkspaceId, setCurrentWorkspaceId] = useState<number | null>(null);
 
-  // === 附件 / 输出目录 / 工具调用 / 预览 都按 sessionId 持久化（在下方） ===
+  // === 附件 / 工具调用 / 预览 都按 sessionId 持久化（在下方） ===
   const [uploading, setUploading] = useState(false);
 
   // === 会话管理 ===
@@ -157,18 +156,6 @@ const Chat: React.FC = () => {
       return {};
     }
   });
-  // 当前会话的输出目录
-  const [outputDirBySession, setOutputDirBySession] = useState<
-    Record<number, string>
-  >(() => {
-    try {
-      const raw = localStorage.getItem('chat:right:all-outputdirs');
-      return raw ? JSON.parse(raw) : {};
-    } catch {
-      return {};
-    }
-  });
-
   // 派生当前会话的数据
   const toolEvents = currentSessionId != null ? toolEventsBySession[currentSessionId] || [] : [];
   const currentPreview = currentSessionId != null ? previewBySession[currentSessionId] : undefined;
@@ -176,7 +163,6 @@ const Chat: React.FC = () => {
   const previewLanguage = currentPreview?.previewLanguage ?? 'python';
   const activeTaskId = currentPreview?.activeTaskId ?? null;
   const attachments = currentSessionId != null ? attachmentsBySession[currentSessionId] || [] : [];
-  const outputDir = currentSessionId != null ? outputDirBySession[currentSessionId] || '' : '';
 
   // 包装 setXxxBySession：把单会话更新写到对应 map
   const setToolEvents = useCallback(
@@ -229,16 +215,6 @@ const Chat: React.FC = () => {
     },
     [currentSessionId]
   );
-  const setOutputDir = useCallback(
-    (v: string) => {
-      setOutputDirBySession((prev) => {
-        if (currentSessionId == null) return prev;
-        return { ...prev, [currentSessionId]: v };
-      });
-    },
-    [currentSessionId]
-  );
-
   // 写回 localStorage（任何 map 变化都同步）
   useEffect(() => {
     try { localStorage.setItem('chat:right:all-tools', JSON.stringify(toolEventsBySession)); } catch { /* ignore */ }
@@ -249,9 +225,6 @@ const Chat: React.FC = () => {
   useEffect(() => {
     try { localStorage.setItem('chat:right:all-attachments', JSON.stringify(attachmentsBySession)); } catch { /* ignore */ }
   }, [attachmentsBySession]);
-  useEffect(() => {
-    try { localStorage.setItem('chat:right:all-outputdirs', JSON.stringify(outputDirBySession)); } catch { /* ignore */ }
-  }, [outputDirBySession]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -270,10 +243,11 @@ const Chat: React.FC = () => {
    */
   useEffect(() => {
     if (location.state) {
-      const state = location.state as { selectedFile?: any; sessionId?: number };
+      const state = location.state as { selectedFile?: any; sessionId?: number; workspaceId?: number };
       if (state.selectedFile) {
         setSelectedFile(state.selectedFile);
         setInputValue(`请为文件 ${state.selectedFile.name} 生成单元测试`);
+        setCurrentWorkspaceId(state.workspaceId ? Number(state.workspaceId) : null);
         window.history.replaceState({}, document.title);
       }
       // 从任务页跳转过来：自动选中会话
@@ -322,14 +296,15 @@ const Chat: React.FC = () => {
       return;
     }
     try {
-      const res = await apiClient.post('/sessions', {
-        title: newSessionTitle.trim(),
-        mode: taskMode,
-        outputDir: outputDir || undefined,
-      });
+        const res = await apiClient.post('/sessions', {
+          title: newSessionTitle.trim(),
+          mode: taskMode,
+          workspaceId: currentWorkspaceId ?? undefined,
+        });
       if (res.data.code === 0) {
         const newSession = res.data.data;
         setCurrentSessionId(Number(newSession.id));
+        setCurrentWorkspaceId(newSession.workspace?.id ? Number(newSession.workspace.id) : currentWorkspaceId);
         setStreamMessages([]);
         setToolEvents([]);
         setPreviewFileId(null);
@@ -353,6 +328,11 @@ const Chat: React.FC = () => {
     setCurrentSessionId(sessionId);
     setError(null);
     try {
+      const detailRes = await apiClient.get(`/sessions/${sessionId}`);
+      if (detailRes.data.code === 0) {
+        const wsId = detailRes.data.data.workspace?.id;
+        setCurrentWorkspaceId(wsId ? Number(wsId) : null);
+      }
       const res = await apiClient.get(`/sessions/${sessionId}/messages`);
       if (res.data.code === 0) {
         const msgs = res.data.data.items.map((m: any) => ({
@@ -380,6 +360,7 @@ const Chat: React.FC = () => {
       message.success('已删除');
       if (currentSessionId === sessionId) {
         setCurrentSessionId(null);
+        setCurrentWorkspaceId(null);
         setStreamMessages([]);
         setToolEvents([]);
         setPreviewFileId(null);
@@ -403,6 +384,7 @@ const Chat: React.FC = () => {
       try {
         const res = await filesApi.uploadFile(file, {
           sessionId: currentSessionId ?? undefined,
+          workspaceId: currentWorkspaceId ?? undefined,
           purpose: 'source',
         });
         // 转换 FileInfo → AttachedFile
@@ -421,7 +403,7 @@ const Chat: React.FC = () => {
         setUploading(false);
       }
     },
-    [currentSessionId, isStreaming]
+    [currentSessionId, currentWorkspaceId, isStreaming]
   );
 
   /**
@@ -466,11 +448,12 @@ const Chat: React.FC = () => {
         const res = await apiClient.post('/sessions', {
           title,
           mode: taskMode,
-          outputDir: outputDir || undefined,
+          workspaceId: currentWorkspaceId ?? undefined,
         });
         if (res.data.code === 0) {
           sessionId = Number(res.data.data.id);
           setCurrentSessionId(sessionId);
+          setCurrentWorkspaceId(res.data.data.workspace?.id ? Number(res.data.data.workspace.id) : currentWorkspaceId);
         } else {
           message.error('创建会话失败');
           return;
@@ -516,7 +499,7 @@ const Chat: React.FC = () => {
         content,
         mode: taskMode,
         sessionId,
-        outputDir: outputDir || undefined,
+        workspaceId: currentWorkspaceId ?? undefined,
         fileIds: attachments.map((a) => a.id),
       };
 
@@ -547,7 +530,7 @@ const Chat: React.FC = () => {
       await consumeStream(response, assistantId, sessionId);
 
       setSelectedFile(null);
-      // 不清空 attachments 和 outputDir，方便继续追问
+      // 不清空 attachments，方便继续追问
       loadSessions();
     } catch (err: any) {
       console.error('流式请求失败:', err);
@@ -647,8 +630,17 @@ const Chat: React.FC = () => {
         body: JSON.stringify({
           runId: event.runId,
           toolCallId: event.toolCallId,
+          toolName: event.toolName,
           decision,
           answer: answer || '',
+          taskId: event.taskId,
+          sessionId: currentSessionId,
+          workspaceId: currentWorkspaceId ?? undefined,
+          sourceFile: selectedFile?.name || attachments[0]?.originalName,
+          language:
+            selectedFile?.language ||
+            attachments[0]?.language ||
+            (selectedFile?.name?.endsWith('.py') || attachments[0]?.originalName?.endsWith('.py') ? 'python' : undefined),
         }),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -708,11 +700,17 @@ const Chat: React.FC = () => {
             args: ev.args,
             runId: ev.runId,
             toolCallId: ev.toolCallId,
+            taskId: ev.taskId,
             status: 'pending',
           };
+          if (ev.taskId) setActiveTaskId(ev.taskId);
           setToolEvents((prev) => [...prev, pendingTool]);
+          setStreamMessages((prev) =>
+            prev.map((m) => (m.id === assistantId ? { ...m, isStreaming: false } : m))
+          );
           setIsStreaming(false);
           setCurrentStep('⏸️ 等待你在右侧面板批准/拒绝...');
+          setProgress((prev) => Math.max(prev, 60));
         } else if (eventType === 'complete') {
           if (ev.taskId) setActiveTaskId(ev.taskId);
           if (ev.previewFileId) setPreviewFileId(ev.previewFileId);
@@ -724,15 +722,16 @@ const Chat: React.FC = () => {
             setStreamMessages((prev) => prev.map((m) => m.id === assistantId ? { ...m, isStreaming: false } : m));
           }
           setCurrentStep('✅ 完成');
+          setProgress(100);
           if (fullAssistantText) saveMessageToServer(sessionId, 'assistant', fullAssistantText);
         } else if (eventType === 'error') {
           setError(ev.message);
           setStreamMessages((prev) => prev.map((m) => m.id === assistantId ? { ...m, content: m.content + `\n\n❌ 错误: ${ev.message}`, isStreaming: false } : m));
+          setCurrentStep('执行出错');
         }
       }
     }
     setIsStreaming(false);
-    setProgress(0);
     loadSessions();
   };
 
@@ -981,13 +980,6 @@ const Chat: React.FC = () => {
                 </Tag>
               ))}
             </Space>
-            {outputDir && (
-              <Tooltip title="当前输出目录">
-                <Tag color="gold" icon={<FolderOpenOutlined />}>
-                  {outputDir.length > 30 ? outputDir.slice(0, 28) + '...' : outputDir}
-                </Tag>
-              </Tooltip>
-            )}
           </div>
 
           {/* 进度条 */}
@@ -1048,7 +1040,7 @@ const Chat: React.FC = () => {
                   {currentSessionId ? '该会话暂无消息' : '选择左侧会话或新建会话'}
                 </Text>
                 <Text type="secondary" style={{ marginTop: 8, fontSize: 12 }}>
-                  支持拖拽文件、点击 📎 上传，或在下方选择输出目录
+                  支持拖拽文件、点击上传，或直接粘贴文件
                 </Text>
               </div>
             ) : (
@@ -1151,18 +1143,6 @@ const Chat: React.FC = () => {
                       children: (
                         <div style={{ padding: '4px 0', minWidth: 480 }}>
                           <Space direction="vertical" size="small" style={{ width: '100%' }}>
-                            <div>
-                              <Text
-                                type="secondary"
-                                style={{ fontSize: 12, display: 'block', marginBottom: 4 }}
-                              >
-                                <FolderOpenOutlined /> 测试代码输出目录
-                              </Text>
-                              <DirectoryBrowser
-                                value={outputDir}
-                                onChange={(v) => setOutputDir(v || '')}
-                              />
-                            </div>
                             {attachments.length > 0 && (
                               <div>
                                 <Text

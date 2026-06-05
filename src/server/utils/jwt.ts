@@ -45,7 +45,7 @@ export function generateAccessToken(payload: Omit<JwtPayload, 'type'>): string {
   return jwt.sign(
     { ...payload, type: 'access' },
     env.jwt.secret,
-    { expiresIn: env.jwt.expiresIn }
+    { expiresIn: env.jwt.expiresIn } as jwt.SignOptions
   );
 }
 
@@ -59,7 +59,7 @@ export function generateRefreshToken(payload: Omit<JwtPayload, 'type'>): string 
   return jwt.sign(
     { ...payload, type: 'refresh' },
     env.jwt.secret,
-    { expiresIn: env.jwt.refreshExpiresIn }
+    { expiresIn: env.jwt.refreshExpiresIn } as jwt.SignOptions
   );
 }
 
@@ -88,7 +88,7 @@ export function verifyToken(
   expectedType: 'access' | 'refresh' = 'access'
 ): TokenVerificationResult {
   try {
-    const payload = jwt.verify(token, env.jwt.secret) as JwtPayload;
+    const payload = jwt.verify(token, env.jwt.secret) as unknown as JwtPayload;
 
     // 验证 Token 类型
     if (payload.type !== expectedType) {
@@ -132,7 +132,7 @@ export function verifyToken(
  */
 export function decodeToken(token: string): JwtPayload | null {
   try {
-    return jwt.decode(token) as JwtPayload;
+    return jwt.decode(token) as unknown as JwtPayload;
   } catch {
     return null;
   }

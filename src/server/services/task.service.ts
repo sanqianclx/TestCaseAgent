@@ -117,7 +117,7 @@ export async function createTask(userId: number, params: CreateTaskParams) {
       sessionId,
       taskId,
       status: 'pending',
-      mode: mode.toUpperCase() as any,
+      mode: mode.toLowerCase() as any,
       sourceFile: resolvedSourceFile,
       sourceContent: resolvedSourceContent,
       language: resolvedLanguage,
@@ -190,9 +190,17 @@ export async function getTasks(userId: number, params: TaskQueryParams) {
         executionTime: true,
         tokenUsage: true,
         attemptCount: true,
+        outputDir: true,
+        result: true,
         createdAt: true,
         startedAt: true,
         completedAt: true,
+        session: {
+          select: {
+            id: true,
+            title: true,
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
       skip,
@@ -206,6 +214,7 @@ export async function getTasks(userId: number, params: TaskQueryParams) {
       ...item,
       id: Number(item.id),
       executionTime: item.executionTime ? Number(item.executionTime) : null,
+      session: item.session ? { id: Number(item.session.id), title: item.session.title } : null,
     })),
     total,
     page,
@@ -355,7 +364,7 @@ export async function cancelTask(userId: number, taskId: string): Promise<void> 
   await prisma.taskLog.create({
     data: {
       taskId,
-      level: 'INFO',
+      level: 'info',
       message: '任务已取消',
     },
   });

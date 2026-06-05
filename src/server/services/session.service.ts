@@ -16,7 +16,6 @@ export interface CreateSessionParams {
   workspaceId?: number;
   mode?: 'workflow' | 'autonomous';
   modelConfig?: Record<string, any>;
-  outputDir?: string;
 }
 
 /**
@@ -47,7 +46,7 @@ export interface SendMessageParams {
  * @returns 创建的会话
  */
 export async function createSession(userId: number, params: CreateSessionParams) {
-  const { title = '新会话', workspaceId, mode = 'autonomous', modelConfig, outputDir } = params;
+  const { title = '新会话', workspaceId, mode = 'autonomous', modelConfig } = params;
 
   // 如果指定了工作空间，检查是否存在
   if (workspaceId) {
@@ -59,9 +58,6 @@ export async function createSession(userId: number, params: CreateSessionParams)
     }
   }
 
-  // 把 outputDir 塞进 context JSON（不动 schema）
-  const contextValue = outputDir ? JSON.stringify({ outputDir }) : undefined;
-
   const session = await prisma.session.create({
     data: {
       userId,
@@ -69,7 +65,6 @@ export async function createSession(userId: number, params: CreateSessionParams)
       title,
       mode: mode as any,
       modelConfig: modelConfig ? JSON.stringify(modelConfig) : undefined,
-      context: contextValue as any,
     },
     select: {
       id: true,
@@ -503,7 +498,7 @@ export async function sendMessage(
   let assistantContent = '';
 
   // 从会话上下文获取工作空间信息
-  const workspaceId = session.workspaceId || undefined;
+  const workspaceId = session.workspaceId ? Number(session.workspaceId) : undefined;
 
   try {
     // 创建并执行任务
