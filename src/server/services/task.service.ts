@@ -24,6 +24,7 @@ export interface CreateTaskParams {
   requirements?: string;
   maxAttempts?: number;
   llmRetries?: number;
+  outputDir?: string;
 }
 
 /**
@@ -121,6 +122,7 @@ export async function createTask(userId: number, params: CreateTaskParams) {
       sourceContent: resolvedSourceContent,
       language: resolvedLanguage,
       requirements,
+      outputDir: params.outputDir,
       attemptCount: 0,
     },
     select: {
@@ -130,6 +132,7 @@ export async function createTask(userId: number, params: CreateTaskParams) {
       mode: true,
       sourceFile: true,
       language: true,
+      outputDir: true,
       createdAt: true,
     },
   });
@@ -163,7 +166,7 @@ export async function getTasks(userId: number, params: TaskQueryParams) {
   const { skip, take } = createPagination(page, pageSize);
 
   const where: any = { userId };
-  if (status) where.status = status.toUpperCase();
+  if (status) where.status = status.toLowerCase();
   if (workspaceId) where.workspaceId = workspaceId;
   if (sessionId) where.sessionId = sessionId;
   if (language) where.language = language;
@@ -410,11 +413,39 @@ export async function retryTask(userId: number, taskId: string) {
 }
 
 /**
+ * 物理删除任务
+ *
+ * 级联删除：任务的 logs 会被 prisma onDelete: Cascade 一起删掉。
+ * 如果任务正在运行（pending/running），先标记为 cancelled 再删。
+ *
+ * @param userId 用户 ID
+ * @param taskId 任务 UUID
+ */
+export async function deleteTask(userId: number, taskId: string): Promise<void> {
+  const task = await prisma.task.findFirst({
+    where: { taskId, userId },
+  });
+
+  if (!task) {
+    throw new AppError(ErrorCode.TASK_NOT_FOUND, '任务不存在');
+  }
+
+  // 正在运行的任务不允许直接删（必须先取消）
+  if (task.status === 'pending' || task.status === 'running') {
+    throw new AppError(ErrorCode.TASK_ALREADY_RUNNING, '运行中的任务请先取消');
+  }
+
+  await prisma.task.delete({
+    where: { taskId },
+  });
+}
+
+/**
  * 获取任务结果
  *
  * @param userId 用户 ID
  * @param taskId 任务 UUID
- * @returns 任务结果
+ * @returns 任务结果（已解析 result JSON，顶层补 outputDir/sourceFile 等）
  */
 export async function getTaskResult(userId: number, taskId: string) {
   const task = await prisma.task.findFirst({
@@ -422,11 +453,24 @@ export async function getTaskResult(userId: number, taskId: string) {
     select: {
       taskId: true,
       status: true,
+      mode: true,
+      sourceFile: true,
+      language: true,
+      outputDir: true,
       result: true,
       errorMessage: true,
       executionTime: true,
       tokenUsage: true,
+      startedAt: true,
       completedAt: true,
+      createdAt: true,
+      sessionId: true,
+      session: {
+        select: {
+          id: true,
+          title: true,
+        },
+      },
     },
   });
 
@@ -434,11 +478,40 @@ export async function getTaskResult(userId: number, taskId: string) {
     throw new AppError(ErrorCode.TASK_NOT_FOUND, '任务不存在');
   }
 
-  if (task.status !== 'completed') {
-    throw new AppError(ErrorCode.TASK_FAILED, '任务未完成');
+  // 解析 result JSON 字符串为对象（Prisma Json 字段在读取时已解析，但兼容字符串）
+  let parsedResult: any = null;
+  if (task.result != null) {
+    if (typeof task.result === 'string') {
+      try {
+        parsedResult = JSON.parse(task.result);
+      } catch {
+        parsedResult = { raw: task.result };
+      }
+    } else {
+      parsedResult = task.result;
+    }
   }
 
-  return task;
+  // 顶层补 outputDir / sourceFile / language / mode / session
+  return {
+    taskId: task.taskId,
+    status: task.status,
+    mode: task.mode,
+    sourceFile: task.sourceFile,
+    language: task.language,
+    outputDir: task.outputDir,
+    errorMessage: task.errorMessage,
+    executionTime: task.executionTime ? Number(task.executionTime) : null,
+    tokenUsage: task.tokenUsage,
+    startedAt: task.startedAt,
+    completedAt: task.completedAt,
+    createdAt: task.createdAt,
+    sessionId: task.sessionId ? Number(task.sessionId) : null,
+    session: task.session
+      ? { id: Number(task.session.id), title: task.session.title }
+      : null,
+    result: parsedResult,
+  };
 }
 
 /**

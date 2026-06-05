@@ -14,7 +14,9 @@ import { ErrorCode, createPagination } from '../utils/response.js';
 export interface CreateSessionParams {
   title?: string;
   workspaceId?: number;
+  mode?: 'workflow' | 'autonomous';
   modelConfig?: Record<string, any>;
+  outputDir?: string;
 }
 
 /**
@@ -45,7 +47,7 @@ export interface SendMessageParams {
  * @returns 创建的会话
  */
 export async function createSession(userId: number, params: CreateSessionParams) {
-  const { title = '新会话', workspaceId, modelConfig } = params;
+  const { title = '新会话', workspaceId, mode = 'autonomous', modelConfig, outputDir } = params;
 
   // 如果指定了工作空间，检查是否存在
   if (workspaceId) {
@@ -57,14 +59,17 @@ export async function createSession(userId: number, params: CreateSessionParams)
     }
   }
 
+  // 把 outputDir 塞进 context JSON（不动 schema）
+  const contextValue = outputDir ? JSON.stringify({ outputDir }) : undefined;
+
   const session = await prisma.session.create({
     data: {
       userId,
       workspaceId,
       title,
-      // 从 modelConfig 提取 mode，或使用 'autonomous' 作为默认
-      mode: ((modelConfig as any)?.mode || 'autonomous') as any,
+      mode: mode as any,
       modelConfig: modelConfig ? JSON.stringify(modelConfig) : undefined,
+      context: contextValue as any,
     },
     select: {
       id: true,
@@ -75,6 +80,7 @@ export async function createSession(userId: number, params: CreateSessionParams)
       messageCount: true,
       totalTokens: true,
       createdAt: true,
+      context: true,
       workspace: {
         select: {
           id: true,
@@ -360,6 +366,54 @@ export async function getMessages(
 }
 
 /**
+ * 保存消息（不执行任务，只入库）
+ */
+export async function saveMessage(
+  userId: number,
+  sessionId: number,
+  params: {
+    content: string;
+    role: 'user' | 'assistant';
+    messageType?: string;
+  }
+) {
+  // 验证会话
+  const session = await prisma.session.findFirst({
+    where: { id: sessionId, userId },
+  });
+  if (!session) {
+    throw new AppError(ErrorCode.SESSION_NOT_FOUND, '会话不存在');
+  }
+
+  const message = await prisma.message.create({
+    data: {
+      sessionId,
+      role: params.role as any,
+      content: params.content,
+      messageType: (params.messageType?.toLowerCase() || 'text') as any,
+    },
+    select: {
+      id: true,
+      role: true,
+      content: true,
+      messageType: true,
+      createdAt: true,
+    },
+  });
+
+  // 更新统计
+  await prisma.session.update({
+    where: { id: sessionId },
+    data: {
+      messageCount: { increment: 1 },
+      lastMessageAt: new Date(),
+    },
+  });
+
+  return message;
+}
+
+/**
  * 发送消息
  *
  * @param userId 用户 ID
@@ -389,7 +443,7 @@ export async function sendMessage(
   const userMessage = await prisma.message.create({
     data: {
       sessionId,
-      role: 'user',
+      role: ((params as any).role || 'user') as any,
       content: params.content,
       messageType: (params.messageType?.toLowerCase() || 'text') as any,
       metadata: params.metadata ? JSON.stringify(params.metadata) : undefined,

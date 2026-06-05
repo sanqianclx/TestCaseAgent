@@ -158,6 +158,20 @@ export const retryTask = asyncHandler(async (req: Request, res: Response) => {
 });
 
 /**
+ * 删除任务
+ *
+ * DELETE /api/v1/tasks/:taskId
+ */
+export const deleteTask = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+  const { taskId } = req.params;
+
+  await taskService.deleteTask(userId, taskId);
+
+  sendSuccess(res, null, '任务已删除');
+});
+
+/**
  * 获取任务结果
  *
  * GET /api/v1/tasks/:taskId/result

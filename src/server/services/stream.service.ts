@@ -9,6 +9,7 @@ import { getWiredAutonomousAgent } from '../../autonomous/autonomous-agent.js';
 import { memoryStore } from '../../mastra/memory/in-memory-store.js';
 import { generateTestWorkflow } from '../../mastra/workflows/generate-test-workflow.js';
 import { getActiveApiKey } from './llmKey.service.js';
+import { registerGeneratedFile } from './file.service.js';
 import { logger } from '../../mastra/runtime/logger.js';
 
 /**
@@ -16,8 +17,28 @@ import { logger } from '../../mastra/runtime/logger.js';
  */
 export interface StreamCallbacks {
   onProgress: (event: { type: string; step?: string; message: string; progress?: number; data?: any }) => void;
-  onComplete: (result: { success: boolean; testCode?: string; testFile?: string; error?: string }) => void;
+  onComplete: (result: {
+    success: boolean;
+    testCode?: string;
+    testFile?: string;
+    error?: string;
+    taskId?: string;
+    previewFileId?: number | null;
+    outputDir?: string;
+  }) => void;
   onError: (error: Error) => void;
+  /**
+   * Agent 调用了 ask-user 工具，需要用户输入。
+   * 调用方应该弹出对话框收集用户输入后，把答案作为新消息重发。
+   */
+  onAsk?: (info: {
+    question: string;
+    options?: string[];
+    toolCallId?: string;
+    runId?: string;
+    toolName?: string;
+    args?: Record<string, any>;
+  }) => void;
 }
 
 /**
@@ -28,7 +49,8 @@ export interface StreamCallbacks {
 export async function streamAutonomousAgent(
   userId: number,
   input: string,
-  callbacks: StreamCallbacks
+  callbacks: StreamCallbacks,
+  options: { sessionId?: number; workspaceId?: number; outputDir?: string; sourceFile?: string; language?: string } = {}
 ): Promise<void> {
   try {
     // 1. 检查 API Key
@@ -81,8 +103,21 @@ export async function streamAutonomousAgent(
     let fullText = '';
     let testCode = '';
     let testFile = '';
+    // write-file 工具结果（如果 LLM 用 writeFile 写了文件）
+    let writtenFileContent: string | null = null;
+    let writtenFilePath: string | null = null;
+    // 工具调用记录
+    const toolCalls: Array<{ toolName: string; args: any; result: any }> = [];
+    // 是否已经触发 ask-user（决定是否还要发 onComplete）
+    let asked = false;
+    // 挂起信息（从 chunk 累积）
+    let suspendPayloadFromChunk: any = null;
+    let lastRunId: string | null = null;
+    let lastFinishReason: string | null = null;
 
     // 6. 流式调用 Agent
+    // ask-user 检测策略：在 LLM 文本里匹配 <<ASK_USER:问题>> 标记
+    // 出现则触发前端弹窗，让用户输入
     const stream = await (agent as any).stream(messages, {
       maxSteps: 25,
       modelSettings: { temperature: 0, maxOutputTokens: 4096 },
@@ -106,6 +141,24 @@ export async function streamAutonomousAgent(
       if (type === 'text-delta' && payload?.text) {
         const text = payload.text;
         fullText += text;
+
+        // 检测 ask-user 标记：<<ASK_USER:问题>>
+        // LLM 在需要向用户确认时输出这个标记，我们就弹窗
+        const askMatch = fullText.match(/<<ASK_USER:([\s\S]+?)>>/);
+        if (askMatch && callbacks.onAsk && !asked) {
+          const question = askMatch[1].trim();
+          callbacks.onAsk({ question, options: undefined, toolCallId: undefined });
+          asked = true;
+          callbacks.onProgress({
+            type: 'progress',
+            step: 'awaiting-user-input',
+            message: '⏸️ 等待你的输入...',
+            progress: 60,
+          });
+          // 把标记从 fullText 中剥掉，避免最终保存到消息里
+          fullText = fullText.replace(/<<ASK_USER:[\s\S]+?>>/, '').trim();
+          return;
+        }
 
         // 检测工具调用
         if (text.includes('读取') || text.includes('reading')) {
@@ -160,13 +213,81 @@ export async function streamAutonomousAgent(
         });
       } else if (type === 'tool-call') {
         const toolName = payload?.toolName || 'unknown';
+        const args = payload?.args || payload?.input || {};
+        toolCalls.push({ toolName, args, result: null });
+        // 服务端日志：方便排查为什么没触发 ask
+        logger.info('streamAutonomousAgent', { event: 'tool-call', toolName, argsKeys: Object.keys(args) });
         callbacks.onProgress({
           type: 'tool',
           step: toolName,
           message: `🔧 调用工具: ${toolName}`,
           progress: Math.min(progress + 2, 85),
         });
+      } else if (type === 'tool-call-suspended' || type === 'tool-suspended') {
+        // 工具挂起：框架通知需要用户审批
+        const sp = (payload as any)?.suspendPayload || payload;
+        if (sp && typeof sp === 'object') {
+          suspendPayloadFromChunk = sp;
+          logger.info('streamAutonomousAgent', {
+            event: 'tool-call-suspended',
+            toolName: (sp as any).toolName,
+            toolCallId: (sp as any).toolCallId,
+            runId: (sp as any).runId,
+          });
+        }
+      } else if (type === 'finish') {
+        // 记录 runId 和 finishReason
+        const finishPayload = (payload as any) || chunk;
+        if (finishPayload?.runId) lastRunId = finishPayload.runId;
+        if (finishPayload?.finishReason) lastFinishReason = finishPayload.finishReason;
+        if (finishPayload?.payload?.runId) lastRunId = finishPayload.payload.runId;
+        if (finishPayload?.payload?.finishReason) lastFinishReason = finishPayload.payload.finishReason;
+        // runId 也可能在 chunk 顶层
+        if (!lastRunId && (chunk as any).runId) lastRunId = (chunk as any).runId;
+
+        // 检测 ask-user 工具被调用：兜底发 ask 事件（如果 LLM 没输出 <<ASK_USER:..>> 标记）
+        // 实际前端弹窗主要由文本标记 <<ASK_USER:...>> 触发
+        if (
+          callbacks.onAsk &&
+          (toolName === 'askUser' || toolName === 'ask-user' || toolName === 'ask_user')
+        ) {
+          const question =
+            args?.question ||
+            args?.prompt ||
+            args?.message ||
+            args?.text ||
+            'Agent 需要你的输入';
+          const options = Array.isArray(args?.options) ? args.options : undefined;
+          const toolCallId = (payload as any)?.toolCallId;
+          if (!asked) {
+            callbacks.onAsk({ question, options, toolCallId });
+            asked = true;
+            callbacks.onProgress({
+              type: 'progress',
+              step: 'awaiting-user-input',
+              message: '⏸️ 等待你的输入...',
+              progress: 60,
+            });
+            return;
+          }
+        }
       } else if (type === 'tool-result') {
+        const lastCall = toolCalls[toolCalls.length - 1];
+        const result = payload?.result ?? payload?.output ?? null;
+        if (lastCall && lastCall.result === null) {
+          lastCall.result = result;
+        }
+
+        // 抓 writeFile 工具的内容/路径
+        if (lastCall && (lastCall.toolName === 'writeFile' || lastCall.toolName === 'write-file')) {
+          const r: any = result;
+          if (r && typeof r === 'object') {
+            if (typeof r.path === 'string') writtenFilePath = r.path;
+            if (typeof r.filePath === 'string') writtenFilePath = r.filePath;
+            if (typeof r.content === 'string') writtenFileContent = r.content;
+          }
+        }
+
         callbacks.onProgress({
           type: 'tool-result',
           step: 'tool',
@@ -176,14 +297,126 @@ export async function streamAutonomousAgent(
       }
     }
 
-    // 7. 提取测试代码
-    const codeMatch = fullText.match(/```(?:python|java|cpp|c\+\+)?\n([\s\S]*?)```/);
-    if (codeMatch) {
-      testCode = codeMatch[1];
+    // ========== 统一检查挂起状态 ==========
+    // Mastra 框架在 requireApproval 工具调用时挂起 stream，
+    // 此时 finishReason === 'suspended'，suspendPayload 在 fullOutput 里
+    let fullOutput: any = null;
+    try {
+      fullOutput = await (stream as any).getFullOutput?.();
+    } catch (e: any) {
+      logger.warn('streamAutonomousAgent: getFullOutput failed', { error: e?.message });
+    }
 
-      // 尝试提取文件名
-      const fileMatch = fullText.match(/(?:file|文件名)[:：]\s*(\S+\.\w+)/i);
-      testFile = fileMatch ? fileMatch[1] : 'test_output.py';
+    const finalFinishReason = (fullOutput?.finishReason as string | undefined) ?? lastFinishReason ?? '';
+    const finalRunId = (fullOutput?.runId as string | undefined) ?? lastRunId ?? '';
+
+    if (!asked && (finalFinishReason === 'suspended' || suspendPayloadFromChunk)) {
+      // 提取挂起信息
+      const sp: any =
+        suspendPayloadFromChunk ||
+        (fullOutput?.suspendPayload as Record<string, unknown>) ||
+        {};
+      const toolName = (sp.toolName as string) || '';
+      const toolCallId = (sp.toolCallId as string) || '';
+      const args = (sp.args as Record<string, any>) || {};
+      const runId = (sp.runId as string) || finalRunId;
+
+      if (callbacks.onAsk && toolName && toolCallId && runId) {
+        // 决定前端要展示什么
+        let question = '';
+        if (toolName === 'askUser') {
+          question =
+            (args.question as string) ||
+            (args.prompt as string) ||
+            'Agent 需要你的输入';
+        } else if (toolName === 'writeFile' || toolName === 'write-file') {
+          const path = (args.path as string) || (args.filePath as string) || '?';
+          question = `Agent 想写入文件：${path}`;
+        } else if (toolName === 'shellRun' || toolName === 'shell-run') {
+          const cmd = (args.command as string) || '?';
+          question = `Agent 想执行 shell 命令：\n\`\`\`\n${cmd}\n\`\`\``;
+        } else if (toolName === 'exportCases' || toolName === 'export-cases') {
+          const dir = (args.output_dir as string) || '?';
+          question = `Agent 想导出测试到：${dir}`;
+        } else {
+          question = `Agent 想调用工具 ${toolName}，请确认`;
+        }
+
+        callbacks.onAsk({
+          question,
+          options: undefined,
+          toolCallId,
+          runId,
+          toolName,
+          args,
+        });
+        logger.info('streamAutonomousAgent: ask', { toolName, toolCallId, runId });
+        // 不 res.end()，让前端 keep-alive
+        // 走 early return 跳过 onComplete
+        callbacks.onProgress({
+          type: 'progress',
+          step: 'awaiting-user-approval',
+          message: '⏸️ 等待你的确认...',
+          progress: 60,
+        });
+        return;
+      }
+    }
+
+    // 7. 提取测试代码：优先用 writeFile 工具真正写入的内容
+    // ask 模式下：跳过 onComplete / 入库 / 进度消息
+    if (asked) {
+      callbacks.onProgress({
+        type: 'progress',
+        step: 'awaiting-user-input',
+        message: '⏸️ 已通知前端等待用户输入...',
+        progress: 60,
+      });
+      return;
+    }
+
+    if (writtenFileContent) {
+      testCode = writtenFileContent;
+      if (writtenFilePath) {
+        testFile = writtenFilePath.split(/[\\/]/).pop() || writtenFilePath;
+      }
+    } else {
+      const codeMatch = fullText.match(/```(?:python|java|cpp|c\+\+)?\n([\s\S]*?)```/);
+      if (codeMatch) {
+        testCode = codeMatch[1];
+
+        // 尝试提取文件名
+        const fileMatch = fullText.match(/(?:file|文件名)[:：]\s*(\S+\.\w+)/i);
+        testFile = fileMatch ? fileMatch[1] : 'test_output.py';
+      }
+    }
+
+    callbacks.onProgress({
+      type: 'progress',
+      step: 'register',
+      message: '💾 正在保存测试代码到文件库...',
+      progress: 95,
+    });
+
+    // 8. 把测试代码入库
+    let previewFileId: number | null = null;
+    if (testCode) {
+      try {
+        const lang = options.language || 'python';
+        const ext = lang === 'python' ? 'py' : lang === 'java' ? 'java' : lang === 'cpp' ? 'cpp' : 'txt';
+        const reg = await registerGeneratedFile({
+          userId,
+          sessionId: options.sessionId,
+          workspaceId: options.workspaceId,
+          filename: testFile || `test_output_${Date.now()}.${ext}`,
+          content: testCode,
+          purpose: 'test_output',
+          metadata: { language: lang, sourceFile: options.sourceFile, kind: 'unit_test' },
+        });
+        previewFileId = reg.id;
+      } catch (regErr: any) {
+        logger.warn('streamAutonomousAgent: register generated file failed', { error: regErr.message });
+      }
     }
 
     callbacks.onProgress({
@@ -216,7 +449,8 @@ export async function streamWorkflow(
   sourceFile: string,
   language: string,
   requirements: string,
-  callbacks: StreamCallbacks
+  callbacks: StreamCallbacks,
+  options: { sessionId?: number; workspaceId?: number; outputDir?: string } = {}
 ): Promise<void> {
   try {
     // 1. 检查 API Key
@@ -272,7 +506,7 @@ export async function streamWorkflow(
       language,
       requirements,
       maxAttempts: 3,
-      outputDir: `./output/workflow-${Date.now()}`,
+      outputDir: options.outputDir || `./output/workflow-${Date.now()}`,
     };
 
     let testCode = '';
@@ -298,6 +532,33 @@ export async function streamWorkflow(
 
     callbacks.onProgress({
       type: 'progress',
+      step: 'register',
+      message: '💾 正在保存测试代码到文件库...',
+      progress: 96,
+    });
+
+    // 把测试代码入库
+    let previewFileId: number | null = null;
+    if (testCode) {
+      try {
+        const ext = language === 'python' ? 'py' : language === 'java' ? 'java' : language === 'cpp' ? 'cpp' : 'txt';
+        const reg = await registerGeneratedFile({
+          userId,
+          sessionId: options.sessionId,
+          workspaceId: options.workspaceId,
+          filename: testFile || `test_output_${Date.now()}.${ext}`,
+          content: testCode,
+          purpose: 'test_output',
+          metadata: { language, sourceFile, kind: 'unit_test' },
+        });
+        previewFileId = reg.id;
+      } catch (regErr: any) {
+        logger.warn('streamWorkflow: register generated file failed', { error: regErr.message });
+      }
+    }
+
+    callbacks.onProgress({
+      type: 'progress',
       step: 'complete',
       message: '✅ Workflow 执行完成',
       progress: 100,
@@ -307,6 +568,8 @@ export async function streamWorkflow(
       success: true,
       testCode,
       testFile,
+      previewFileId,
+      outputDir: workflowInput.outputDir,
     });
 
   } catch (error: any) {

@@ -22,6 +22,9 @@ const SUSPENSION_MARKER = "ASK_USER_SUSPENDED"
 
 export const askUserTool = createTool({
   id: "ask-user",
+  // 工具级 requireApproval：让框架拦截挂起，stream 以 finishReason='suspended' 结束
+  // 后端识别挂起后发 event: ask 给前端弹"待审批"，用户回答后调 /resume 恢复
+  requireApproval: true,
   description:
     "向用户发起一个澄清问题并等待回答。" +
     "用于在执行前确认缺失的参数、行为选择或破坏性意图。" +

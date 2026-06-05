@@ -12,6 +12,7 @@ import { generateUUID } from '../utils/crypto.js';
 import { getActiveApiKey } from './llmKey.service.js';
 import { executeAgentNonInteractive } from './agent-executor.js';
 import { executeWorkflow } from './workflow-executor.js';
+import { registerGeneratedFile } from './file.service.js';
 
 /**
  * 任务模式
@@ -31,6 +32,7 @@ export interface ExecuteTaskParams {
   requirements?: string;
   mode: TaskMode;
   maxAttempts?: number;
+  outputDir?: string;
 }
 
 /**
@@ -112,6 +114,7 @@ async function executeWorkflowTask(taskId: string, params: ExecuteTaskParams): P
     language = 'python',
     requirements = '',
     maxAttempts = 3,
+    outputDir,
   } = params;
 
   try {
@@ -122,6 +125,13 @@ async function executeWorkflowTask(taskId: string, params: ExecuteTaskParams): P
     await updateTaskStatus(taskId, 'running');
     await addTaskLog(taskId, 'info', '开始 Workflow 模式执行', 'start');
 
+    // 把 outputDir 持久化到任务（用户指定的目录优先，否则用默认 ./output/<taskId>）
+    const finalOutputDir = outputDir || `./output/${taskId}`;
+    await prisma.task.update({
+      where: { taskId },
+      data: { outputDir: finalOutputDir },
+    });
+
     // 调用 Workflow 执行器，传入 API Key
     const result = await executeWorkflow(
       sourceContent,
@@ -130,7 +140,7 @@ async function executeWorkflowTask(taskId: string, params: ExecuteTaskParams): P
       requirements,
       {
         maxAttempts,
-        outputDir: `./output/${taskId}`,
+        outputDir: finalOutputDir,
         apiKey,
         onLog: (message) => addTaskLog(taskId, 'info', message),
         onStep: (step, progress) => addTaskLog(taskId, 'info', `步骤: ${step}`, step),
@@ -138,9 +148,29 @@ async function executeWorkflowTask(taskId: string, params: ExecuteTaskParams): P
     );
 
     if (result.success) {
+      // 把生成的测试代码入库，便于前端预览
+      let previewFileId: number | null = null;
+      if (result.testCode) {
+        try {
+          const reg = await registerGeneratedFile({
+            userId,
+            sessionId: params.sessionId,
+            workspaceId: params.workspaceId,
+            filename: result.testFile || `test_output_${Date.now()}.${language === 'python' ? 'py' : language === 'java' ? 'java' : 'txt'}`,
+            content: result.testCode,
+            purpose: 'test_output',
+            metadata: { sourceTaskId: taskId, language, sourceFile, kind: 'unit_test' },
+          });
+          previewFileId = reg.id;
+        } catch (regErr: any) {
+          // 入库失败不影响任务完成
+          await addTaskLog(taskId, 'warn', `测试代码入库失败: ${regErr.message}`, 'register');
+        }
+      }
+
       await addTaskLog(taskId, 'info', '工作流执行完成', 'complete', {
         testFile: result.testFile,
-        coverage: result.coverage,
+        previewFileId,
       });
 
       await updateTaskStatus(taskId, 'completed', {
@@ -149,6 +179,8 @@ async function executeWorkflowTask(taskId: string, params: ExecuteTaskParams): P
           testFile: result.testFile,
           coverage: result.coverage,
           execution: result.execution,
+          previewFileId,
+          outputDir: finalOutputDir,
         }),
         executionTime: result.executionTime,
       });
@@ -174,6 +206,7 @@ async function executeAgentTask(taskId: string, params: ExecuteTaskParams): Prom
     sourceContent = '',
     language = 'python',
     requirements = '',
+    outputDir,
   } = params;
 
   try {
@@ -183,6 +216,13 @@ async function executeAgentTask(taskId: string, params: ExecuteTaskParams): Prom
 
     await updateTaskStatus(taskId, 'running');
     await addTaskLog(taskId, 'info', '开始 Agent 自主模式执行', 'start');
+
+    // 持久化 outputDir
+    const finalOutputDir = outputDir || `./output/agent-${taskId}`;
+    await prisma.task.update({
+      where: { taskId },
+      data: { outputDir: finalOutputDir },
+    });
 
     // 构建 Agent 输入
     const agentInput = `
@@ -213,14 +253,41 @@ ${requirements || '无'}
     });
 
     if (result.success) {
+      // 把生成的测试代码入库，便于前端预览
+      let previewFileId: number | null = null;
+      if (result.testCode) {
+        try {
+          const reg = await registerGeneratedFile({
+            userId,
+            sessionId: params.sessionId,
+            workspaceId: params.workspaceId,
+            filename: result.testFile || `test_output_${Date.now()}.${language === 'python' ? 'py' : language === 'java' ? 'java' : 'txt'}`,
+            content: result.testCode,
+            purpose: 'test_output',
+            metadata: { sourceTaskId: taskId, language, sourceFile, kind: 'unit_test' },
+          });
+          previewFileId = reg.id;
+        } catch (regErr: any) {
+          await addTaskLog(taskId, 'warn', `测试代码入库失败: ${regErr.message}`, 'register');
+        }
+      }
+
       await addTaskLog(taskId, 'info', 'Agent 执行完成', 'complete', {
         testFile: result.testFile,
+        previewFileId,
+        toolCallCount: result.toolCalls?.length || 0,
       });
 
       await updateTaskStatus(taskId, 'completed', {
         result: JSON.stringify({
           testCode: result.testCode,
           testFile: result.testFile,
+          testFilePath: result.testFilePath,
+          previewFileId,
+          outputDir: finalOutputDir,
+          coverage: result.coverage,
+          execution: result.execution,
+          toolCalls: result.toolCalls,
         }),
         executionTime: result.executionTime,
       });
@@ -240,7 +307,7 @@ ${requirements || '无'}
  * 执行任务
  */
 export async function executeTask(params: ExecuteTaskParams): Promise<string> {
-  const { userId, sessionId, workspaceId, sourceFile, sourceContent, language, requirements, mode, maxAttempts } = params;
+  const { userId, sessionId, workspaceId, sourceFile, sourceContent, language, requirements, mode, maxAttempts, outputDir } = params;
 
   const taskId = generateUUID();
 
@@ -257,6 +324,7 @@ export async function executeTask(params: ExecuteTaskParams): Promise<string> {
       sourceContent: sourceContent || '',
       language: language || 'unknown',
       requirements,
+      outputDir,
       attemptCount: 0,
     },
   });

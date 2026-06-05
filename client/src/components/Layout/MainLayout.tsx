@@ -1,5 +1,7 @@
 /**
  * 主布局组件
+ *
+ * 紧凑布局，自适应屏幕，不出现整体滚动条
  */
 
 import React from 'react';
@@ -10,19 +12,18 @@ import {
   MessageOutlined,
   FolderOutlined,
   FileOutlined,
-  ThunderboltOutlined,
   UserOutlined,
   LogoutOutlined,
   SettingOutlined,
   ExperimentOutlined,
+  UnorderedListOutlined,
 } from '@ant-design/icons';
 import { useAuthStore } from '../../stores/authStore';
 
-const { Header, Sider, Content } = Layout;
 const { Text } = Typography;
 
-const SIDER_WIDTH = 220;
-const HEADER_HEIGHT = 64;
+const SIDER_WIDTH = 200;
+const HEADER_HEIGHT = 56;
 
 /**
  * 侧边栏菜单项
@@ -37,6 +38,16 @@ const menuItems = [
     key: '/chat',
     icon: <MessageOutlined />,
     label: 'AI 对话',
+  },
+  {
+    key: '/sessions',
+    icon: <ExperimentOutlined />,
+    label: '会话历史',
+  },
+  {
+    key: '/tasks',
+    icon: <UnorderedListOutlined />,
+    label: '测试任务',
   },
   {
     key: '/workspaces',
@@ -72,21 +83,15 @@ const MainLayout: React.FC = () => {
       key: 'profile',
       icon: <UserOutlined />,
       label: '个人资料',
-      onClick: () => {
-        navigate('/profile');
-      },
+      onClick: () => navigate('/profile'),
     },
     {
       key: 'settings',
       icon: <SettingOutlined />,
       label: 'LLM 设置',
-      onClick: () => {
-        navigate('/settings');
-      },
+      onClick: () => navigate('/settings'),
     },
-    {
-      type: 'divider' as const,
-    },
+    { type: 'divider' as const },
     {
       key: 'logout',
       icon: <LogoutOutlined />,
@@ -96,53 +101,68 @@ const MainLayout: React.FC = () => {
   ];
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', width: '100%' }}>
+    <div
+      style={{
+        display: 'flex',
+        height: '100vh',
+        width: '100vw',
+        overflow: 'hidden',
+        position: 'fixed',
+        top: 0,
+        left: 0,
+      }}
+    >
       {/* 侧边栏 */}
       <div
         style={{
           width: SIDER_WIDTH,
-          minHeight: '100vh',
+          minWidth: SIDER_WIDTH,
+          height: '100vh',
           background: '#fff',
           borderRight: '1px solid #f0f0f0',
-          position: 'fixed',
-          left: 0,
-          top: 0,
-          bottom: 0,
-          zIndex: 100,
-          overflow: 'auto',
+          display: 'flex',
+          flexDirection: 'column',
+          flexShrink: 0,
         }}
       >
         {/* Logo */}
-        <div style={{
-          height: HEADER_HEIGHT,
-          display: 'flex',
-          alignItems: 'center',
-          padding: '0 20px',
-          borderBottom: '1px solid #f0f0f0',
-        }}>
-          <span style={{ fontSize: 20, marginRight: 8 }}>🧪</span>
-          <Text strong style={{ fontSize: 16 }}>TestGenerate</Text>
+        <div
+          style={{
+            height: HEADER_HEIGHT,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'flex-start',
+            padding: '0 16px',
+            borderBottom: '1px solid #f0f0f0',
+            flexShrink: 0,
+          }}
+        >
+          <span style={{ fontSize: 18, marginRight: 6 }}>🧪</span>
+          <Text strong style={{ fontSize: 14 }}>TestGenerate</Text>
           <Tag color="blue" style={{ marginLeft: 4, fontSize: 10 }}>V3</Tag>
         </div>
 
         {/* 菜单 */}
-        <Menu
-          mode="inline"
-          selectedKeys={[location.pathname]}
-          items={menuItems}
-          onClick={handleMenuClick}
-          style={{ borderRight: 0, paddingTop: 8 }}
-        />
+        <div style={{ flex: 1, overflowY: 'auto' }}>
+          <Menu
+            mode="inline"
+            selectedKeys={[location.pathname]}
+            items={menuItems}
+            onClick={handleMenuClick}
+            style={{ borderRight: 0 }}
+          />
+        </div>
       </div>
 
       {/* 右侧主区域 */}
       <div
         style={{
-          marginLeft: SIDER_WIDTH,
           flex: 1,
-          minHeight: '100vh',
+          height: '100vh',
           display: 'flex',
           flexDirection: 'column',
+          minWidth: 0,
+          overflow: 'hidden',
         }}
       >
         {/* 顶部导航 */}
@@ -154,36 +174,33 @@ const MainLayout: React.FC = () => {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            padding: '0 24px',
-            position: 'sticky',
-            top: 0,
-            zIndex: 99,
+            padding: '0 16px',
+            flexShrink: 0,
           }}
         >
-          <Text type="secondary" style={{ fontSize: 14 }}>
+          <Text type="secondary" style={{ fontSize: 13 }}>
             {(() => {
               const item = menuItems.find(m => m.key === location.pathname);
               return item ? item.label : 'TestGenerate Agent';
             })()}
           </Text>
-          <Space size="large">
+          <Space size="middle">
             <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
               <Space style={{ cursor: 'pointer' }}>
-                <Avatar style={{ backgroundColor: '#1890ff' }} icon={<UserOutlined />} />
-                <Text strong>{user?.username || '用户'}</Text>
+                <Avatar size={28} style={{ backgroundColor: '#1890ff' }} icon={<UserOutlined />} />
+                <Text style={{ fontSize: 13 }}>{user?.username || '用户'}</Text>
               </Space>
             </Dropdown>
           </Space>
         </div>
 
-        {/* 主内容 */}
+        {/* 主内容区 */}
         <div
           style={{
             flex: 1,
-            padding: 24,
             background: '#f5f7fa',
-            minHeight: `calc(100vh - ${HEADER_HEIGHT}px)`,
             overflow: 'auto',
+            minHeight: 0,
           }}
         >
           <Outlet />

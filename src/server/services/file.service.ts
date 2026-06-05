@@ -70,6 +70,86 @@ async function ensureUploadDir(): Promise<string> {
 }
 
 /**
+ * 注册 AI 生成的测试文件
+ *
+ * 用于把工作流 / 自主 Agent 生成的测试代码落盘到 uploads 目录，
+ * 并写入 `uploaded_files` + `file_contents` 表，
+ * 后续可通过 `GET /api/v1/files/:id/content` 预览。
+ *
+ * @param params 文件元信息
+ * @returns 入库后的文件 ID 与磁盘路径
+ */
+export async function registerGeneratedFile(params: {
+  userId: number;
+  sessionId?: number;
+  workspaceId?: number;
+  filename: string;
+  content: string | Buffer;
+  purpose?: 'test_output' | 'test_plan' | 'source';
+  metadata?: Record<string, any>;
+}): Promise<{ id: number; path: string }> {
+  const {
+    userId,
+    sessionId,
+    workspaceId,
+    filename,
+    content,
+    purpose = 'test_output',
+    metadata = {},
+  } = params;
+
+  // 计算内容 Buffer 与哈希
+  const buf = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf-8');
+  const hash = sha256(buf);
+  const detectedLang = detectLanguage(filename) || 'text';
+  const mimeType = 'text/plain';
+
+  // 命名规则：uploads/<userId>/generated/<timestamp>-<rand>__<filename>
+  const userDir = path.resolve(env.upload.dir, String(userId), 'generated');
+  await fs.mkdir(userDir, { recursive: true });
+
+  const safeBase = path.basename(filename).replace(/[\\/:*?"<>|]/g, '_');
+  const storedName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}__${safeBase}`;
+  const filePath = path.join(userDir, storedName);
+
+  await fs.writeFile(filePath, buf);
+
+  // 查重：同 user + 同 hash 已有记录则直接返回（避免重复入库）
+  const existing = await prisma.uploadedFile.findFirst({
+    where: { userId, hash },
+  });
+  if (existing) {
+    return { id: Number(existing.id), path: existing.path };
+  }
+
+  const file = await prisma.uploadedFile.create({
+    data: {
+      userId,
+      workspaceId,
+      sessionId,
+      filename: storedName,
+      originalName: safeBase,
+      mimeType,
+      size: BigInt(buf.length),
+      path: filePath,
+      hash,
+      purpose: purpose.toLowerCase() as any,
+      metadata: JSON.stringify({ ...metadata, language: detectedLang, isGenerated: true }),
+    },
+  });
+
+  await prisma.fileContent.create({
+    data: {
+      fileId: file.id,
+      chunkIndex: 0,
+      content: buf,
+    },
+  });
+
+  return { id: Number(file.id), path: filePath };
+}
+
+/**
  * 上传文件
  *
  * @param file 上传的文件
@@ -212,7 +292,7 @@ export async function getFiles(
   const where: any = { userId };
   if (workspaceId) where.workspaceId = workspaceId;
   if (sessionId) where.sessionId = sessionId;
-  if (purpose) where.purpose = purpose.toUpperCase();
+  if (purpose) where.purpose = purpose.toLowerCase();
 
   const [items, total] = await Promise.all([
     prisma.uploadedFile.findMany({

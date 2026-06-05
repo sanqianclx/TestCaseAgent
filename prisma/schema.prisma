@@ -108,6 +108,7 @@ model Session {
   workspaceId   BigInt?     @map("workspace_id")
   title         String      @default("新会话") @db.VarChar(200)
   status        SessionStatus @default(active)
+  mode          TaskMode     @default(autonomous)
   context       Json?
   modelConfig   Json?       @map("model_config")
   messageCount  Int         @default(0) @map("message_count")
@@ -367,4 +368,6 @@ enum FilePurpose {
   reference
   config
   other
+  test_output
+  test_plan
 }

@@ -242,6 +242,8 @@ export const updateWorkspaceSchema = z.object({
 export const createSessionSchema = z.object({
   title: z.string().max(200).optional().default('新会话'),
   workspaceId: z.number().int().positive().optional(),
+  mode: z.enum(['workflow', 'autonomous']).optional().default('autonomous'),
+  outputDir: z.string().max(500).optional(),
   modelConfig: z.object({
     provider: z.string().optional(),
     model: z.string().optional(),
@@ -275,6 +277,7 @@ export const sendMessageSchema = z.object({
   metadata: z.any().optional(),
   fileIds: z.array(z.number().int().positive()).optional(),
   taskMode: z.enum(['workflow', 'autonomous']).optional(),
+  role: z.enum(['user', 'assistant']).optional().default('user'),
 });
 
 // =====================================================
@@ -295,6 +298,7 @@ export const createTaskSchema = z.object({
   requirements: z.string().max(10000).optional(),
   maxAttempts: z.number().int().min(1).max(20).optional(),
   llmRetries: z.number().int().min(1).max(10).optional(),
+  outputDir: z.string().max(500).optional(),
 }).refine(
   (data) => data.sourceFile || data.sourceContent || data.fileId,
   { message: '必须提供 sourceFile、sourceContent 或 fileId 之一' }

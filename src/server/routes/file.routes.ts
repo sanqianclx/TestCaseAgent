@@ -61,7 +61,7 @@ const fileQuerySchema = z.object({
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
   workspaceId: z.coerce.number().int().positive().optional(),
   sessionId: z.coerce.number().int().positive().optional(),
-  purpose: z.enum(['source', 'reference', 'config', 'other']).optional(),
+  purpose: z.enum(['source', 'reference', 'config', 'other', 'test_output', 'test_plan']).optional(),
 });
 
 /**

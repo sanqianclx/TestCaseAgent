@@ -10,17 +10,35 @@ import { getWiredAutonomousAgent } from '../../autonomous/autonomous-agent.js';
 import { memoryStore } from '../../mastra/memory/in-memory-store.js';
 
 /**
+ * 单次工具调用
+ */
+export interface ToolCallRecord {
+  toolName: string;
+  args: any;
+  result: any;
+}
+
+/**
  * 执行结果
  */
 export interface AgentExecutionResult {
   success: boolean;
   testCode?: string;
   testFile?: string;
+  testFilePath?: string;
   coverage?: Record<string, number>;
+  execution?: {
+    passed: number;
+    failed: number;
+    skipped: number;
+    duration: number;
+  };
   executionTime: number;
   error?: string;
   logs: string[];
   fullText?: string;
+  /** 所有工具调用记录 */
+  toolCalls?: ToolCallRecord[];
 }
 
 /**
@@ -99,6 +117,7 @@ export async function executeAgentNonInteractive(
     ];
 
     // 调用 Agent
+    // ask-user 检测策略：在 LLM 文本里匹配 <<ASK_USER:问题>> 标记
     const stream = await (agent as any).stream(messages, {
       maxSteps,
       modelSettings: { temperature: 0, maxOutputTokens: 4096 },
@@ -107,6 +126,12 @@ export async function executeAgentNonInteractive(
     let fullText = '';
     let testCode = '';
     let testFile = '';
+    // 收集所有工具调用与结果（按时间顺序）
+    const toolCalls: Array<{ toolName: string; args: any; result: any }> = [];
+    // write-file 写入的文件路径（多个取最后一个）
+    let writtenFilePath: string | null = null;
+    // write-file 写入的内容（多个取最后一个）
+    let writtenFileContent: string | null = null;
 
     addLog('Agent 流式输出中...');
 
@@ -117,25 +142,94 @@ export async function executeAgentNonInteractive(
 
       if (type === 'text-delta' && payload?.text) {
         fullText += payload.text;
+      } else if (type === 'tool-call') {
+        // 工具调用开始
+        const toolName = payload?.toolName || 'unknown';
+        const args = payload?.args || payload?.input || {};
+        addLog(`🔧 调用工具: ${toolName}`);
+        toolCalls.push({ toolName, args, result: null });
+      } else if (type === 'tool-result') {
+        // 工具执行结果
+        const lastCall = toolCalls[toolCalls.length - 1];
+        const result = payload?.result ?? payload?.output ?? null;
+        if (lastCall && lastCall.result === null) {
+          lastCall.result = result;
+        }
+        addLog(`✅ 工具执行完成`);
+
+        // 特殊处理 write-file：拿到最终写入的文件
+        if (lastCall && (lastCall.toolName === 'writeFile' || lastCall.toolName === 'write-file')) {
+          const r: any = result;
+          if (r && typeof r === 'object') {
+            if (typeof r.path === 'string') writtenFilePath = r.path;
+            if (typeof r.filePath === 'string') writtenFilePath = r.filePath;
+            if (typeof r.content === 'string') writtenFileContent = r.content;
+            // 一些工具把写入状态放在 result.success / result.message
+          }
+        }
       }
     }
 
-    addLog(`Agent 输出完成，文本长度: ${fullText.length}`);
+    addLog(`Agent 输出完成，文本长度: ${fullText.length}, 工具调用次数: ${toolCalls.length}`);
 
-    // 提取测试代码
-    const codeMatch = fullText.match(/```(?:python|java|cpp|c\+\+)?\n([\s\S]*?)```/);
-    if (codeMatch) {
-      testCode = codeMatch[1];
+    // 从工具结果中提取 coverage / execution
+    let coverage: Record<string, number> | undefined;
+    let execution: { passed: number; failed: number; skipped: number; duration: number } | undefined;
+
+    for (const call of toolCalls) {
+      const r: any = call.result;
+      if (!r || typeof r !== 'object') continue;
+      const toolName = call.toolName;
+      // measureCoverage 返回 { line, branch, function } 或 { symbol_coverage, ... }
+      if (toolName === 'measureCoverage' || toolName === 'measure-coverage') {
+        if (typeof r.line === 'number') {
+          coverage = {
+            line: r.line,
+            branch: r.branch ?? 0,
+            function: r.function ?? 0,
+          };
+        } else if (typeof r.symbol_coverage === 'number') {
+          coverage = {
+            line: r.symbol_coverage,
+            branch: r.branch_coverage ?? 0,
+            function: r.function_coverage ?? 0,
+          };
+        }
+      }
+      // executeTests 返回 { passed, failed, errors, skipped, duration_ms, test_results }
+      if (toolName === 'executeTests' || toolName === 'execute-tests') {
+        const passed = Number(r.passed ?? 0);
+        const failed = Number(r.failed ?? Number(r.errors ?? 0));
+        const skipped = Number(r.skipped ?? 0);
+        const duration = Number(r.duration_ms ?? r.duration ?? 0);
+        execution = { passed, failed, skipped, duration };
+      }
     }
 
-    // 推断文件名
-    const extMap: Record<string, string> = {
-      python: 'py',
-      java: 'java',
-      cpp: 'cpp',
-    };
-    const ext = extMap[language] || 'txt';
-    testFile = `test_output_${Date.now()}.${ext}`;
+    // 优先使用工具真正写入的内容（write-file 工具的结果）
+    if (writtenFileContent) {
+      testCode = writtenFileContent;
+    } else {
+      // 回退：从 LLM 文本中提取 ```code``` 块
+      const codeMatch = fullText.match(/```(?:python|java|cpp|c\+\+)?\n([\s\S]*?)```/);
+      if (codeMatch) {
+        testCode = codeMatch[1];
+      }
+    }
+
+    // 优先用工具返回的文件路径
+    if (writtenFilePath) {
+      testFile = writtenFilePath.split(/[\\/]/).pop() || writtenFilePath;
+    } else {
+      // 回退：推断文件名
+      const extMap: Record<string, string> = {
+        python: 'py',
+        java: 'java',
+        cpp: 'cpp',
+      };
+      const ext = extMap[language] || 'txt';
+      testFile = `test_output_${Date.now()}.${ext}`;
+    }
 
     const executionTime = Date.now() - startTime;
     addLog(`执行完成，耗时: ${executionTime}ms`);
@@ -144,9 +238,13 @@ export async function executeAgentNonInteractive(
       success: true,
       testCode,
       testFile,
+      testFilePath: writtenFilePath || undefined,
+      coverage,
+      execution,
       executionTime,
       logs,
       fullText,
+      toolCalls,
     };
   } catch (error: any) {
     const executionTime = Date.now() - startTime;

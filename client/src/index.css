@@ -1,4 +1,4 @@
-/* 全局样式 */
+/* 全局样式 - 填满屏幕，不出现页面级滚动条 */
 
 * {
   box-sizing: border-box;
@@ -8,8 +8,14 @@ html, body, #root {
   margin: 0;
   padding: 0;
   height: 100vh;
-  width: 100%;
+  width: 100vw;
+  max-width: 100vw;
   overflow: hidden;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
     Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
   background: #f5f7fa;
@@ -17,35 +23,33 @@ html, body, #root {
 
 #root {
   height: 100vh;
+  width: 100vw;
   display: flex;
   flex-direction: column;
-}
-
-/* 让 Ant Design 组件铺满全屏 */
-.ant-layout {
-  background: transparent !important;
-}
-
-.ant-layout-sider {
-  background: #fff !important;
-}
-
-.ant-layout-header {
-  background: #fff !important;
-  padding: 0 !important;
-  height: 64px;
-  line-height: 64px;
-}
-
-.ant-layout-content {
-  background: #f5f7fa;
-  height: 100%;
-  overflow: auto;
-}
-
-/* 内容区不允许出现页面级滚动条 */
-body {
   overflow: hidden;
+}
+
+/* 主布局固定 100vh，不滚动 */
+.app-main-layout {
+  height: 100vh !important;
+  width: 100vw !important;
+  overflow: hidden !important;
+}
+
+/* 侧边栏固定 */
+.app-sider {
+  height: 100vh !important;
+  position: sticky !important;
+  top: 0 !important;
+  overflow-y: auto !important;
+}
+
+/* 内容区铺满剩余空间 */
+.app-content {
+  height: calc(100vh - 64px) !important;
+  width: 100% !important;
+  overflow: auto !important;
+  background: #f5f7fa;
 }
 
 /* 卡片美化 */
@@ -81,7 +85,7 @@ body {
   padding: 2px 8px;
 }
 
-/* 滚动条美化 - 细长但可见 */
+/* 滚动条美化 */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -116,4 +120,9 @@ body {
 /* 隐藏特定元素的滚动条 */
 .hide-scrollbar::-webkit-scrollbar {
   display: none;
+}
+
+/* 确保 Ant Design 不会撑破容器 */
+.ant-layout, .ant-layout-sider, .ant-layout-header, .ant-layout-content {
+  max-width: 100%;
 }

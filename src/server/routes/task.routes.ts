@@ -75,6 +75,12 @@ router.post('/:taskId/cancel', taskController.cancelTask);
 router.post('/:taskId/retry', taskController.retryTask);
 
 /**
+ * DELETE /api/v1/tasks/:taskId
+ * 物理删除任务（仅限非运行中）
+ */
+router.delete('/:taskId', taskController.deleteTask);
+
+/**
  * GET /api/v1/tasks/:taskId/result
  * 获取任务结果
  */

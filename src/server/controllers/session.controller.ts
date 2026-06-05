@@ -19,18 +19,26 @@ import { asyncHandler } from '../middleware/errorHandler.js';
  */
 export const createSession = asyncHandler(async (req: Request, res: Response) => {
   const userId = req.user!.id;
-  const { title, workspaceId, modelConfig, mode } = req.body;
+
+  console.log('[createSession] 完整 req.body:', JSON.stringify(req.body));
+
+  const { title, workspaceId, modelConfig, mode, outputDir } = req.body;
+
+  console.log('[createSession] 解析后:', { title, workspaceId, mode, modelConfig, outputDir });
 
   // 合并 mode 到 modelConfig
+  const finalMode = mode || 'autonomous';
   const finalModelConfig = {
     ...(modelConfig || {}),
-    mode: mode || 'autonomous',
+    mode: finalMode,
   };
 
   const result = await sessionService.createSession(userId, {
     title,
     workspaceId,
+    mode: finalMode,
     modelConfig: finalModelConfig,
+    outputDir,
   });
 
   sendSuccess(res, result, '会话创建成功', 201);
@@ -167,8 +175,20 @@ export const getMessages = asyncHandler(async (req: Request, res: Response) => {
 export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
   const userId = req.user!.id;
   const sessionId = parseInt(req.params.id);
-  const { content, messageType, metadata, fileIds, taskMode } = req.body;
+  const { content, messageType, metadata, fileIds, taskMode, role } = req.body;
 
+  // 如果只是保存消息（Chat 页面 SSE 模式调用）
+  if (role && (role === 'user' || role === 'assistant')) {
+    const msg = await sessionService.saveMessage(userId, sessionId, {
+      content,
+      role,
+      messageType,
+    });
+    sendSuccess(res, msg, '消息已保存');
+    return;
+  }
+
+  // 否则执行完整流程
   const result = await sessionService.sendMessage(userId, sessionId, {
     content,
     messageType,
