@@ -66,7 +66,7 @@ const ApiKeys: React.FC = () => {
   const handleCreate = async (values: CreateApiKeyParams) => {
     try {
       const result = await apiKeysApi.createApiKey(values);
-      setNewKey(result.key);
+      setNewKey((result as any).key || result.preview);
       form.resetFields();
       loadApiKeys();
     } catch (error) {

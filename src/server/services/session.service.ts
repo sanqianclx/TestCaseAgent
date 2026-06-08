@@ -16,6 +16,8 @@ export interface CreateSessionParams {
   workspaceId?: number;
   mode?: 'workflow' | 'autonomous';
   modelConfig?: Record<string, any>;
+  /** 用户指定的测试代码输出目录（不绑定工作空间，作为"会话级默认目录"持久化） */
+  outputDir?: string;
 }
 
 /**
@@ -25,6 +27,7 @@ export interface UpdateSessionParams {
   title?: string;
   status?: 'active' | 'archived';
   modelConfig?: Record<string, any>;
+  workspaceId?: number;
 }
 
 /**
@@ -46,7 +49,7 @@ export interface SendMessageParams {
  * @returns 创建的会话
  */
 export async function createSession(userId: number, params: CreateSessionParams) {
-  const { title = '新会话', workspaceId, mode = 'autonomous', modelConfig } = params;
+  const { title = '新会话', workspaceId, mode = 'autonomous', modelConfig, outputDir } = params;
 
   // 如果指定了工作空间，检查是否存在
   if (workspaceId) {
@@ -58,6 +61,9 @@ export async function createSession(userId: number, params: CreateSessionParams)
     }
   }
 
+  // 把 outputDir 写到 session.context JSON（不动 schema）
+  const contextValue = outputDir ? JSON.stringify({ outputDir }) : undefined;
+
   const session = await prisma.session.create({
     data: {
       userId,
@@ -65,6 +71,7 @@ export async function createSession(userId: number, params: CreateSessionParams)
       title,
       mode: mode as any,
       modelConfig: modelConfig ? JSON.stringify(modelConfig) : undefined,
+      context: contextValue as any,
     },
     select: {
       id: true,
@@ -85,7 +92,14 @@ export async function createSession(userId: number, params: CreateSessionParams)
     },
   });
 
-  return session;
+  return {
+    ...session,
+    id: Number(session.id),
+    workspaceId: session.workspaceId ? Number(session.workspaceId) : null,
+    messageCount: Number(session.messageCount),
+    totalTokens: Number(session.totalTokens || 0),
+    workspace: session.workspace ? { id: Number(session.workspace.id), name: session.workspace.name } : null,
+  };
 }
 
 /**
@@ -152,6 +166,7 @@ export async function getSessions(
       id: Number(item.id),
       messageCount: Number(item.messageCount),
       totalTokens: Number(item.totalTokens || 0),
+      workspace: item.workspace ? { id: Number(item.workspace.id), name: item.workspace.name } : null,
     })),
     total,
     page,
@@ -204,7 +219,15 @@ export async function getSessionById(userId: number, sessionId: number) {
     throw new AppError(ErrorCode.SESSION_NOT_FOUND, '会话不存在');
   }
 
-  return session;
+  return {
+    ...session,
+    id: Number(session.id),
+    messageCount: Number(session.messageCount),
+    totalTokens: Number(session.totalTokens || 0),
+    workspace: session.workspace
+      ? { ...session.workspace, id: Number(session.workspace.id) }
+      : null,
+  };
 }
 
 /**
@@ -235,6 +258,18 @@ export async function updateSession(
   if (params.title !== undefined) updateData.title = params.title;
   if (params.status !== undefined) updateData.status = params.status.toLowerCase();
   if (params.modelConfig !== undefined) updateData.modelConfig = JSON.stringify(params.modelConfig);
+  if (params.workspaceId !== undefined) {
+    if (existing.workspaceId && Number(existing.workspaceId) !== params.workspaceId) {
+      throw new AppError(ErrorCode.WORKSPACE_NO_PERMISSION, '会话已绑定工作空间，不能更换');
+    }
+    const workspace = await prisma.workspace.findFirst({
+      where: { id: params.workspaceId, userId },
+    });
+    if (!workspace) {
+      throw new AppError(ErrorCode.WORKSPACE_NOT_FOUND, '工作空间不存在');
+    }
+    updateData.workspaceId = params.workspaceId;
+  }
 
   const session = await prisma.session.update({
     where: { id: sessionId },
@@ -243,12 +278,24 @@ export async function updateSession(
       id: true,
       title: true,
       status: true,
+      workspaceId: true,
       modelConfig: true,
       updatedAt: true,
+      workspace: {
+        select: {
+          id: true,
+          name: true,
+        },
+      },
     },
   });
 
-  return session;
+  return {
+    ...session,
+    id: Number(session.id),
+    workspaceId: session.workspaceId ? Number(session.workspaceId) : null,
+    workspace: session.workspace ? { id: Number(session.workspace.id), name: session.workspace.name } : null,
+  };
 }
 
 /**
@@ -353,10 +400,14 @@ export async function getMessages(
   ]);
 
   return {
-    items: items.reverse(), // 返回正序
+    items: items.reverse().map((m) => ({
+      ...m,
+      id: Number(m.id),
+      parentId: m.parentId != null ? Number(m.parentId) : null,
+    })),
     total,
     hasMore: skip + items.length < total,
-    oldestId: items.length > 0 ? items[0].id : null,
+    oldestId: items.length > 0 ? Number(items[0].id) : null,
   };
 }
 

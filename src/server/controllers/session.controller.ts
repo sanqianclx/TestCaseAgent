@@ -22,9 +22,9 @@ export const createSession = asyncHandler(async (req: Request, res: Response) =>
 
   console.log('[createSession] 完整 req.body:', JSON.stringify(req.body));
 
-  const { title, workspaceId, modelConfig, mode } = req.body;
+  const { title, workspaceId, modelConfig, mode, outputDir } = req.body;
 
-  console.log('[createSession] 解析后:', { title, workspaceId, mode, modelConfig });
+  console.log('[createSession] 解析后:', { title, workspaceId, mode, modelConfig, outputDir });
 
   // 合并 mode 到 modelConfig
   const finalMode = mode || 'autonomous';
@@ -38,6 +38,7 @@ export const createSession = asyncHandler(async (req: Request, res: Response) =>
     workspaceId,
     mode: finalMode,
     modelConfig: finalModelConfig,
+    outputDir,
   });
 
   sendSuccess(res, result, '会话创建成功', 201);
@@ -94,12 +95,13 @@ export const getSessionById = asyncHandler(async (req: Request, res: Response) =
 export const updateSession = asyncHandler(async (req: Request, res: Response) => {
   const userId = req.user!.id;
   const sessionId = parseInt(req.params.id);
-  const { title, status, modelConfig } = req.body;
+  const { title, status, modelConfig, workspaceId } = req.body;
 
   const result = await sessionService.updateSession(userId, sessionId, {
     title,
     status,
     modelConfig,
+    workspaceId,
   });
 
   sendSuccess(res, result, '会话更新成功');

@@ -85,7 +85,7 @@ const Tasks: React.FC = () => {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detail, setDetail] = useState<TaskResultResponse | null>(null);
-  const [taskLogs, setTaskLogs] = useState<Array<{ level: string; step?: string; message: string; createdAt: string }>>([]);
+  const [taskLogs, setTaskLogs] = useState<Array<{ level: string; step?: string | null; message: string; createdAt: string }>>([]);
 
   // 源文件内容（若 sourceFileId 存在则拉取）
   const [sourceCode, setSourceCode] = useState<string | null>(null);

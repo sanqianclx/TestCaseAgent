@@ -146,7 +146,10 @@ export async function createWorkspace(userId: number, params: CreateWorkspacePar
     },
   });
 
-  return workspace;
+  return {
+    ...workspace,
+    id: Number(workspace.id),
+  };
 }
 
 /**
@@ -180,7 +183,10 @@ export async function getWorkspaces(userId: number) {
     ],
   });
 
-  return workspaces;
+  return workspaces.map((w) => ({
+    ...w,
+    id: Number(w.id),
+  }));
 }
 
 /**
@@ -226,7 +232,10 @@ export async function getWorkspaceById(userId: number, workspaceId: number) {
     data: { lastAccessedAt: new Date() },
   });
 
-  return workspace;
+  return {
+    ...workspace,
+    id: Number(workspace.id),
+  };
 }
 
 /**
@@ -298,7 +307,10 @@ export async function updateWorkspace(
     },
   });
 
-  return workspace;
+  return {
+    ...workspace,
+    id: Number(workspace.id),
+  };
 }
 
 /**

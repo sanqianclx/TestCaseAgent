@@ -227,19 +227,20 @@ const ChatRightPanel: React.FC<ChatRightPanelProps> = ({
             </span>
           }
           key="tools"
-          style={{ flex: 1, overflow: 'auto', padding: 8 }}
+          style={{ flex: 1, padding: 8, minHeight: 0 }}
         >
-          {toolEvents.length === 0 ? (
-            <Empty
-              image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description={isRunning ? '等待工具调用...' : '暂无工具调用'}
-              style={{ marginTop: 40 }}
-            />
-          ) : (
-            <List
-              size="small"
-              dataSource={toolEvents}
-              renderItem={(e) => {
+          <div style={{ maxHeight: 'calc(100vh - 180px)', overflowY: 'auto', paddingRight: 4 }}>
+            {toolEvents.length === 0 ? (
+              <Empty
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                description={isRunning ? '等待工具调用...' : '暂无工具调用'}
+                style={{ marginTop: 40 }}
+              />
+            ) : (
+              <List
+                size="small"
+                dataSource={toolEvents}
+                renderItem={(e) => {
                 const isPending = e.status === 'pending';
                 const statusTag = isPending ? (
                   <Tag color="warning" style={{ marginRight: 0, fontSize: 10 }}>待审批</Tag>
@@ -282,9 +283,10 @@ const ChatRightPanel: React.FC<ChatRightPanelProps> = ({
                     )}
                   </List.Item>
                 );
-              }}
-            />
-          )}
+                }}
+              />
+            )}
+          </div>
         </TabPane>
         <TabPane
           tab={

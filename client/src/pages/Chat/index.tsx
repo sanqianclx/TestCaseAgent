@@ -31,6 +31,7 @@ import {
   message,
   Collapse,
   Upload,
+  Select,
 } from 'antd';
 import {
   SendOutlined,
@@ -45,10 +46,13 @@ import {
   PaperClipOutlined,
   InboxOutlined,
   FileTextOutlined,
+  FolderOutlined,
 } from '@ant-design/icons';
 import { useLocation, useNavigate } from 'react-router-dom';
 import apiClient from '../../api/client';
 import * as filesApi from '../../api/files';
+import * as workspacesApi from '../../api/workspaces';
+import type { Workspace } from '../../api/workspaces';
 import MarkdownMessage from '../../components/Common/MarkdownMessage';
 import ChatRightPanel, {
   type ToolEvent,
@@ -97,6 +101,8 @@ const Chat: React.FC = () => {
   const [taskMode, setTaskMode] = useState<'workflow' | 'autonomous'>('autonomous');
   const [selectedFile, setSelectedFile] = useState<any>(null);
   const [currentWorkspaceId, setCurrentWorkspaceId] = useState<number | null>(null);
+  const [workspaceLocked, setWorkspaceLocked] = useState(false);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
 
   // === 附件 / 工具调用 / 预览 都按 sessionId 持久化（在下方） ===
   const [uploading, setUploading] = useState(false);
@@ -178,29 +184,35 @@ const Chat: React.FC = () => {
     [currentSessionId]
   );
   const setPreviewFileId = useCallback(
-    (v: number | null) => {
-      setPreviewBySession((prev) => {
-        if (currentSessionId == null) return prev;
-        return { ...prev, [currentSessionId]: { ...(prev[currentSessionId] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null }), previewFileId: v } };
-      });
+    (v: number | null, forSessionId?: number) => {
+      const sid = forSessionId ?? currentSessionId;
+      if (sid == null) return;
+      setPreviewBySession((prev) => ({
+        ...prev,
+        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null }), previewFileId: v },
+      }));
     },
     [currentSessionId]
   );
   const setPreviewLanguage = useCallback(
-    (v: string | null) => {
-      setPreviewBySession((prev) => {
-        if (currentSessionId == null) return prev;
-        return { ...prev, [currentSessionId]: { ...(prev[currentSessionId] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null }), previewLanguage: v } };
-      });
+    (v: string | null, forSessionId?: number) => {
+      const sid = forSessionId ?? currentSessionId;
+      if (sid == null) return;
+      setPreviewBySession((prev) => ({
+        ...prev,
+        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null }), previewLanguage: v },
+      }));
     },
     [currentSessionId]
   );
   const setActiveTaskId = useCallback(
-    (v: string | null) => {
-      setPreviewBySession((prev) => {
-        if (currentSessionId == null) return prev;
-        return { ...prev, [currentSessionId]: { ...(prev[currentSessionId] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null }), activeTaskId: v } };
-      });
+    (v: string | null, forSessionId?: number) => {
+      const sid = forSessionId ?? currentSessionId;
+      if (sid == null) return;
+      setPreviewBySession((prev) => ({
+        ...prev,
+        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null }), activeTaskId: v },
+      }));
     },
     [currentSessionId]
   );
@@ -231,6 +243,7 @@ const Chat: React.FC = () => {
   // 加载会话列表
   useEffect(() => {
     loadSessions();
+    loadWorkspaces();
   }, []);
 
   // 滚动到底部
@@ -248,6 +261,7 @@ const Chat: React.FC = () => {
         setSelectedFile(state.selectedFile);
         setInputValue(`请为文件 ${state.selectedFile.name} 生成单元测试`);
         setCurrentWorkspaceId(state.workspaceId ? Number(state.workspaceId) : null);
+        setWorkspaceLocked(Boolean(state.workspaceId));
         window.history.replaceState({}, document.title);
       }
       // 从任务页跳转过来：自动选中会话
@@ -272,6 +286,44 @@ const Chat: React.FC = () => {
       console.error('加载会话失败:', e);
     }
   }, []);
+
+  const loadWorkspaces = useCallback(async () => {
+    try {
+      const list = await workspacesApi.getWorkspaces();
+      setWorkspaces(list);
+      if (!currentWorkspaceId) {
+        const defaultWorkspace = list.find((w) => w.isDefault);
+        if (defaultWorkspace && !currentSessionId) setCurrentWorkspaceId(defaultWorkspace.id);
+      }
+    } catch (e) {
+      console.error('加载工作空间失败:', e);
+    }
+  }, [currentSessionId, currentWorkspaceId]);
+
+  const bindWorkspaceToCurrentSession = async (workspaceId: number | null) => {
+    if (isStreaming) return;
+    if (!currentSessionId) {
+      setCurrentWorkspaceId(workspaceId);
+      setWorkspaceLocked(false);
+      return;
+    }
+    if (!workspaceId) {
+      setCurrentWorkspaceId(null);
+      setWorkspaceLocked(false);
+      return;
+    }
+    try {
+      const res = await apiClient.put(`/sessions/${currentSessionId}`, { workspaceId });
+      if (res.data.code === 0) {
+        setCurrentWorkspaceId(workspaceId);
+        setWorkspaceLocked(true);
+        loadSessions();
+        message.success('工作空间已绑定到当前会话');
+      }
+    } catch (e: any) {
+      message.error(e?.response?.data?.message || '绑定工作空间失败');
+    }
+  };
 
   /**
    * 按模式过滤会话
@@ -299,12 +351,14 @@ const Chat: React.FC = () => {
         const res = await apiClient.post('/sessions', {
           title: newSessionTitle.trim(),
           mode: taskMode,
-          workspaceId: currentWorkspaceId ?? undefined,
+          workspaceId: currentWorkspaceId != null ? Number(currentWorkspaceId) : undefined,
         });
       if (res.data.code === 0) {
         const newSession = res.data.data;
         setCurrentSessionId(Number(newSession.id));
-        setCurrentWorkspaceId(newSession.workspace?.id ? Number(newSession.workspace.id) : currentWorkspaceId);
+        const boundWorkspaceId = newSession.workspace?.id ? Number(newSession.workspace.id) : null;
+        setCurrentWorkspaceId(boundWorkspaceId);
+        setWorkspaceLocked(Boolean(boundWorkspaceId));
         setStreamMessages([]);
         setToolEvents([]);
         setPreviewFileId(null);
@@ -332,6 +386,7 @@ const Chat: React.FC = () => {
       if (detailRes.data.code === 0) {
         const wsId = detailRes.data.data.workspace?.id;
         setCurrentWorkspaceId(wsId ? Number(wsId) : null);
+        setWorkspaceLocked(Boolean(wsId));
       }
       const res = await apiClient.get(`/sessions/${sessionId}/messages`);
       if (res.data.code === 0) {
@@ -361,6 +416,7 @@ const Chat: React.FC = () => {
       if (currentSessionId === sessionId) {
         setCurrentSessionId(null);
         setCurrentWorkspaceId(null);
+        setWorkspaceLocked(false);
         setStreamMessages([]);
         setToolEvents([]);
         setPreviewFileId(null);
@@ -384,7 +440,7 @@ const Chat: React.FC = () => {
       try {
         const res = await filesApi.uploadFile(file, {
           sessionId: currentSessionId ?? undefined,
-          workspaceId: currentWorkspaceId ?? undefined,
+          workspaceId: currentWorkspaceId != null ? Number(currentWorkspaceId) : undefined,
           purpose: 'source',
         });
         // 转换 FileInfo → AttachedFile
@@ -448,12 +504,14 @@ const Chat: React.FC = () => {
         const res = await apiClient.post('/sessions', {
           title,
           mode: taskMode,
-          workspaceId: currentWorkspaceId ?? undefined,
+          workspaceId: currentWorkspaceId != null ? Number(currentWorkspaceId) : undefined,
         });
         if (res.data.code === 0) {
           sessionId = Number(res.data.data.id);
           setCurrentSessionId(sessionId);
-          setCurrentWorkspaceId(res.data.data.workspace?.id ? Number(res.data.data.workspace.id) : currentWorkspaceId);
+          const boundWorkspaceId = res.data.data.workspace?.id ? Number(res.data.data.workspace.id) : null;
+          setCurrentWorkspaceId(boundWorkspaceId);
+          setWorkspaceLocked(Boolean(boundWorkspaceId));
         } else {
           message.error('创建会话失败');
           return;
@@ -499,7 +557,7 @@ const Chat: React.FC = () => {
         content,
         mode: taskMode,
         sessionId,
-        workspaceId: currentWorkspaceId ?? undefined,
+        workspaceId: currentWorkspaceId != null ? Number(currentWorkspaceId) : undefined,
         fileIds: attachments.map((a) => a.id),
       };
 
@@ -635,7 +693,7 @@ const Chat: React.FC = () => {
           answer: answer || '',
           taskId: event.taskId,
           sessionId: currentSessionId,
-          workspaceId: currentWorkspaceId ?? undefined,
+          workspaceId: currentWorkspaceId != null ? Number(currentWorkspaceId) : undefined,
           sourceFile: selectedFile?.name || attachments[0]?.originalName,
           language:
             selectedFile?.language ||
@@ -646,7 +704,7 @@ const Chat: React.FC = () => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
       // 直接传入新 assistant ID，resume 流的文本就追加到这里
-      await consumeStream(response, newAssistantId, currentSessionId);
+      await consumeStream(response, newAssistantId, currentSessionId!);
     } catch (err: any) {
       message.error(err.message || '继续执行失败');
       setIsStreaming(false);
@@ -703,7 +761,7 @@ const Chat: React.FC = () => {
             taskId: ev.taskId,
             status: 'pending',
           };
-          if (ev.taskId) setActiveTaskId(ev.taskId);
+          if (ev.taskId) setActiveTaskId(ev.taskId, sessionId);
           setToolEvents((prev) => [...prev, pendingTool]);
           setStreamMessages((prev) =>
             prev.map((m) => (m.id === assistantId ? { ...m, isStreaming: false } : m))
@@ -712,8 +770,8 @@ const Chat: React.FC = () => {
           setCurrentStep('⏸️ 等待你在右侧面板批准/拒绝...');
           setProgress((prev) => Math.max(prev, 60));
         } else if (eventType === 'complete') {
-          if (ev.taskId) setActiveTaskId(ev.taskId);
-          if (ev.previewFileId) setPreviewFileId(ev.previewFileId);
+          if (ev.taskId) setActiveTaskId(ev.taskId, sessionId);
+          if (ev.previewFileId) setPreviewFileId(ev.previewFileId, sessionId);
           if (ev.testCode && !fullAssistantText.includes(ev.testCode)) {
             const codeBlock = '\n\n```' + (previewLanguage || 'python') + '\n' + ev.testCode + '\n```\n';
             fullAssistantText += codeBlock;
@@ -979,6 +1037,11 @@ const Chat: React.FC = () => {
                   {a.originalName}
                 </Tag>
               ))}
+              {currentWorkspaceId && (
+                <Tag color="green" icon={<FolderOutlined />}>
+                  {workspaces.find((w) => w.id === currentWorkspaceId)?.name || '工作空间'}
+                </Tag>
+              )}
             </Space>
           </div>
 
@@ -1143,6 +1206,31 @@ const Chat: React.FC = () => {
                       children: (
                         <div style={{ padding: '4px 0', minWidth: 480 }}>
                           <Space direction="vertical" size="small" style={{ width: '100%' }}>
+                            <div>
+                              <Text
+                                type="secondary"
+                                style={{ fontSize: 12, display: 'block', marginBottom: 4 }}
+                              >
+                                <FolderOutlined /> 会话工作空间
+                              </Text>
+                              <Select
+                                allowClear={!currentSessionId}
+                                placeholder={currentSessionId ? '本会话尚未绑定工作空间' : '选择本会话绑定的工作空间'}
+                                value={currentWorkspaceId ?? undefined}
+                                disabled={isStreaming || !!currentSessionId}
+                                onChange={(v) => bindWorkspaceToCurrentSession(v ?? null)}
+                                style={{ width: '100%' }}
+                                options={workspaces.map((w) => ({
+                                  value: w.id,
+                                  label: `${w.name}${w.isDefault ? '（默认）' : ''}`,
+                                }))}
+                              />
+                              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
+                                {currentSessionId
+                                  ? '会话创建后即锁定工作空间（已创建但未绑定可新建会话绑定）。'
+                                  : '新建会话时可绑定工作空间；绑定后如需更换，请新建会话。'}
+                              </Text>
+                            </div>
                             {attachments.length > 0 && (
                               <div>
                                 <Text

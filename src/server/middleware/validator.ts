@@ -258,6 +258,7 @@ export const createSessionSchema = z.object({
 export const updateSessionSchema = z.object({
   title: z.string().max(200).optional(),
   status: z.enum(['active', 'archived']).optional(),
+  workspaceId: z.number().int().positive().optional(),
   modelConfig: z.object({
     provider: z.string().optional(),
     model: z.string().optional(),
