@@ -196,14 +196,15 @@ export async function authenticate(
 ): Promise<void> {
   const apiKey = req.headers['x-api-key'] as string;
   const authorization = req.headers.authorization;
+  const accessTokenCookie = req.cookies?.['tg_access_token'];
 
   // 优先使用 API Key
   if (apiKey) {
     return authenticateApiKey(req, res, next);
   }
 
-  // 其次使用 JWT Token
-  if (authorization) {
+  // 其次使用 JWT Token（Header 或 Cookie）
+  if (authorization || accessTokenCookie) {
     return authenticateToken(req, res, next);
   }
 

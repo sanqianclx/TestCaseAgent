@@ -32,6 +32,7 @@ import {
   Collapse,
   Upload,
   Select,
+  Steps,
 } from 'antd';
 import {
   SendOutlined,
@@ -44,13 +45,13 @@ import {
   DeleteOutlined,
   MessageOutlined,
   PaperClipOutlined,
-  InboxOutlined,
   FileTextOutlined,
   FolderOutlined,
 } from '@ant-design/icons';
 import { useLocation, useNavigate } from 'react-router-dom';
 import apiClient from '../../api/client';
 import * as filesApi from '../../api/files';
+import * as sessionsApi from '../../api/sessions';
 import * as workspacesApi from '../../api/workspaces';
 import type { Workspace } from '../../api/workspaces';
 import MarkdownMessage from '../../components/Common/MarkdownMessage';
@@ -88,6 +89,55 @@ interface AttachedFile {
   language: string | null;
   size: number;
 }
+
+interface WorkflowLogEntry {
+  id: string;
+  step: string;
+  message: string;
+  progress: number;
+  type: 'progress' | 'complete' | 'error';
+  at: string;
+}
+
+interface WorkflowSessionState {
+  input: string;
+  logs: WorkflowLogEntry[];
+  progress: number;
+  currentStep: string;
+  status: 'idle' | 'running' | 'success' | 'error';
+  outputDir: string | null;
+  previewFileId: number | null;
+  error: string | null;
+}
+
+const WORKFLOW_STEP_TITLES: Record<string, string> = {
+  init: '初始化',
+  parse: '读取与解析',
+  design: '设计用例',
+  exportPlan: '导出测试计划',
+  generate: '生成测试代码',
+  execute: '执行测试',
+  heal: '自愈修复',
+  export: '导出结果',
+  workflow: '执行工作流',
+  register: '登记产物',
+  complete: '完成',
+  error: '失败',
+};
+
+const WORKFLOW_STEP_ORDER = [
+  'init',
+  'parse',
+  'design',
+  'exportPlan',
+  'generate',
+  'execute',
+  'heal',
+  'export',
+  'workflow',
+  'register',
+  'complete',
+];
 
 /**
  * 聊天页面
@@ -128,6 +178,18 @@ const Chat: React.FC = () => {
 
   // === 右侧面板：所有数据按 sessionId 分组存到 localStorage，刷新/切换会话不丢 ===
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
+  const [rightPanelWidth, setRightPanelWidth] = useState(420);
+  const [isResizingPanel, setIsResizingPanel] = useState(false);
+  const [workflowStateBySession, setWorkflowStateBySession] = useState<
+    Record<number, WorkflowSessionState>
+  >(() => {
+    try {
+      const raw = localStorage.getItem('chat:workflow:state');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
 
   // 当前会话的工具事件
   const [toolEventsBySession, setToolEventsBySession] = useState<
@@ -142,7 +204,7 @@ const Chat: React.FC = () => {
   });
   // 当前会话的预览
   const [previewBySession, setPreviewBySession] = useState<
-    Record<number, { previewFileId: number | null; previewLanguage: string | null; activeTaskId: string | null }>
+    Record<number, { previewFileId: number | null; previewLanguage: string | null; activeTaskId: string | null; previewCode: string | null }>
   >(() => {
     try {
       const raw = localStorage.getItem('chat:right:all-previews');
@@ -162,13 +224,68 @@ const Chat: React.FC = () => {
       return {};
     }
   });
+  const [outputEntriesBySession, setOutputEntriesBySession] = useState<
+    Record<number, sessionsApi.SessionOutputEntry[]>
+  >(() => {
+    try {
+      const raw = localStorage.getItem('chat:right:output-entries');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [outputDirBySession, setOutputDirBySession] = useState<Record<number, string | null>>(() => {
+    try {
+      const raw = localStorage.getItem('chat:right:output-dir');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [currentOutputPathBySession, setCurrentOutputPathBySession] = useState<Record<number, string>>(() => {
+    try {
+      const raw = localStorage.getItem('chat:right:output-current-path');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [parentOutputPathBySession, setParentOutputPathBySession] = useState<Record<number, string | null>>(() => {
+    try {
+      const raw = localStorage.getItem('chat:right:output-parent-path');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [selectedOutputFilePathBySession, setSelectedOutputFilePathBySession] = useState<Record<number, string | null>>(() => {
+    try {
+      const raw = localStorage.getItem('chat:right:selected-output-file');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
   // 派生当前会话的数据
   const toolEvents = currentSessionId != null ? toolEventsBySession[currentSessionId] || [] : [];
   const currentPreview = currentSessionId != null ? previewBySession[currentSessionId] : undefined;
   const previewFileId = currentPreview?.previewFileId ?? null;
   const previewLanguage = currentPreview?.previewLanguage ?? 'python';
   const activeTaskId = currentPreview?.activeTaskId ?? null;
+  const previewCode = currentPreview?.previewCode ?? null;
   const attachments = currentSessionId != null ? attachmentsBySession[currentSessionId] || [] : [];
+  const outputEntries = currentSessionId != null ? outputEntriesBySession[currentSessionId] || [] : [];
+  const outputDir = currentSessionId != null ? outputDirBySession[currentSessionId] ?? null : null;
+  const currentOutputPath = currentSessionId != null ? currentOutputPathBySession[currentSessionId] || '/' : '/';
+  const parentOutputPath = currentSessionId != null ? parentOutputPathBySession[currentSessionId] ?? null : null;
+  const selectedOutputFilePath = currentSessionId != null ? selectedOutputFilePathBySession[currentSessionId] ?? null : null;
+  const currentWorkflowState =
+    currentSessionId != null ? workflowStateBySession[currentSessionId] : undefined;
+  const currentSessionMode =
+    currentSessionId != null
+      ? sessions.find((s) => s.id === currentSessionId)?.mode || taskMode
+      : taskMode;
+  const isWorkflowSession = currentSessionMode === 'workflow';
 
   // 包装 setXxxBySession：把单会话更新写到对应 map
   const setToolEvents = useCallback(
@@ -189,7 +306,7 @@ const Chat: React.FC = () => {
       if (sid == null) return;
       setPreviewBySession((prev) => ({
         ...prev,
-        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null }), previewFileId: v },
+        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null, previewCode: null }), previewFileId: v },
       }));
     },
     [currentSessionId]
@@ -200,7 +317,7 @@ const Chat: React.FC = () => {
       if (sid == null) return;
       setPreviewBySession((prev) => ({
         ...prev,
-        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null }), previewLanguage: v },
+        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null, previewCode: null }), previewLanguage: v },
       }));
     },
     [currentSessionId]
@@ -211,7 +328,18 @@ const Chat: React.FC = () => {
       if (sid == null) return;
       setPreviewBySession((prev) => ({
         ...prev,
-        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null }), activeTaskId: v },
+        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null, previewCode: null }), activeTaskId: v },
+      }));
+    },
+    [currentSessionId]
+  );
+  const setPreviewCode = useCallback(
+    (v: string | null, forSessionId?: number) => {
+      const sid = forSessionId ?? currentSessionId;
+      if (sid == null) return;
+      setPreviewBySession((prev) => ({
+        ...prev,
+        [sid]: { ...(prev[sid] || { previewFileId: null, previewLanguage: 'python', activeTaskId: null, previewCode: null }), previewCode: v },
       }));
     },
     [currentSessionId]
@@ -227,6 +355,56 @@ const Chat: React.FC = () => {
     },
     [currentSessionId]
   );
+  const setSessionOutputState = useCallback(
+    (
+      sessionId: number,
+      data: {
+        outputDir: string;
+        currentPath: string;
+        parentPath: string | null;
+        files: sessionsApi.SessionOutputEntry[];
+      }
+    ) => {
+      setOutputEntriesBySession((prev) => ({ ...prev, [sessionId]: data.files }));
+      setOutputDirBySession((prev) => ({ ...prev, [sessionId]: data.outputDir }));
+      setCurrentOutputPathBySession((prev) => ({ ...prev, [sessionId]: data.currentPath }));
+      setParentOutputPathBySession((prev) => ({ ...prev, [sessionId]: data.parentPath }));
+      setSelectedOutputFilePathBySession((prev) => {
+        const existingSelected = prev[sessionId] ?? null;
+        const hasExisting = existingSelected != null && data.files.some((file) => file.type === 'file' && file.path === existingSelected);
+        const fallback = data.files.find((file) => file.type === 'file')?.path ?? null;
+        return {
+          ...prev,
+          [sessionId]: hasExisting ? existingSelected : fallback,
+        };
+      });
+    },
+    []
+  );
+  const setSelectedOutputFilePath = useCallback(
+    (sessionId: number, filePath: string | null) => {
+      setSelectedOutputFilePathBySession((prev) => ({
+        ...prev,
+        [sessionId]: filePath,
+      }));
+    },
+    []
+  );
+  const updateWorkflowState = useCallback(
+    (
+      sessionId: number,
+      updater: WorkflowSessionState | ((prev: WorkflowSessionState | undefined) => WorkflowSessionState)
+    ) => {
+      setWorkflowStateBySession((prev) => ({
+        ...prev,
+        [sessionId]:
+          typeof updater === 'function'
+            ? (updater as (prev: WorkflowSessionState | undefined) => WorkflowSessionState)(prev[sessionId])
+            : updater,
+      }));
+    },
+    []
+  );
   // 写回 localStorage（任何 map 变化都同步）
   useEffect(() => {
     try { localStorage.setItem('chat:right:all-tools', JSON.stringify(toolEventsBySession)); } catch { /* ignore */ }
@@ -237,6 +415,24 @@ const Chat: React.FC = () => {
   useEffect(() => {
     try { localStorage.setItem('chat:right:all-attachments', JSON.stringify(attachmentsBySession)); } catch { /* ignore */ }
   }, [attachmentsBySession]);
+  useEffect(() => {
+    try { localStorage.setItem('chat:right:output-entries', JSON.stringify(outputEntriesBySession)); } catch { /* ignore */ }
+  }, [outputEntriesBySession]);
+  useEffect(() => {
+    try { localStorage.setItem('chat:right:output-dir', JSON.stringify(outputDirBySession)); } catch { /* ignore */ }
+  }, [outputDirBySession]);
+  useEffect(() => {
+    try { localStorage.setItem('chat:right:output-current-path', JSON.stringify(currentOutputPathBySession)); } catch { /* ignore */ }
+  }, [currentOutputPathBySession]);
+  useEffect(() => {
+    try { localStorage.setItem('chat:right:output-parent-path', JSON.stringify(parentOutputPathBySession)); } catch { /* ignore */ }
+  }, [parentOutputPathBySession]);
+  useEffect(() => {
+    try { localStorage.setItem('chat:right:selected-output-file', JSON.stringify(selectedOutputFilePathBySession)); } catch { /* ignore */ }
+  }, [selectedOutputFilePathBySession]);
+  useEffect(() => {
+    try { localStorage.setItem('chat:workflow:state', JSON.stringify(workflowStateBySession)); } catch { /* ignore */ }
+  }, [workflowStateBySession]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -250,6 +446,31 @@ const Chat: React.FC = () => {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [streamMessages, isStreaming]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!isResizingPanel) return;
+    const handleMove = (event: MouseEvent) => {
+      const nextWidth = window.innerWidth - event.clientX;
+      setRightPanelWidth(Math.max(320, Math.min(860, nextWidth)));
+    };
+    const handleUp = () => setIsResizingPanel(false);
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+  }, [isResizingPanel]);
+
+  const loadSessionOutputFiles = useCallback(async (sessionId: number, pathArg?: string) => {
+    try {
+      const response = await sessionsApi.getSessionOutputFiles(sessionId, pathArg);
+      setSessionOutputState(sessionId, response);
+    } catch (e) {
+      console.error('加载会话输出目录失败:', e);
+    }
+  }, [setSessionOutputState]);
 
   /**
    * 接收从 Workspaces 跳过来的选中文件
@@ -362,9 +583,14 @@ const Chat: React.FC = () => {
         setStreamMessages([]);
         setToolEvents([]);
         setPreviewFileId(null);
+        setPreviewCode(null);
         setError(null);
         setSelectedFile(null);
         setAttachments([]);
+        setOutputEntriesBySession((prev) => ({ ...prev, [Number(newSession.id)]: [] }));
+        setCurrentOutputPathBySession((prev) => ({ ...prev, [Number(newSession.id)]: '/' }));
+        setParentOutputPathBySession((prev) => ({ ...prev, [Number(newSession.id)]: null }));
+        setSelectedOutputFilePathBySession((prev) => ({ ...prev, [Number(newSession.id)]: null }));
         setNewSessionModal(false);
         loadSessions();
         message.success('会话已创建');
@@ -398,8 +624,12 @@ const Chat: React.FC = () => {
           createdAt: m.createdAt,
         }));
         setStreamMessages(msgs);
-        setToolEvents([]);
-        setPreviewFileId(null);
+        const sessionPreview = previewBySession[sessionId];
+        setPreviewFileId(sessionPreview?.previewFileId ?? null, sessionId);
+        setPreviewLanguage(sessionPreview?.previewLanguage ?? 'python', sessionId);
+        setActiveTaskId(sessionPreview?.activeTaskId ?? null, sessionId);
+        setPreviewCode(sessionPreview?.previewCode ?? null, sessionId);
+        await loadSessionOutputFiles(sessionId);
       }
     } catch (e) {
       message.error('加载消息失败');
@@ -418,8 +648,38 @@ const Chat: React.FC = () => {
         setCurrentWorkspaceId(null);
         setWorkspaceLocked(false);
         setStreamMessages([]);
-        setToolEvents([]);
         setPreviewFileId(null);
+        setPreviewCode(null);
+        setOutputEntriesBySession((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
+        setOutputDirBySession((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
+        setCurrentOutputPathBySession((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
+        setParentOutputPathBySession((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
+        setSelectedOutputFilePathBySession((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
+        setWorkflowStateBySession((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
       }
       loadSessions();
     } catch (e) {
@@ -473,8 +733,11 @@ const Chat: React.FC = () => {
    * 重置实时面板（开始新一次执行时）
    */
   const resetLivePanel = () => {
-    setToolEvents([]);
+    if (taskMode === 'autonomous') {
+      setToolEvents([]);
+    }
     setPreviewFileId(null);
+    setPreviewCode(null);
     setActiveTaskId(null);
     setProgress(0);
     setCurrentStep('准备调用 AI...');
@@ -486,6 +749,7 @@ const Chat: React.FC = () => {
   const handleStreamSend = async () => {
     const content = inputValue.trim();
     if (!content || isStreaming) return;
+    const isWorkflowRequest = taskMode === 'workflow';
 
     setInputValue('');
     setError(null);
@@ -525,31 +789,42 @@ const Chat: React.FC = () => {
     // 保存用户消息
     saveMessageToServer(sessionId, 'user', content);
 
-    // 用户消息加到 UI
-    const userMsg: StreamMessage = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content,
-      createdAt: new Date().toISOString(),
-    };
-    setStreamMessages((prev) => [...prev, userMsg]);
-
-    // 占位 Assistant
-    const assistantId = `assistant-${Date.now()}`;
-    setStreamMessages((prev) => [
-      ...prev,
-      {
-        id: assistantId,
-        role: 'assistant',
-        content: '',
-        isStreaming: true,
+    let assistantId = '';
+    if (!isWorkflowRequest) {
+      const userMsg: StreamMessage = {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content,
         createdAt: new Date().toISOString(),
-      },
-    ]);
+      };
+      setStreamMessages((prev) => [...prev, userMsg]);
+      assistantId = `assistant-${Date.now()}`;
+      setStreamMessages((prev) => [
+        ...prev,
+        {
+          id: assistantId,
+          role: 'assistant',
+          content: '',
+          isStreaming: true,
+          createdAt: new Date().toISOString(),
+        },
+      ]);
+    } else {
+      updateWorkflowState(sessionId, {
+        input: content,
+        logs: [],
+        progress: 5,
+        currentStep: '准备调用 Workflow...',
+        status: 'running',
+        outputDir: null,
+        previewFileId: null,
+        error: null,
+      });
+    }
 
     setIsStreaming(true);
     setProgress(5);
-    setCurrentStep('准备调用 AI...');
+    setCurrentStep(isWorkflowRequest ? '准备调用 Workflow...' : '准备调用 AI...');
 
     try {
       // 构造请求体
@@ -560,6 +835,13 @@ const Chat: React.FC = () => {
         workspaceId: currentWorkspaceId != null ? Number(currentWorkspaceId) : undefined,
         fileIds: attachments.map((a) => a.id),
       };
+
+      if (currentWorkspaceId) {
+        const currentWorkspace = workspaces.find((w) => w.id === currentWorkspaceId);
+        if (currentWorkspace?.basePath) {
+          requestData.outputDir = currentWorkspace.basePath;
+        }
+      }
 
       if (taskMode === 'workflow' && (selectedFile || attachments[0])) {
         const srcName = selectedFile?.name || attachments[0].originalName;
@@ -584,17 +866,132 @@ const Chat: React.FC = () => {
         throw new Error(`HTTP ${response.status}`);
       }
 
-      // 复用统一的 SSE 消费器
-      await consumeStream(response, assistantId, sessionId);
+      if (isWorkflowRequest) {
+        await consumeWorkflowStream(response, sessionId);
+      } else {
+        await consumeStream(response, assistantId, sessionId);
+      }
 
       setSelectedFile(null);
       // 不清空 attachments，方便继续追问
+      await loadSessionOutputFiles(sessionId);
       loadSessions();
     } catch (err: any) {
       console.error('流式请求失败:', err);
       setError(err.message);
       setIsStreaming(false);
     }
+  };
+
+  const consumeWorkflowStream = async (response: Response, sessionId: number) => {
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    if (!reader) {
+      throw new Error('Workflow 响应流不可用');
+    }
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value);
+      const chunks = buffer.split('\n\n');
+      buffer = chunks.pop() || '';
+
+      for (const line of chunks) {
+        const eventMatch = line.match(/^event: (.+)$/m);
+        const dataMatch = line.match(/^data: (.+)$/m);
+        if (!eventMatch || !dataMatch) continue;
+        const eventType = eventMatch[1];
+        let ev: any = {};
+        try { ev = JSON.parse(dataMatch[1]); } catch { continue; }
+
+        if (eventType === 'progress') {
+          const nextProgress = typeof ev.progress === 'number' ? ev.progress : 0;
+          const nextStep = ev.step || 'workflow';
+          const nextMessage = ev.message || '';
+          setProgress(nextProgress);
+          setCurrentStep(nextMessage);
+          updateWorkflowState(sessionId, (prev) => ({
+            input: prev?.input || '',
+            logs: [
+              ...(prev?.logs || []),
+              {
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                step: nextStep,
+                message: nextMessage,
+                progress: nextProgress,
+                type: 'progress',
+                at: new Date().toISOString(),
+              },
+            ],
+            progress: nextProgress,
+            currentStep: nextMessage,
+            status: 'running',
+            outputDir: prev?.outputDir ?? null,
+            previewFileId: prev?.previewFileId ?? null,
+            error: null,
+          }));
+        } else if (eventType === 'complete') {
+          setProgress(100);
+          setCurrentStep('✅ Workflow 执行完成');
+          if (typeof ev.previewFileId === 'number') {
+            setPreviewFileId(ev.previewFileId, sessionId);
+          }
+          if (ev.testCode) {
+            setPreviewCode(ev.testCode, sessionId);
+          }
+          updateWorkflowState(sessionId, (prev) => ({
+            input: prev?.input || '',
+            logs: [
+              ...(prev?.logs || []),
+              {
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                step: 'complete',
+                message: 'Workflow 已完成，产物已写入输出目录',
+                progress: 100,
+                type: 'complete',
+                at: new Date().toISOString(),
+              },
+            ],
+            progress: 100,
+            currentStep: '✅ Workflow 执行完成',
+            status: 'success',
+            outputDir: ev.outputDir || prev?.outputDir || null,
+            previewFileId: typeof ev.previewFileId === 'number' ? ev.previewFileId : prev?.previewFileId ?? null,
+            error: null,
+          }));
+          await loadSessionOutputFiles(sessionId);
+          loadSessions();
+        } else if (eventType === 'error') {
+          setError(ev.message || 'Workflow 执行失败');
+          updateWorkflowState(sessionId, (prev) => ({
+            input: prev?.input || '',
+            logs: [
+              ...(prev?.logs || []),
+              {
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                step: 'error',
+                message: ev.message || 'Workflow 执行失败',
+                progress: prev?.progress || 0,
+                type: 'error',
+                at: new Date().toISOString(),
+              },
+            ],
+            progress: prev?.progress || 0,
+            currentStep: '执行出错',
+            status: 'error',
+            outputDir: prev?.outputDir ?? null,
+            previewFileId: prev?.previewFileId ?? null,
+            error: ev.message || 'Workflow 执行失败',
+          }));
+        }
+      }
+    }
+
+    setIsStreaming(false);
+    await loadSessionOutputFiles(sessionId);
+    loadSessions();
   };
 
   const saveMessageToServer = async (
@@ -705,6 +1102,7 @@ const Chat: React.FC = () => {
 
       // 直接传入新 assistant ID，resume 流的文本就追加到这里
       await consumeStream(response, newAssistantId, currentSessionId!);
+      await loadSessionOutputFiles(currentSessionId!);
     } catch (err: any) {
       message.error(err.message || '继续执行失败');
       setIsStreaming(false);
@@ -745,6 +1143,42 @@ const Chat: React.FC = () => {
             );
           } else if (subType === 'tool' || subType === 'tool-result') {
             setToolEvents((prev) => [...prev, { step: ev.step, message: ev.message || '', at: Date.now() }]);
+            const toolName = ev?.data?.toolName || '';
+            const toolResult = ev?.data?.result;
+            const toolArgs = ev?.data?.args;
+            const outputPath =
+              ev?.data?.filePath ||
+              toolResult?.file_path ||
+              toolResult?.filePath ||
+              toolResult?.path ||
+              toolArgs?.path ||
+              toolArgs?.filePath;
+            const outputContent =
+              ev?.data?.content ||
+              toolResult?.content ||
+              toolArgs?.content;
+            if (
+              subType === 'tool-result' &&
+              (toolName === 'writeFile' || toolName === 'write-file') &&
+              typeof outputContent === 'string' &&
+              outputContent.trim()
+            ) {
+              setPreviewCode(outputContent, sessionId);
+              if (typeof ev?.data?.registeredFileId === 'number') {
+                setPreviewFileId(ev.data.registeredFileId, sessionId);
+                void loadSessionOutputFiles(sessionId);
+              }
+              if (typeof outputPath === 'string' && outputPath) {
+                const ext = outputPath.split('.').pop()?.toLowerCase();
+                const lang =
+                  ext === 'py' ? 'python' :
+                  ext === 'java' ? 'java' :
+                  ext === 'cpp' || ext === 'cc' || ext === 'cxx' || ext === 'c' ? 'cpp' :
+                  previewLanguage || 'python';
+                setPreviewLanguage(lang, sessionId);
+                setCurrentStep(`已捕捉生成文件：${outputPath.split(/[\\\\/]/).pop() || outputPath}`);
+              }
+            }
           } else {
           }
         } else if (eventType === 'ask') {
@@ -772,8 +1206,15 @@ const Chat: React.FC = () => {
         } else if (eventType === 'complete') {
           if (ev.taskId) setActiveTaskId(ev.taskId, sessionId);
           if (ev.previewFileId) setPreviewFileId(ev.previewFileId, sessionId);
+          if (ev.testCode) setPreviewCode(ev.testCode, sessionId);
+          void loadSessionOutputFiles(sessionId);
+          if (ev.outputDir && !ev.previewFileId && ev.testCode) {
+            setCurrentStep(`✅ 完成，产物目录：${ev.outputDir}`);
+          }
           if (ev.testCode && !fullAssistantText.includes(ev.testCode)) {
-            const codeBlock = '\n\n```' + (previewLanguage || 'python') + '\n' + ev.testCode + '\n```\n';
+            const lang = ev.previewLanguage || ev.language || previewLanguage || 'python';
+            setPreviewLanguage(lang, sessionId);
+            const codeBlock = '\n\n```' + lang + '\n' + ev.testCode + '\n```\n';
             fullAssistantText += codeBlock;
             setStreamMessages((prev) => prev.map((m) => m.id === assistantId ? { ...m, content: m.content + codeBlock, isStreaming: false } : m));
           } else {
@@ -790,6 +1231,7 @@ const Chat: React.FC = () => {
       }
     }
     setIsStreaming(false);
+    await loadSessionOutputFiles(sessionId);
     loadSessions();
   };
 
@@ -859,6 +1301,128 @@ const Chat: React.FC = () => {
       </div>
     );
   };
+
+  const renderWorkflowContent = () => {
+    const logs = currentWorkflowState?.logs || [];
+    const latestStepKey =
+      logs.length > 0 ? logs[logs.length - 1].step : currentWorkflowState?.status === 'success' ? 'complete' : 'init';
+    const currentStepIndex = Math.max(WORKFLOW_STEP_ORDER.indexOf(latestStepKey), 0);
+    const seenSteps = new Set(logs.map((log) => log.step));
+
+    return (
+      <div
+        style={{
+          flex: 1,
+          overflow: 'auto',
+          padding: 20,
+          minHeight: 0,
+        }}
+      >
+        {!currentSessionId ? (
+          <div
+            style={{
+              height: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexDirection: 'column',
+            }}
+          >
+            <ThunderboltOutlined style={{ fontSize: 80, color: '#d9d9d9' }} />
+            <Text type="secondary" style={{ marginTop: 16, fontSize: 16 }}>
+              选择 Workflow 会话或新建会话
+            </Text>
+          </div>
+        ) : (
+          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+            {currentWorkflowState?.input ? (
+              <div style={{ background: '#fff', border: '1px solid #f0f0f0', borderRadius: 8, padding: 14 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>本次请求</Text>
+                <div style={{ marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 14 }}>
+                  {currentWorkflowState.input}
+                </div>
+              </div>
+            ) : null}
+
+            <div style={{ background: '#fff', border: '1px solid #f0f0f0', borderRadius: 8, padding: 16 }}>
+              <Steps
+                direction="vertical"
+                size="small"
+                current={currentWorkflowState?.status === 'success' ? WORKFLOW_STEP_ORDER.length - 1 : currentStepIndex}
+                items={WORKFLOW_STEP_ORDER.map((stepKey, index) => {
+                  const matched = [...logs].reverse().find((log) => log.step === stepKey);
+                  const status =
+                    stepKey === 'error'
+                      ? currentWorkflowState?.status === 'error'
+                        ? 'error'
+                        : 'wait'
+                      : matched
+                      ? matched.type === 'error'
+                        ? 'error'
+                        : index < currentStepIndex || currentWorkflowState?.status === 'success'
+                        ? 'finish'
+                        : currentWorkflowState?.status === 'running' && index === currentStepIndex
+                        ? 'process'
+                        : 'finish'
+                      : currentWorkflowState?.status === 'running' && index === currentStepIndex
+                      ? 'process'
+                      : 'wait';
+
+                  return {
+                    title: WORKFLOW_STEP_TITLES[stepKey] || stepKey,
+                    description: matched?.message || '',
+                    status,
+                  };
+                })}
+              />
+            </div>
+
+            <div style={{ background: '#fff', border: '1px solid #f0f0f0', borderRadius: 8, padding: 16 }}>
+              <Text strong style={{ display: 'block', marginBottom: 12 }}>执行日志</Text>
+              {logs.length === 0 ? (
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无流水线记录" />
+              ) : (
+                <List
+                  size="small"
+                  dataSource={logs}
+                  renderItem={(log) => (
+                    <List.Item style={{ paddingInline: 0 }}>
+                      <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                        <Space size={8}>
+                          <Tag color={log.type === 'error' ? 'error' : log.type === 'complete' ? 'success' : 'processing'}>
+                            {WORKFLOW_STEP_TITLES[log.step] || log.step}
+                          </Tag>
+                          <Text type="secondary" style={{ fontSize: 12 }}>
+                            {new Date(log.at).toLocaleTimeString()}
+                          </Text>
+                        </Space>
+                        <Text style={{ fontSize: 13 }}>{log.message}</Text>
+                      </Space>
+                    </List.Item>
+                  )}
+                />
+              )}
+            </div>
+
+            {currentWorkflowState?.outputDir ? (
+              <div style={{ background: '#fff', border: '1px solid #f0f0f0', borderRadius: 8, padding: 14 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>输出目录</Text>
+                <div style={{ marginTop: 6, fontSize: 14 }}>{currentWorkflowState.outputDir}</div>
+              </div>
+            ) : null}
+          </Space>
+        )}
+      </div>
+    );
+  };
+
+  const rightPanelEvents = isWorkflowSession
+    ? (currentWorkflowState?.logs || []).map((log) => ({
+        step: log.step,
+        message: log.message,
+        at: new Date(log.at).getTime(),
+      }))
+    : toolEvents;
 
   return (
     <>
@@ -1068,49 +1632,66 @@ const Chat: React.FC = () => {
           )}
 
           {/* 错误 */}
-          {error && (
+          {(error || currentWorkflowState?.error) && (
             <Alert
               message="执行错误"
-              description={error}
+              description={currentWorkflowState?.error || error}
               type="error"
               closable
-              onClose={() => setError(null)}
+              onClose={() => {
+                setError(null);
+                if (currentSessionId != null && currentWorkflowState?.error) {
+                  updateWorkflowState(currentSessionId, (prev) => ({
+                    input: prev?.input || '',
+                    logs: prev?.logs || [],
+                    progress: prev?.progress || 0,
+                    currentStep: prev?.currentStep || '',
+                    status: prev?.status || 'idle',
+                    outputDir: prev?.outputDir ?? null,
+                    previewFileId: prev?.previewFileId ?? null,
+                    error: null,
+                  }));
+                }
+              }}
               style={{ margin: 8 }}
             />
           )}
 
-          {/* 消息列表 */}
-          <div
-            style={{
-              flex: 1,
-              overflow: 'auto',
-              padding: 20,
-              minHeight: 0,
-            }}
-          >
-            {streamMessages.length === 0 ? (
-              <div
-                style={{
-                  height: '100%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  flexDirection: 'column',
-                }}
-              >
-                <MessageOutlined style={{ fontSize: 80, color: '#d9d9d9' }} />
-                <Text type="secondary" style={{ marginTop: 16, fontSize: 16 }}>
-                  {currentSessionId ? '该会话暂无消息' : '选择左侧会话或新建会话'}
-                </Text>
-                <Text type="secondary" style={{ marginTop: 8, fontSize: 12 }}>
-                  支持拖拽文件、点击上传，或直接粘贴文件
-                </Text>
-              </div>
-            ) : (
-              streamMessages.map(renderMessage)
-            )}
-            <div ref={messagesEndRef} />
-          </div>
+          {isWorkflowSession ? (
+            renderWorkflowContent()
+          ) : (
+            <div
+              style={{
+                flex: 1,
+                overflow: 'auto',
+                padding: 20,
+                minHeight: 0,
+              }}
+            >
+              {streamMessages.length === 0 ? (
+                <div
+                  style={{
+                    height: '100%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    flexDirection: 'column',
+                  }}
+                >
+                  <MessageOutlined style={{ fontSize: 80, color: '#d9d9d9' }} />
+                  <Text type="secondary" style={{ marginTop: 16, fontSize: 16 }}>
+                    {currentSessionId ? '该会话暂无消息' : '选择左侧会话或新建会话'}
+                  </Text>
+                  <Text type="secondary" style={{ marginTop: 8, fontSize: 12 }}>
+                    支持拖拽文件、点击上传，或直接粘贴文件
+                  </Text>
+                </div>
+              ) : (
+                streamMessages.map(renderMessage)
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+          )}
 
           {/* 输入区 */}
           <div
@@ -1172,22 +1753,6 @@ const Chat: React.FC = () => {
                     上传
                   </Button>
                 </Upload>
-                <Upload.Dragger
-                  showUploadList={false}
-                  beforeUpload={(file) => {
-                    handleUploadFile(file);
-                    return false;
-                  }}
-                  style={{ display: 'none' }}
-                />
-                <Button
-                  size="small"
-                  icon={<InboxOutlined />}
-                  disabled={isStreaming}
-                  title="也可直接拖拽文件到上方输入框"
-                >
-                  拖拽
-                </Button>
               </Space>
 
               <Space size={4} wrap>
@@ -1291,17 +1856,51 @@ const Chat: React.FC = () => {
         </Content>
 
         {/* 右侧实时面板 */}
+        {!rightPanelCollapsed && (
+          <div
+            onMouseDown={() => setIsResizingPanel(true)}
+            style={{
+              width: 6,
+              cursor: 'col-resize',
+              background: isResizingPanel ? '#91caff' : 'transparent',
+              transition: 'background 0.15s ease',
+              flexShrink: 0,
+            }}
+          />
+        )}
         <ChatRightPanel
           collapsed={rightPanelCollapsed}
           onToggleCollapse={() => setRightPanelCollapsed((v) => !v)}
-          toolEvents={toolEvents}
+          toolEvents={rightPanelEvents}
           activeTaskId={activeTaskId}
+          sessionId={currentSessionId}
           previewFileId={previewFileId}
           previewLanguage={previewLanguage}
+          previewCode={previewCode}
+          outputEntries={outputEntries}
+          outputDir={outputDir}
+          currentOutputPath={currentOutputPath}
+          parentOutputPath={parentOutputPath}
+          selectedOutputFilePath={selectedOutputFilePath}
+          onOpenOutputEntry={(entry) => {
+            if (currentSessionId == null) return;
+            if (entry.type === 'directory') {
+              void loadSessionOutputFiles(currentSessionId, entry.path);
+              return;
+            }
+            setSelectedOutputFilePath(currentSessionId, entry.path);
+          }}
+          onOpenParentOutputDir={() => {
+            if (currentSessionId == null) return;
+            void loadSessionOutputFiles(
+              currentSessionId,
+              parentOutputPath && parentOutputPath !== '.' ? parentOutputPath : undefined
+            );
+          }}
           isRunning={isStreaming}
-          width={340}
-          onApproveTool={handleApproveTool}
-          onDeclineTool={handleDeclineTool}
+          width={rightPanelWidth}
+          onApproveTool={isWorkflowSession ? undefined : handleApproveTool}
+          onDeclineTool={isWorkflowSession ? undefined : handleDeclineTool}
         />
       </Layout>
 

@@ -8,25 +8,12 @@
  * 通过 react-syntax-highlighter 渲染高亮。
  */
 
-import React, { useEffect, useState } from 'react';
-import { Spin, Alert, Space, Select, Button, message } from 'antd';
-import { CopyOutlined, ReloadOutlined } from '@ant-design/icons';
+import React, { useCallback, useEffect, useState } from 'react';
+import { Spin, Alert } from 'antd';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import * as filesApi from '../../api/files';
-
-const SUPPORTED_LANGS = [
-  'python',
-  'java',
-  'cpp',
-  'javascript',
-  'typescript',
-  'json',
-  'bash',
-  'sql',
-  'yaml',
-  'text',
-];
+import * as sessionsApi from '../../api/sessions';
 
 /**
  * 属性
@@ -34,14 +21,15 @@ const SUPPORTED_LANGS = [
 export interface CodeViewerProps {
   /** 文件 ID（与 code 二选一） */
   fileId?: number;
+  /** 会话输出目录文件 */
+  sessionOutputFile?: {
+    sessionId: number;
+    path: string;
+  };
   /** 直接传入的代码 */
   code?: string;
   /** 语言 */
   language?: string | null;
-  /** 是否显示语言切换器（默认 true） */
-  showLangSwitch?: boolean;
-  /** 是否显示复制按钮（默认 true） */
-  showCopy?: boolean;
   /** 最大高度 */
   maxHeight?: number;
 }
@@ -51,10 +39,9 @@ export interface CodeViewerProps {
  */
 const CodeViewer: React.FC<CodeViewerProps> = ({
   fileId,
+  sessionOutputFile,
   code,
   language,
-  showLangSwitch = true,
-  showCopy = true,
   maxHeight = 480,
 }) => {
   const [loading, setLoading] = useState(false);
@@ -62,22 +49,27 @@ const CodeViewer: React.FC<CodeViewerProps> = ({
   const [err, setErr] = useState<string | null>(null);
   const [lang, setLang] = useState<string>((language || 'text').toLowerCase());
 
-  // 拉取文件内容
-  useEffect(() => {
+  const loadContent = useCallback(() => {
     if (code !== undefined) {
       setContent(code);
-      return;
+      setErr(null);
+      setLoading(false);
+      return () => {};
     }
-    if (!fileId) {
+    if (!fileId && !sessionOutputFile) {
       setContent('');
-      return;
+      setErr(null);
+      setLoading(false);
+      return () => {};
     }
     let cancelled = false;
     setLoading(true);
     setErr(null);
-    filesApi
-      .getFileContent(fileId)
-      .then((r) => {
+    const request = fileId
+      ? filesApi.getFileContent(fileId)
+      : sessionsApi.getSessionOutputFileContent(sessionOutputFile!.sessionId, sessionOutputFile!.path);
+    request
+      .then((r: any) => {
         if (cancelled) return;
         setContent(r.content || '');
       })
@@ -91,24 +83,15 @@ const CodeViewer: React.FC<CodeViewerProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [fileId, code]);
+  }, [code, fileId, sessionOutputFile]);
+
+  // 拉取文件内容
+  useEffect(() => loadContent(), [loadContent]);
 
   // 同步外部 language 变化
   useEffect(() => {
     if (language) setLang(language.toLowerCase());
   }, [language]);
-
-  /**
-   * 复制到剪贴板
-   */
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(content);
-      message.success('已复制');
-    } catch {
-      message.error('复制失败');
-    }
-  };
 
   if (err) {
     return <Alert type="error" message="加载失败" description={err} showIcon />;
@@ -116,43 +99,6 @@ const CodeViewer: React.FC<CodeViewerProps> = ({
 
   return (
     <div className="code-viewer">
-      <Space style={{ marginBottom: 6, width: '100%', justifyContent: 'space-between' }}>
-        {showLangSwitch ? (
-          <Space size={6}>
-            <span style={{ fontSize: 12, color: '#888' }}>语言</span>
-            <Select
-              size="small"
-              value={lang}
-              onChange={setLang}
-              style={{ width: 130 }}
-              options={SUPPORTED_LANGS.map((v) => ({ value: v, label: v }))}
-            />
-            {fileId && (
-              <Button
-                size="small"
-                icon={<ReloadOutlined />}
-                onClick={() => {
-                  // 强制重读
-                  setContent('');
-                  setLoading(true);
-                  filesApi
-                    .getFileContent(fileId)
-                    .then((r) => setContent(r.content || ''))
-                    .catch((e) => setErr(e?.message || '加载失败'))
-                    .finally(() => setLoading(false));
-                }}
-              />
-            )}
-          </Space>
-        ) : (
-          <span />
-        )}
-        {showCopy && (
-          <Button size="small" icon={<CopyOutlined />} onClick={handleCopy} disabled={!content}>
-            复制
-          </Button>
-        )}
-      </Space>
       {loading ? (
         <div style={{ padding: 40, textAlign: 'center' }}>
           <Spin tip="加载中..." />

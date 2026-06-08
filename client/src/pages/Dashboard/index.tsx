@@ -11,7 +11,6 @@ import {
   Typography,
   Space,
   Spin,
-  Progress,
   Avatar,
   List,
   Tag,
@@ -24,8 +23,6 @@ import {
   FolderOutlined,
   FileOutlined,
   RocketOutlined,
-  ArrowRightOutlined,
-  ClockCircleOutlined,
   CheckCircleOutlined,
   RiseOutlined,
   UserOutlined,
@@ -33,7 +30,6 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../../stores/authStore';
 import * as sessionsApi from '../../api/sessions';
-import * as tasksApi from '../../api/tasks';
 import * as apiKeysApi from '../../api/apiKeys';
 
 const { Title, Text, Paragraph } = Typography;
@@ -47,7 +43,6 @@ const Dashboard: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [stats, setStats] = useState({
     sessions: { total: 0, active: 0, totalMessages: 0 },
-    tasks: { total: 0, completed: 0, running: 0, failed: 0, pending: 0 },
     apiKeys: { total: 0, active: 0 },
   });
 
@@ -58,9 +53,8 @@ const Dashboard: React.FC = () => {
   const loadStats = async () => {
     setLoading(true);
     try {
-      const [sessionStats, taskStats, apiKeyStats] = await Promise.allSettled([
+      const [sessionStats, apiKeyStats] = await Promise.allSettled([
         sessionsApi.getSessionStats(),
-        tasksApi.getTaskStats(),
         apiKeysApi.getApiKeyStats(),
       ]);
 
@@ -68,9 +62,6 @@ const Dashboard: React.FC = () => {
         sessions: sessionStats.status === 'fulfilled'
           ? sessionStats.value
           : { total: 0, active: 0, totalMessages: 0 },
-        tasks: taskStats.status === 'fulfilled'
-          ? taskStats.value
-          : { total: 0, completed: 0, running: 0, failed: 0, pending: 0 },
         apiKeys: apiKeyStats.status === 'fulfilled'
           ? apiKeyStats.value
           : { total: 0, active: 0 },
@@ -81,10 +72,6 @@ const Dashboard: React.FC = () => {
       setLoading(false);
     }
   };
-
-  const successRate = stats.tasks.total > 0
-    ? Math.round((stats.tasks.completed / stats.tasks.total) * 100)
-    : 0;
 
   return (
     <Spin spinning={loading}>
@@ -139,10 +126,10 @@ const Dashboard: React.FC = () => {
           <Col xs={24} sm={12} lg={6}>
             <Card hoverable styles={{ body: { padding: 20 } }}>
               <Statistic
-                title="总任务数"
-                value={stats.tasks.total}
+                title="活跃会话"
+                value={stats.sessions.active}
                 prefix={<ThunderboltOutlined style={{ color: '#52c41a' }} />}
-                suffix={<Tag color="green" style={{ marginLeft: 8 }}>完成 {stats.tasks.completed}</Tag>}
+                suffix={<Tag color="green" style={{ marginLeft: 8 }}>总计 {stats.sessions.total}</Tag>}
                 valueStyle={{ color: '#52c41a' }}
               />
             </Card>
@@ -239,22 +226,18 @@ const Dashboard: React.FC = () => {
               </Row>
             </Card>
 
-            {/* 任务状态 */}
-            <Card title="📊 任务概览" style={{ marginTop: 16 }}>
+            <Card title="📊 会话概览" style={{ marginTop: 16 }}>
               <Row gutter={16}>
                 <Col span={12}>
                   <div style={{ textAlign: 'center', padding: 16 }}>
-                    <Progress
-                      type="circle"
-                      percent={successRate}
-                      strokeColor={{
-                        '0%': '#108ee9',
-                        '100%': '#87d068',
-                      }}
-                      size={120}
+                    <Statistic
+                      title="累计消息"
+                      value={stats.sessions.totalMessages}
+                      prefix={<RiseOutlined style={{ color: '#108ee9' }} />}
+                      valueStyle={{ color: '#108ee9' }}
                     />
                     <div style={{ marginTop: 12 }}>
-                      <Text type="secondary">任务成功率</Text>
+                      <Text type="secondary">会话内累计消息数</Text>
                     </div>
                   </div>
                 </Col>
@@ -262,39 +245,24 @@ const Dashboard: React.FC = () => {
                   <Space direction="vertical" size="middle" style={{ width: '100%' }}>
                     <div>
                       <Space>
-                        <ClockCircleOutlined style={{ color: '#faad14' }} />
-                        <Text>等待中</Text>
+                        <MessageOutlined style={{ color: '#1890ff' }} />
+                        <Text>总会话</Text>
                       </Space>
-                      <Progress
-                        percent={stats.tasks.total > 0 ? (stats.tasks.pending / stats.tasks.total) * 100 : 0}
-                        strokeColor="#faad14"
-                        showInfo={false}
-                      />
-                      <Text type="secondary">{stats.tasks.pending} 个任务</Text>
+                      <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>{stats.sessions.total} 个会话</Text>
                     </div>
                     <div>
                       <Space>
                         <ThunderboltOutlined style={{ color: '#1890ff' }} />
-                        <Text>运行中</Text>
+                        <Text>活跃中</Text>
                       </Space>
-                      <Progress
-                        percent={stats.tasks.total > 0 ? (stats.tasks.running / stats.tasks.total) * 100 : 0}
-                        strokeColor="#1890ff"
-                        showInfo={false}
-                      />
-                      <Text type="secondary">{stats.tasks.running} 个任务</Text>
+                      <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>{stats.sessions.active} 个会话</Text>
                     </div>
                     <div>
                       <Space>
                         <CheckCircleOutlined style={{ color: '#52c41a' }} />
-                        <Text>已完成</Text>
+                        <Text>API Key</Text>
                       </Space>
-                      <Progress
-                        percent={stats.tasks.total > 0 ? (stats.tasks.completed / stats.tasks.total) * 100 : 0}
-                        strokeColor="#52c41a"
-                        showInfo={false}
-                      />
-                      <Text type="secondary">{stats.tasks.completed} 个任务</Text>
+                      <Text type="secondary" style={{ display: 'block', marginTop: 4 }}>{stats.apiKeys.active} 个活跃 Key</Text>
                     </div>
                   </Space>
                 </Col>
@@ -304,19 +272,7 @@ const Dashboard: React.FC = () => {
 
           {/* 右侧 - 活动日志 */}
           <Col xs={24} lg={8}>
-            <Card
-              title="📈 系统状态"
-              extra={
-                <Button
-                  type="link"
-                  size="small"
-                  onClick={() => navigate('/tasks')}
-                >
-                  查看全部 <ArrowRightOutlined />
-                </Button>
-              }
-              style={{ height: '100%' }}
-            >
+            <Card title="📈 系统状态" style={{ height: '100%' }}>
               <List
                 size="small"
                 dataSource={[
@@ -334,8 +290,8 @@ const Dashboard: React.FC = () => {
                   },
                   {
                     icon: <ThunderboltOutlined style={{ color: '#722ed1' }} />,
-                    title: `${stats.tasks.total} 个任务记录`,
-                    desc: `完成率 ${successRate}%`,
+                    title: `${stats.sessions.totalMessages} 条消息`,
+                    desc: '会话内容持续累积',
                     time: '累计',
                   },
                   {

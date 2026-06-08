@@ -118,8 +118,8 @@ const Profile: React.FC = () => {
                 </Col>
                 <Col span={8}>
                   <Statistic
-                    title="任务数"
-                    value={user?._count?.tasks || 0}
+                    title="会话数"
+                    value={user?._count?.sessions || 0}
                     valueStyle={{ color: '#fa8c16' }}
                   />
                 </Col>

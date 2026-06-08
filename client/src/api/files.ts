@@ -12,6 +12,8 @@ export interface FileInfo {
   size: number;
   language: string | null;
   purpose: string;
+  isGenerated?: boolean;
+  outputPath?: string | null;
   createdAt: string;
 }
 

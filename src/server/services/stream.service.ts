@@ -7,10 +7,20 @@
 
 import { getWiredAutonomousAgent } from '../../autonomous/autonomous-agent.js';
 import { memoryStore } from '../../mastra/memory/in-memory-store.js';
-import { generateTestWorkflow } from '../../mastra/workflows/generate-test-workflow.js';
 import { getActiveApiKey } from './llmKey.service.js';
 import { registerGeneratedFile } from './file.service.js';
 import { logger } from '../../mastra/runtime/logger.js';
+import { runGenerateTestWorkflow } from './workflow-runner.js';
+import { throwIfTaskRunCancelled } from './task-runtime-registry.js';
+
+type StreamExecutionOptions = {
+  taskId?: string;
+  sessionId?: number;
+  workspaceId?: number;
+  outputDir?: string;
+  sourceFile?: string;
+  language?: string;
+};
 
 /**
  * 流式回调
@@ -50,9 +60,10 @@ export async function streamAutonomousAgent(
   userId: number,
   input: string,
   callbacks: StreamCallbacks,
-  options: { sessionId?: number; workspaceId?: number; outputDir?: string; sourceFile?: string; language?: string } = {}
+  options: StreamExecutionOptions = {}
 ): Promise<void> {
   try {
+    throwIfTaskRunCancelled(options.taskId);
     // 1. 检查 API Key
     const apiKey = await getActiveApiKey(userId);
     if (!apiKey) {
@@ -90,12 +101,16 @@ export async function streamAutonomousAgent(
 
     // 5. 构建消息：把最近会话记忆交还给 Agent，避免反复读取/解析已处理文件。
     const memorySummary = memoryStore.summarize(sessionId, 10);
+    const outputDirInstruction =
+      typeof options.outputDir === 'string' && options.outputDir.trim()
+        ? `\n\n[系统约束]\n本次任务的目标输出目录是：${options.outputDir.trim()}\n除非用户另行明确指定，否则生成的测试文件、导出结果和中间产物都应放在这个目录下。`
+        : '';
     const messages = [
       {
         role: 'user',
         content: memorySummary
-          ? `以下是本 Web 会话的近期上下文。若源文件内容和附件未变化，不要重复读取或解析已经完成过的内容，直接基于已有结论继续。\n\n${memorySummary}\n\n当前用户消息：\n${input}`
-          : input,
+          ? `以下是本 Web 会话的近期上下文。若源文件内容和附件未变化，不要重复读取或解析已经完成过的内容，直接基于已有结论继续。\n\n${memorySummary}\n\n当前用户消息：\n${input}${outputDirInstruction}`
+          : `${input}${outputDirInstruction}`,
       },
     ];
 
@@ -112,6 +127,7 @@ export async function streamAutonomousAgent(
     // write-file 工具结果（如果 LLM 用 writeFile 写了文件）
     let writtenFileContent: string | null = null;
     let writtenFilePath: string | null = null;
+    let latestRegisteredFileId: number | null = null;
     // 工具调用记录
     const toolCalls: Array<{ toolName: string; args: any; result: any }> = [];
     // 是否已经触发 ask-user（决定是否还要发 onComplete）
@@ -140,6 +156,7 @@ export async function streamAutonomousAgent(
     let lastChunkType = '';
 
     for await (const chunk of stream.fullStream) {
+      throwIfTaskRunCancelled(options.taskId);
       const type = (chunk as any).type;
       const payload = (chunk as any).payload;
 
@@ -308,6 +325,42 @@ export async function streamAutonomousAgent(
                 ? lastCall.args.filePath
                 : null;
           }
+
+          if (writtenFileContent && options.sessionId) {
+            try {
+              const ext =
+                options.language === 'python'
+                  ? 'py'
+                  : options.language === 'java'
+                  ? 'java'
+                  : options.language === 'cpp'
+                  ? 'cpp'
+                  : 'txt';
+              const reg = await registerGeneratedFile({
+                userId,
+                sessionId: options.sessionId,
+                workspaceId: options.workspaceId,
+                filename:
+                  (writtenFilePath ? writtenFilePath.split(/[\\/]/).pop() : '') ||
+                  `test_output_${Date.now()}.${ext}`,
+                content: writtenFileContent,
+                purpose: 'test_output',
+                metadata: {
+                  language: options.language || 'python',
+                  sourceFile: options.sourceFile,
+                  kind: 'unit_test',
+                  outputPath: writtenFilePath,
+                },
+              });
+              latestRegisteredFileId = reg.id;
+            } catch (regErr: any) {
+              logger.warn('system', {
+                scope: 'streamAutonomousAgent',
+                event_name: 'registerGeneratedFile.realtime.failed',
+                error: regErr.message,
+              });
+            }
+          }
         }
 
         callbacks.onProgress({
@@ -315,6 +368,14 @@ export async function streamAutonomousAgent(
           step: 'tool',
           message: `✅ 工具执行完成`,
           progress: Math.min(progress + 3, 90),
+          data: {
+            toolName: lastCall?.toolName || '',
+            args: lastCall?.args || null,
+            result,
+            filePath: writtenFilePath,
+            content: writtenFileContent,
+            registeredFileId: latestRegisteredFileId,
+          },
         });
       }
     }
@@ -333,6 +394,7 @@ export async function streamAutonomousAgent(
     const finalRunId = (fullOutput?.runId as string | undefined) ?? lastRunId ?? '';
 
     if (!asked && (finalFinishReason === 'suspended' || suspendPayloadFromChunk)) {
+      throwIfTaskRunCancelled(options.taskId);
       // 提取挂起信息
       const sp: any =
         suspendPayloadFromChunk ||
@@ -398,6 +460,7 @@ export async function streamAutonomousAgent(
     }
 
     if (writtenFileContent) {
+      throwIfTaskRunCancelled(options.taskId);
       testCode = writtenFileContent;
       if (writtenFilePath) {
         testFile = writtenFilePath.split(/[\\/]/).pop() || writtenFilePath;
@@ -423,21 +486,31 @@ export async function streamAutonomousAgent(
     // 8. 把测试代码入库
     let previewFileId: number | null = null;
     if (testCode) {
-      try {
-        const lang = options.language || 'python';
-        const ext = lang === 'python' ? 'py' : lang === 'java' ? 'java' : lang === 'cpp' ? 'cpp' : 'txt';
-        const reg = await registerGeneratedFile({
-          userId,
-          sessionId: options.sessionId,
-          workspaceId: options.workspaceId,
-          filename: testFile || `test_output_${Date.now()}.${ext}`,
-          content: testCode,
-          purpose: 'test_output',
-          metadata: { language: lang, sourceFile: options.sourceFile, kind: 'unit_test' },
-        });
-        previewFileId = reg.id;
-      } catch (regErr: any) {
-        logger.warn('system', { scope: 'streamAutonomousAgent', event_name: 'registerGeneratedFile.failed', error: regErr.message });
+      throwIfTaskRunCancelled(options.taskId);
+      if (latestRegisteredFileId && writtenFileContent && testCode === writtenFileContent) {
+        previewFileId = latestRegisteredFileId;
+      } else {
+        try {
+          const lang = options.language || 'python';
+          const ext = lang === 'python' ? 'py' : lang === 'java' ? 'java' : lang === 'cpp' ? 'cpp' : 'txt';
+          const reg = await registerGeneratedFile({
+            userId,
+            sessionId: options.sessionId,
+            workspaceId: options.workspaceId,
+            filename: testFile || `test_output_${Date.now()}.${ext}`,
+            content: testCode,
+            purpose: 'test_output',
+            metadata: {
+              language: lang,
+              sourceFile: options.sourceFile,
+              kind: 'unit_test',
+              outputPath: writtenFilePath,
+            },
+          });
+          previewFileId = reg.id;
+        } catch (regErr: any) {
+          logger.warn('system', { scope: 'streamAutonomousAgent', event_name: 'registerGeneratedFile.failed', error: regErr.message });
+        }
       }
     }
 
@@ -453,6 +526,7 @@ export async function streamAutonomousAgent(
       testCode,
       testFile,
       previewFileId,
+      outputDir: options.outputDir,
     });
     if (fullText.trim()) {
       memoryStore.addMessage(sessionId, 'agent', fullText.trim(), { previewFileId, testFile });
@@ -476,9 +550,10 @@ export async function streamWorkflow(
   language: string,
   requirements: string,
   callbacks: StreamCallbacks,
-  options: { sessionId?: number; workspaceId?: number; outputDir?: string } = {}
+  options: StreamExecutionOptions = {}
 ): Promise<void> {
   try {
+    throwIfTaskRunCancelled(options.taskId);
     // 1. 检查 API Key
     const apiKey = await getActiveApiKey(userId);
     if (!apiKey) {
@@ -508,6 +583,7 @@ export async function streamWorkflow(
 
     let progress = 0;
     for (const step of steps) {
+      throwIfTaskRunCancelled(options.taskId);
       callbacks.onProgress({
         type: 'progress',
         step: step.step,
@@ -526,35 +602,22 @@ export async function streamWorkflow(
       progress: 90,
     });
 
-    const workflowInput = {
-      sourceCode,
-      sourceFile,
-      language,
-      requirements,
-      maxAttempts: 3,
-      outputDir: options.outputDir || `./output/workflow-${Date.now()}`,
-    };
+    const workflowOutputDir = options.outputDir || `./output/workflow-${Date.now()}`;
 
     let testCode = '';
     let testFile = '';
-
-    try {
-      const result: any = await (generateTestWorkflow as any).execute(workflowInput);
-      testCode = result.testCode || result.test_code || '';
-      testFile = result.testFile || result.test_file || 'test_output.py';
-    } catch (wfError: any) {
-      // 如果工作流失败，生成简单的占位测试
-      logger.warn('system', { scope: 'streamWorkflow', event_name: 'workflow.failed_fallback', error: wfError.message });
-      testCode = `# 测试代码生成占位\n# Workflow 执行失败: ${wfError.message}\n`;
-      testFile = 'test_placeholder.py';
-
-      callbacks.onProgress({
-        type: 'progress',
-        step: 'fallback',
-        message: `⚠️  Workflow 失败: ${wfError.message}`,
-        progress: 95,
-      });
-    }
+    const result = await runGenerateTestWorkflow({
+      sourceCode,
+      sourceFile: sourceFile || 'input',
+      language,
+      requirements,
+      maxAttempts: 3,
+      outputDir: workflowOutputDir,
+    });
+    testCode = result.test_code || '';
+    testFile =
+      result.exported_files?.find((file) => /test/i.test(file)) ||
+      (language === 'python' ? 'test_output.py' : language === 'java' ? 'TestOutput.java' : 'test_output.cpp');
 
     callbacks.onProgress({
       type: 'progress',
@@ -566,6 +629,7 @@ export async function streamWorkflow(
     // 把测试代码入库
     let previewFileId: number | null = null;
     if (testCode) {
+      throwIfTaskRunCancelled(options.taskId);
       try {
         const ext = language === 'python' ? 'py' : language === 'java' ? 'java' : language === 'cpp' ? 'cpp' : 'txt';
         const reg = await registerGeneratedFile({
@@ -575,7 +639,7 @@ export async function streamWorkflow(
           filename: testFile || `test_output_${Date.now()}.${ext}`,
           content: testCode,
           purpose: 'test_output',
-          metadata: { language, sourceFile, kind: 'unit_test' },
+          metadata: { language, sourceFile, kind: 'unit_test', outputPath: testFile ? `${workflowOutputDir}/${testFile}` : workflowOutputDir },
         });
         previewFileId = reg.id;
       } catch (regErr: any) {
@@ -595,7 +659,7 @@ export async function streamWorkflow(
       testCode,
       testFile,
       previewFileId,
-      outputDir: workflowInput.outputDir,
+      outputDir: workflowOutputDir,
     });
 
   } catch (error: any) {

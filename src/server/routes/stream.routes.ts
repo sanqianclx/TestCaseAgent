@@ -8,6 +8,12 @@ import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth.js';
 import { streamAutonomousAgent, streamWorkflow } from '../services/stream.service.js';
 import { registerGeneratedFile } from '../services/file.service.js';
+import {
+  registerTaskRun,
+  throwIfTaskRunCancelled,
+  TaskCancelledError,
+  unregisterTaskRun,
+} from '../services/task-runtime-registry.js';
 import prisma from '../config/database.js';
 import { logger } from '../../mastra/runtime/logger.js';
 import { generateUUID } from '../utils/crypto.js';
@@ -44,6 +50,21 @@ async function buildAttachmentsBlock(userId: number, fileIds: number[]): Promise
   return blocks.join('\n\n');
 }
 
+function parseSessionContext(context: unknown): Record<string, any> | null {
+  if (!context) return null;
+  if (typeof context === 'string') {
+    try {
+      return JSON.parse(context);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof context === 'object') {
+    return context as Record<string, any>;
+  }
+  return null;
+}
+
 /**
  * POST /api/v1/stream/agent
  * 流式执行自主 Agent
@@ -76,10 +97,72 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
 
   const resolvedMode = mode === 'workflow' ? 'workflow' : 'autonomous';
   const createdTaskId = taskId || generateUUID();
-  const resolvedWorkspaceId = workspaceId ? Number(workspaceId) : undefined;
   const resolvedSessionId = sessionId ? Number(sessionId) : undefined;
   const resolvedLanguage = language || 'python';
   const resolvedSourceFile = sourceFile || 'chat-input';
+
+  let sessionRecord:
+    | {
+        workspaceId: bigint | null;
+        context: unknown;
+        workspace: { id: bigint; basePath: string | null } | null;
+      }
+    | null = null;
+  if (resolvedSessionId) {
+    sessionRecord = await prisma.session.findFirst({
+      where: { id: resolvedSessionId, userId },
+      select: {
+        workspaceId: true,
+        context: true,
+        workspace: {
+          select: {
+            id: true,
+            basePath: true,
+          },
+        },
+      },
+    });
+  }
+
+  const explicitWorkspaceId = workspaceId ? Number(workspaceId) : undefined;
+  let workspaceRecord:
+    | {
+        id: number;
+        basePath: string | null;
+      }
+    | null = null;
+  const candidateWorkspaceId = explicitWorkspaceId ?? (sessionRecord?.workspaceId ? Number(sessionRecord.workspaceId) : undefined);
+  if (candidateWorkspaceId) {
+    if (sessionRecord?.workspace && Number(sessionRecord.workspace.id) === candidateWorkspaceId) {
+      workspaceRecord = {
+        id: Number(sessionRecord.workspace.id),
+        basePath: sessionRecord.workspace.basePath,
+      };
+    } else {
+      const dbWorkspace = await prisma.workspace.findFirst({
+        where: { id: candidateWorkspaceId, userId },
+        select: {
+          id: true,
+          basePath: true,
+        },
+      });
+      workspaceRecord = dbWorkspace
+        ? {
+            id: Number(dbWorkspace.id),
+            basePath: dbWorkspace.basePath,
+          }
+        : null;
+    }
+  }
+
+  const sessionContext = parseSessionContext(sessionRecord?.context) || {};
+  const resolvedWorkspaceId = workspaceRecord?.id ?? explicitWorkspaceId;
+  const resolvedOutputDir =
+    typeof outputDir === 'string' && outputDir.trim()
+      ? outputDir.trim()
+      : typeof sessionContext.outputDir === 'string' && sessionContext.outputDir.trim()
+      ? sessionContext.outputDir.trim()
+      : workspaceRecord?.basePath || undefined;
 
   try {
     await prisma.task.create({
@@ -94,6 +177,7 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
         sourceContent: sourceCode || content || '',
         language: resolvedLanguage,
         requirements: content || '',
+        outputDir: resolvedOutputDir,
         attemptCount: 0,
         startedAt: new Date(),
       },
@@ -107,8 +191,16 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
         message: `开始 ${resolvedMode === 'workflow' ? 'Workflow' : 'Agent'} 流式执行`,
       },
     });
+    registerTaskRun(createdTaskId, {
+      sessionId: resolvedSessionId,
+      workspaceId: resolvedWorkspaceId,
+      outputDir: resolvedOutputDir,
+    });
   } catch (e: any) {
-    logger.warn('system', { scope: 'stream/agent', event_name: 'task.create.failed', error: e?.message });
+    logger.error('system', { scope: 'stream/agent', event_name: 'task.create.failed', error: e?.message });
+    sendEvent('error', { message: `创建任务记录失败: ${e?.message || '未知错误'}` });
+    unregisterTaskRun(createdTaskId);
+    return res.end();
   }
 
   let askSent = false;
@@ -122,11 +214,12 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
           where: { taskId: createdTaskId },
           data: {
             status: 'completed',
+            outputDir: e.outputDir || resolvedOutputDir,
             result: {
               testCode: e.testCode || '',
               testFile: e.testFile || '',
               previewFileId: e.previewFileId ?? null,
-              outputDir: e.outputDir,
+              outputDir: e.outputDir || resolvedOutputDir,
             },
             executionTime: null,
             completedAt: new Date(),
@@ -146,15 +239,17 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
         logger.warn('system', { scope: 'stream/agent', event_name: 'task.complete.failed', error: err?.message });
       }
       sendEvent('complete', { ...e, taskId: createdTaskId });
+      unregisterTaskRun(createdTaskId);
       res.end();
     },
     onError: async (e: Error) => {
+      const isCancelled = e instanceof TaskCancelledError;
       try {
         await prisma.task.update({
           where: { taskId: createdTaskId },
           data: {
-            status: 'failed',
-            errorMessage: e.message,
+            status: isCancelled ? 'cancelled' : 'failed',
+            errorMessage: isCancelled ? '任务已取消' : e.message,
             completedAt: new Date(),
           },
         });
@@ -162,15 +257,16 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
           data: {
             taskId: createdTaskId,
             sessionId: resolvedSessionId,
-            level: 'error',
-            step: 'error',
-            message: e.message,
+            level: isCancelled ? 'info' : 'error',
+            step: isCancelled ? 'cancel' : 'error',
+            message: isCancelled ? '任务已取消' : e.message,
           },
         });
       } catch (err: any) {
         logger.warn('system', { scope: 'stream/agent', event_name: 'task.error.failed', error: err?.message });
       }
       sendEvent('error', { message: e.message, taskId: createdTaskId });
+      unregisterTaskRun(createdTaskId);
       res.end();
     },
     onAsk: (info: any) => {
@@ -193,11 +289,12 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
   }
 
   const streamOptions = {
+    taskId: createdTaskId,
     sessionId: resolvedSessionId,
     workspaceId: resolvedWorkspaceId,
-    outputDir,
-    sourceFile,
-    language,
+    outputDir: resolvedOutputDir,
+    sourceFile: resolvedSourceFile,
+    language: resolvedLanguage,
   };
 
   if (mode === 'workflow' && (sourceCode || enrichedContent)) {
@@ -205,8 +302,8 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
     await streamWorkflow(
       userId,
       sourceCode || enrichedContent,
-      sourceFile,
-      language || 'python',
+      resolvedSourceFile,
+      resolvedLanguage,
       enrichedContent,
       callbacks,
       streamOptions
@@ -251,6 +348,23 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
   };
 
   try {
+    if (taskId) {
+      const existingTask = await prisma.task.findFirst({
+        where: { taskId, userId },
+        select: { status: true },
+      });
+      if (!existingTask) {
+        sendEvent('error', { message: '任务不存在', taskId });
+        unregisterTaskRun(taskId);
+        return res.end();
+      }
+      if (existingTask.status === 'cancelled') {
+        sendEvent('error', { message: '任务已取消', taskId });
+        unregisterTaskRun(taskId);
+        return res.end();
+      }
+    }
+
     const { getWiredAutonomousAgent } = await import('../../autonomous/autonomous-agent.js');
     const { agent } = getWiredAutonomousAgent();
     const { memoryStore } = await import('../../mastra/memory/in-memory-store.js');
@@ -299,6 +413,7 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
     let testFile = '';
     const toolCalls: Array<{ toolName: string; args: any; result: any }> = [];
     for await (const chunk of (resumeStream as any).fullStream) {
+      throwIfTaskRunCancelled(taskId);
       const type = (chunk as any).type;
       const payload = (chunk as any).payload;
       if (type === 'text-delta' && payload?.text) {
@@ -384,6 +499,7 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
     const finalRunId = (fullOutput?.runId as string | undefined) ?? lastRunId ?? '';
 
     if (finalFinishReason === 'suspended' || suspendPayloadFromChunk) {
+      throwIfTaskRunCancelled(taskId);
       // resume 后又挂起：再发 ask 事件让前端继续弹"待审批"
       const sp: any =
         suspendPayloadFromChunk ||
@@ -435,7 +551,13 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
           filename: testFile || `test_output_${Date.now()}.${ext}`,
           content: testCode,
           purpose: 'test_output',
-          metadata: { language: lang, sourceFile, kind: 'unit_test', resumedFrom: runId },
+          metadata: {
+            language: lang,
+            sourceFile,
+            kind: 'unit_test',
+            resumedFrom: runId,
+            outputPath: writtenFilePath,
+          },
         });
         previewFileId = reg.id;
       } catch (e: any) {
@@ -473,23 +595,26 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
     }
 
     sendEvent('complete', { success: true, testCode, testFile, previewFileId, taskId });
+    if (taskId) unregisterTaskRun(taskId);
     res.end();
   } catch (err: any) {
+    const isCancelled = err instanceof TaskCancelledError;
     if (taskId) {
       try {
         await prisma.task.update({
           where: { taskId },
           data: {
-            status: 'failed',
-            errorMessage: err?.message || 'resume 失败',
+            status: isCancelled ? 'cancelled' : 'failed',
+            errorMessage: isCancelled ? '任务已取消' : err?.message || 'resume 失败',
             completedAt: new Date(),
           },
         });
       } catch {
         // ignore task update failure while reporting the original stream error
       }
+      unregisterTaskRun(taskId);
     }
-    sendEvent('error', { message: err?.message || 'resume 失败' });
+    sendEvent('error', { message: isCancelled ? '任务已取消' : err?.message || 'resume 失败', taskId });
     res.end();
   }
 });

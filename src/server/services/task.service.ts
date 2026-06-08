@@ -9,6 +9,8 @@ import prisma from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { ErrorCode, createPagination } from '../utils/response.js';
 import { generateUUID } from '../utils/crypto.js';
+import { cancelTaskRun } from './task-runtime-registry.js';
+import { executeTask } from './llm.service.js';
 
 /**
  * 创建任务参数
@@ -107,24 +109,21 @@ export async function createTask(userId: number, params: CreateTaskParams) {
   }
 
   // 生成任务 ID
-  const taskId = generateUUID();
+  const taskId = await executeTask({
+    userId,
+    sessionId,
+    workspaceId,
+    sourceFile: resolvedSourceFile,
+    sourceContent: resolvedSourceContent,
+    language: resolvedLanguage,
+    requirements,
+    mode,
+    maxAttempts,
+    outputDir: params.outputDir,
+  });
 
-  // 创建任务
-  const task = await prisma.task.create({
-    data: {
-      userId,
-      workspaceId,
-      sessionId,
-      taskId,
-      status: 'pending',
-      mode: mode.toLowerCase() as any,
-      sourceFile: resolvedSourceFile,
-      sourceContent: resolvedSourceContent,
-      language: resolvedLanguage,
-      requirements,
-      outputDir: params.outputDir,
-      attemptCount: 0,
-    },
+  const task = await prisma.task.findUnique({
+    where: { taskId },
     select: {
       id: true,
       taskId: true,
@@ -137,11 +136,14 @@ export async function createTask(userId: number, params: CreateTaskParams) {
     },
   });
 
-  // TODO: 异步启动测试生成任务
-  // 这里应该调用现有的工作流或自主 Agent
-  // 例如：startTestGeneration(taskId, params);
+  if (!task) {
+    throw new AppError(ErrorCode.TASK_NOT_FOUND, '任务创建后未找到记录');
+  }
 
-  return task;
+  return {
+    ...task,
+    id: Number(task.id),
+  };
 }
 
 /**
@@ -306,7 +308,7 @@ export async function getTaskLogs(
   }
 
   const where: any = { taskId };
-  if (level) where.level = level.toUpperCase();
+  if (level) where.level = level.toLowerCase();
   if (step) where.step = step;
 
   const [logs, total] = await Promise.all([
@@ -356,9 +358,12 @@ export async function cancelTask(userId: number, taskId: string): Promise<void> 
     where: { taskId },
     data: {
       status: 'cancelled',
+      errorMessage: '任务已取消',
       completedAt: new Date(),
     },
   });
+
+  cancelTaskRun(taskId);
 
   // 添加日志
   await prisma.taskLog.create({
@@ -390,23 +395,20 @@ export async function retryTask(userId: number, taskId: string) {
     throw new AppError(ErrorCode.TASK_ALREADY_RUNNING, '任务正在运行或已完成');
   }
 
-  // 创建新任务
-  const newTaskId = generateUUID();
+  const newTaskId = await executeTask({
+    userId: Number(task.userId),
+    sessionId: task.sessionId ? Number(task.sessionId) : undefined,
+    workspaceId: task.workspaceId ? Number(task.workspaceId) : undefined,
+    sourceFile: task.sourceFile || undefined,
+    sourceContent: task.sourceContent || undefined,
+    language: task.language || undefined,
+    requirements: task.requirements || undefined,
+    mode: task.mode as 'workflow' | 'autonomous',
+    outputDir: task.outputDir || undefined,
+  });
 
-  const newTask = await prisma.task.create({
-    data: {
-      userId: task.userId,
-      workspaceId: task.workspaceId,
-      sessionId: task.sessionId,
-      taskId: newTaskId,
-      status: 'pending',
-      mode: task.mode,
-      sourceFile: task.sourceFile,
-      sourceContent: task.sourceContent,
-      language: task.language,
-      requirements: task.requirements,
-      attemptCount: 0,
-    },
+  const newTask = await prisma.task.findUnique({
+    where: { taskId: newTaskId },
     select: {
       id: true,
       taskId: true,
@@ -418,7 +420,14 @@ export async function retryTask(userId: number, taskId: string) {
     },
   });
 
-  return newTask;
+  if (!newTask) {
+    throw new AppError(ErrorCode.TASK_NOT_FOUND, '重试任务创建后未找到记录');
+  }
+
+  return {
+    ...newTask,
+    id: Number(newTask.id),
+  };
 }
 
 /**
@@ -539,7 +548,7 @@ export async function getTaskStats(userId: number) {
     prisma.task.count({ where: { userId, status: 'cancelled' } }),
   ]);
 
-  const tokenUsage = await prisma.task.aggregate({
+  const executionTimeAggregate = await prisma.task.aggregate({
     where: { userId, status: 'completed' },
     _sum: { executionTime: true },
   });
@@ -551,6 +560,6 @@ export async function getTaskStats(userId: number) {
     completed,
     failed,
     cancelled,
-    totalExecutionTime: tokenUsage._sum.executionTime || 0,
+    totalExecutionTime: executionTimeAggregate._sum.executionTime || 0,
   };
 }

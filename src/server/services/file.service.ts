@@ -12,6 +12,7 @@ import { sha256 } from '../utils/crypto.js';
 import fs from 'fs/promises';
 import path from 'path';
 import { env } from '../config/env.js';
+import type { Prisma } from '@prisma/client';
 
 /**
  * 上传文件参数
@@ -34,6 +35,8 @@ export interface FileInfo {
   size: number;
   language: string | null;
   purpose: string;
+  isGenerated?: boolean;
+  outputPath?: string | null;
   createdAt: Date;
 }
 
@@ -56,6 +59,21 @@ function detectLanguage(filename: string): string | null {
     '.hpp': 'cpp',
   };
   return languageMap[ext] || null;
+}
+
+function parseMetadataValue(metadata: Prisma.JsonValue | null | undefined): Record<string, any> {
+  if (!metadata) return {};
+  if (typeof metadata === 'string') {
+    try {
+      return JSON.parse(metadata);
+    } catch {
+      return {};
+    }
+  }
+  if (typeof metadata === 'object' && !Array.isArray(metadata)) {
+    return metadata as Record<string, any>;
+  }
+  return {};
 }
 
 /**
@@ -109,18 +127,89 @@ export async function registerGeneratedFile(params: {
   await fs.mkdir(userDir, { recursive: true });
 
   const safeBase = path.basename(filename).replace(/[\\/:*?"<>|]/g, '_');
+  const requestedOutputPath =
+    typeof metadata.outputPath === 'string' && metadata.outputPath.trim()
+      ? metadata.outputPath.trim()
+      : null;
+
+  let existingGenerated:
+    | {
+        id: bigint;
+        path: string;
+        metadata: Prisma.JsonValue | null;
+      }
+    | null = null;
+
+  if (sessionId) {
+    const existingCandidates = await prisma.uploadedFile.findMany({
+      where: {
+        userId,
+        sessionId,
+        originalName: safeBase,
+        purpose: purpose.toLowerCase() as any,
+      },
+      select: {
+        id: true,
+        path: true,
+        metadata: true,
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+    });
+
+    existingGenerated =
+      existingCandidates.find((item) => {
+        if (!requestedOutputPath) return true;
+        const parsed = parseMetadataValue(item.metadata);
+        return parsed?.outputPath === requestedOutputPath;
+      }) || null;
+  }
+
+  if (existingGenerated) {
+    await fs.writeFile(existingGenerated.path, buf);
+
+    await prisma.uploadedFile.update({
+      where: { id: existingGenerated.id },
+      data: {
+        workspaceId,
+        size: BigInt(buf.length),
+        hash,
+        metadata: JSON.stringify({ ...metadata, language: detectedLang, isGenerated: true }),
+      },
+    });
+
+    const currentContent = await prisma.fileContent.findFirst({
+      where: { fileId: existingGenerated.id },
+      orderBy: { chunkIndex: 'asc' },
+      select: { id: true },
+    });
+
+    if (currentContent) {
+      await prisma.fileContent.update({
+        where: { id: currentContent.id },
+        data: { content: buf },
+      });
+      await prisma.fileContent.deleteMany({
+        where: {
+          fileId: existingGenerated.id,
+          id: { not: currentContent.id },
+        },
+      });
+    } else {
+      await prisma.fileContent.create({
+        data: {
+          fileId: existingGenerated.id,
+          chunkIndex: 0,
+          content: buf,
+        },
+      });
+    }
+
+    return { id: Number(existingGenerated.id), path: existingGenerated.path };
+  }
+
   const storedName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}__${safeBase}`;
   const filePath = path.join(userDir, storedName);
-
-  await fs.writeFile(filePath, buf);
-
-  // 查重：同 user + 同 hash 已有记录则直接返回（避免重复入库）
-  const existing = await prisma.uploadedFile.findFirst({
-    where: { userId, hash },
-  });
-  if (existing) {
-    return { id: Number(existing.id), path: existing.path };
-  }
 
   const file = await prisma.uploadedFile.create({
     data: {
@@ -138,13 +227,21 @@ export async function registerGeneratedFile(params: {
     },
   });
 
-  await prisma.fileContent.create({
-    data: {
-      fileId: file.id,
-      chunkIndex: 0,
-      content: buf,
-    },
-  });
+  try {
+    await fs.writeFile(filePath, buf);
+
+    await prisma.fileContent.create({
+      data: {
+        fileId: file.id,
+        chunkIndex: 0,
+        content: buf,
+      },
+    });
+  } catch (error) {
+    await prisma.uploadedFile.delete({ where: { id: file.id } }).catch(() => undefined);
+    await fs.unlink(filePath).catch(() => undefined);
+    throw error;
+  }
 
   return { id: Number(file.id), path: filePath };
 }
@@ -316,11 +413,18 @@ export async function getFiles(
   ]);
 
   return {
-    items: items.map(item => ({
-      ...item,
-      size: Number(item.size),
-      language: detectLanguage(item.originalName),
-    })),
+    items: items.map(item => {
+      let parsedMetadata: Record<string, any> = {};
+      parsedMetadata = parseMetadataValue(item.metadata as Prisma.JsonValue | null);
+
+      return {
+        ...item,
+        size: Number(item.size),
+        language: detectLanguage(item.originalName),
+        isGenerated: Boolean(parsedMetadata.isGenerated),
+        outputPath: typeof parsedMetadata.outputPath === 'string' ? parsedMetadata.outputPath : null,
+      };
+    }),
     total,
     page,
     pageSize,

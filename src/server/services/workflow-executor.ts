@@ -5,7 +5,7 @@
  */
 
 import { logger } from '../../mastra/runtime/logger.js';
-import { generateTestWorkflow } from '../../mastra/workflows/generate-test-workflow.js';
+import { runGenerateTestWorkflow } from './workflow-runner.js';
 
 /**
  * 执行结果
@@ -91,22 +91,20 @@ export async function executeWorkflow(
     addLog('开始执行 Workflow...', 'init');
 
     // 准备工作流输入
-    const workflowInput = {
-      sourceCode,
-      sourceFile: sourceFile || 'input',
-      language: language || 'python',
-      requirements,
-      maxAttempts,
-      outputDir,
-    };
-
     addLog(`输入: ${sourceFile} (${language})`, 'init');
 
     // 调用工作流
     addLog('调用 generateTestWorkflow...', 'start');
     onStep?.('start', 5);
 
-    const result = await (generateTestWorkflow as any).execute(workflowInput) as any;
+    const result = await runGenerateTestWorkflow({
+      sourceCode,
+      sourceFile: sourceFile || 'input',
+      language: language || 'python',
+      requirements,
+      maxAttempts,
+      outputDir,
+    });
 
     addLog('工作流执行完成', 'complete');
     onStep?.('complete', 100);
@@ -115,10 +113,23 @@ export async function executeWorkflow(
 
     return {
       success: true,
-      testCode: result.testCode || result.test_code,
-      testFile: result.testFile || result.test_file,
-      coverage: result.coverage,
-      execution: result.execution,
+      testCode: result.test_code,
+      testFile: result.exported_files?.find((file) => /test/i.test(file)),
+      coverage: result.coverage
+        ? {
+            line: Number(result.coverage.line_rate ?? 0),
+            branch: Number(result.coverage.branch_rate ?? 0),
+            function: 0,
+          }
+        : undefined,
+      execution: result.execution_detail
+        ? {
+            passed: result.execution_detail.passed,
+            failed: result.execution_detail.failed,
+            skipped: 0,
+            duration: result.execution_detail.duration_ms,
+          }
+        : undefined,
       executionTime,
       logs,
     };

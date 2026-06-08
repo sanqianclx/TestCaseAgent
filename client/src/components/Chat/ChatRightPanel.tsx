@@ -9,17 +9,19 @@
  * 支持折叠 / 展开，避免占用聊天宽度。
  */
 
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Tabs, List, Tag, Empty, Button, Space, Typography, Badge } from 'antd';
 import {
   ToolOutlined,
-  EyeOutlined,
+  FolderOpenOutlined,
   RightOutlined,
   CloseOutlined,
   CheckCircleOutlined,
   LoadingOutlined,
+  FileTextOutlined,
 } from '@ant-design/icons';
 import CodeViewer from '../Common/CodeViewer';
+import type { SessionOutputEntry } from '../../api/sessions';
 
 const { Text } = Typography;
 const { TabPane } = Tabs;
@@ -64,10 +66,28 @@ export interface ChatRightPanelProps {
   toolEvents: ToolEvent[];
   /** 当前活动任务 ID */
   activeTaskId?: string | null;
+  /** 当前会话 ID */
+  sessionId?: number | null;
   /** 预览文件 ID（来自 complete 事件） */
   previewFileId?: number | null;
   /** 预览文件语言 */
   previewLanguage?: string | null;
+  /** 预览代码兜底 */
+  previewCode?: string | null;
+  /** 当前会话输出目录项 */
+  outputEntries?: SessionOutputEntry[];
+  /** 当前输出目录 */
+  outputDir?: string | null;
+  /** 当前目录路径 */
+  currentOutputPath?: string;
+  /** 上级目录路径 */
+  parentOutputPath?: string | null;
+  /** 当前选中的输出文件路径 */
+  selectedOutputFilePath?: string | null;
+  /** 打开输出目录条目 */
+  onOpenOutputEntry?: (entry: SessionOutputEntry) => void;
+  /** 返回上级目录 */
+  onOpenParentOutputDir?: () => void;
   /** 任务是否正在执行 */
   isRunning: boolean;
   /** 宽度 */
@@ -103,14 +123,27 @@ const ChatRightPanel: React.FC<ChatRightPanelProps> = ({
   onToggleCollapse,
   toolEvents,
   activeTaskId,
+  sessionId,
   previewFileId,
   previewLanguage,
+  previewCode,
+  outputEntries = [],
+  outputDir,
+  currentOutputPath = '/',
+  parentOutputPath,
+  selectedOutputFilePath,
+  onOpenOutputEntry,
+  onOpenParentOutputDir,
   isRunning,
   width = 340,
   onApproveTool,
   onDeclineTool,
 }) => {
   const [activeTab, setActiveTab] = useState<string>('tools');
+  const selectedOutputFile = useMemo(
+    () => outputEntries.find((entry) => entry.path === selectedOutputFilePath) || null,
+    [outputEntries, selectedOutputFilePath]
+  );
 
   // 折叠时只显示竖排按钮
   if (collapsed) {
@@ -146,14 +179,14 @@ const ChatRightPanel: React.FC<ChatRightPanelProps> = ({
           title="工具调用"
         />
         <Button
-          type={activeTab === 'preview' ? 'primary' : 'text'}
+          type={activeTab === 'files' ? 'primary' : 'text'}
           size="small"
-          icon={<EyeOutlined />}
+          icon={<FolderOpenOutlined />}
           onClick={() => {
-            setActiveTab('preview');
+            setActiveTab('files');
             onToggleCollapse();
           }}
-          title="文件预览"
+          title="文件资源"
         />
         {(isRunning || toolEvents.length > 0) && (
           <Badge
@@ -291,37 +324,130 @@ const ChatRightPanel: React.FC<ChatRightPanelProps> = ({
         <TabPane
           tab={
             <span>
-              <EyeOutlined /> 文件预览
+              <FolderOpenOutlined /> 文件资源
             </span>
           }
-          key="preview"
-          style={{ flex: 1, overflow: 'auto', padding: 8 }}
+          key="files"
+          style={{ flex: 1, overflow: 'hidden', padding: 0 }}
         >
-          {previewFileId ? (
-            <>
-              {activeTaskId && (
-                <div
-                  style={{
-                    marginBottom: 6,
-                    fontSize: 11,
-                    color: '#888',
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                  }}
-                >
-                  <span>任务: {activeTaskId.slice(0, 8)}...</span>
+          {outputDir ? (
+            <div style={{ display: 'grid', gridTemplateColumns: '160px minmax(0, 1fr)', height: '100%' }}>
+              <div style={{ borderRight: '1px solid #f0f0f0', overflowY: 'auto', padding: 6 }}>
+                <div style={{ marginBottom: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+                  <Tag
+                    style={{
+                      marginRight: 0,
+                      maxWidth: 96,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      fontSize: 11,
+                      lineHeight: '18px',
+                      paddingInline: 6,
+                    }}
+                  >
+                    {currentOutputPath}
+                  </Tag>
+                  {parentOutputPath && (
+                    <Button size="small" type="text" style={{ paddingInline: 4 }} onClick={onOpenParentOutputDir}>
+                      返回
+                    </Button>
+                  )}
                 </div>
-              )}
+                {outputEntries.length > 0 ? (
+                  <List
+                    size="small"
+                    dataSource={outputEntries}
+                    renderItem={(entry) => (
+                      <List.Item
+                        onClick={() => onOpenOutputEntry?.(entry)}
+                        style={{
+                          cursor: 'pointer',
+                          padding: '4px 6px',
+                          borderRadius: 4,
+                          marginBottom: 1,
+                          background: entry.path === selectedOutputFilePath ? '#e6f4ff' : 'transparent',
+                          border: entry.path === selectedOutputFilePath ? '1px solid #91caff' : '1px solid transparent',
+                        }}
+                      >
+                        <Space size={4} style={{ width: '100%', minWidth: 0 }}>
+                          {entry.type === 'directory' ? (
+                            <FolderOpenOutlined style={{ color: '#1677ff', flexShrink: 0 }} />
+                          ) : (
+                            <FileTextOutlined style={{ color: '#1677ff', flexShrink: 0 }} />
+                          )}
+                          <Text
+                            style={{ fontSize: 12, minWidth: 0, flex: 1 }}
+                            ellipsis={{ tooltip: entry.name }}
+                          >
+                            {entry.name}
+                          </Text>
+                        </Space>
+                      </List.Item>
+                    )}
+                  />
+                ) : (
+                  <Empty
+                    image={Empty.PRESENTED_IMAGE_SIMPLE}
+                    description="空目录"
+                    style={{ marginTop: 20 }}
+                  />
+                )}
+              </div>
+              <div style={{ overflow: 'auto', padding: 6 }}>
+                {selectedOutputFile && selectedOutputFile.type === 'file' ? (
+                  <>
+                    <div
+                      style={{
+                        marginBottom: 6,
+                        fontSize: 11,
+                        color: '#888',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                      title={selectedOutputFile.path}
+                    >
+                      {selectedOutputFile.path}
+                    </div>
+                    <CodeViewer
+                      sessionOutputFile={
+                        sessionId && selectedOutputFilePath
+                          ? { sessionId, path: selectedOutputFilePath }
+                          : undefined
+                      }
+                      language={selectedOutputFile.language || previewLanguage || 'python'}
+                      maxHeight={typeof window !== 'undefined' ? window.innerHeight - 220 : 480}
+                    />
+                  </>
+                ) : (
+                  <Empty
+                    image={Empty.PRESENTED_IMAGE_SIMPLE}
+                    description="选择左侧文件进行预览"
+                    style={{ marginTop: 32 }}
+                  />
+                )}
+              </div>
+            </div>
+          ) : previewFileId ? (
+            <div style={{ padding: 8 }}>
               <CodeViewer
                 fileId={previewFileId}
                 language={previewLanguage || 'python'}
                 maxHeight={typeof window !== 'undefined' ? window.innerHeight - 220 : 480}
               />
-            </>
+            </div>
+          ) : previewCode ? (
+            <div style={{ padding: 8 }}>
+              <CodeViewer
+                code={previewCode}
+                language={previewLanguage || 'python'}
+                maxHeight={typeof window !== 'undefined' ? window.innerHeight - 220 : 480}
+              />
+            </div>
           ) : (
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description={isRunning ? 'AI 正在生成...' : '任务完成后将在此显示测试代码'}
+              description={isRunning ? 'AI 正在生成文件资源...' : '当前会话暂无生成文件'}
               style={{ marginTop: 40 }}
             />
           )}

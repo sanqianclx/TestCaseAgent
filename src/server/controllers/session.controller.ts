@@ -95,13 +95,14 @@ export const getSessionById = asyncHandler(async (req: Request, res: Response) =
 export const updateSession = asyncHandler(async (req: Request, res: Response) => {
   const userId = req.user!.id;
   const sessionId = parseInt(req.params.id);
-  const { title, status, modelConfig, workspaceId } = req.body;
+  const { title, status, modelConfig, workspaceId, outputDir } = req.body;
 
   const result = await sessionService.updateSession(userId, sessionId, {
     title,
     status,
     modelConfig,
     workspaceId,
+    outputDir,
   });
 
   sendSuccess(res, result, '会话更新成功');
@@ -213,6 +214,26 @@ export const getSessionStats = asyncHandler(async (req: Request, res: Response) 
   const userId = req.user!.id;
 
   const result = await sessionService.getSessionStats(userId);
+
+  sendSuccess(res, result);
+});
+
+export const getSessionOutputFiles = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+  const sessionId = parseInt(req.params.id);
+  const { path: subPath } = req.query as { path?: string };
+
+  const result = await sessionService.getSessionOutputFiles(userId, sessionId, subPath);
+
+  sendSuccess(res, result);
+});
+
+export const getSessionOutputFileContent = asyncHandler(async (req: Request, res: Response) => {
+  const userId = req.user!.id;
+  const sessionId = parseInt(req.params.id);
+  const { path: filePath, encoding } = req.query as { path?: string; encoding?: string };
+
+  const result = await sessionService.getSessionOutputFileContent(userId, sessionId, filePath || '', encoding);
 
   sendSuccess(res, result);
 });

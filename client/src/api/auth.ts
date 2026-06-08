@@ -54,7 +54,6 @@ export interface UserInfo {
     apiKeys: number;
     workspaces: number;
     sessions: number;
-    tasks: number;
   };
 }
 

@@ -26,7 +26,7 @@ router.use(authenticate);
  * 任务日志查询参数验证模式
  */
 const taskLogsQuerySchema = z.object({
-  level: z.enum(['info', 'warn', 'error', 'debug', 'step']).optional(),
+  level: z.enum(['info', 'warn', 'error', 'debug', 'step']).transform((value) => value.toLowerCase()).optional(),
   step: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(500).default(100),
   offset: z.coerce.number().int().min(0).default(0),

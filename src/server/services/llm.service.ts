@@ -162,7 +162,13 @@ async function executeWorkflowTask(taskId: string, params: ExecuteTaskParams): P
             filename: result.testFile || `test_output_${Date.now()}.${language === 'python' ? 'py' : language === 'java' ? 'java' : 'txt'}`,
             content: result.testCode,
             purpose: 'test_output',
-            metadata: { sourceTaskId: taskId, language, sourceFile, kind: 'unit_test' },
+            metadata: {
+              sourceTaskId: taskId,
+              language,
+              sourceFile,
+              kind: 'unit_test',
+              outputPath: result.testFile ? `${finalOutputDir}/${result.testFile}` : finalOutputDir,
+            },
           });
           previewFileId = reg.id;
         } catch (regErr: any) {
@@ -242,6 +248,11 @@ ${sourceContent}
 ## 额外要求
 ${requirements || '无'}
 
+## 输出目录约束
+${finalOutputDir}
+
+除非用户明确指定其他路径，否则请把生成的测试文件和相关产物写入上面的输出目录。
+
 请分析代码并生成完整的单元测试。
 `;
 
@@ -267,7 +278,13 @@ ${requirements || '无'}
             filename: result.testFile || `test_output_${Date.now()}.${language === 'python' ? 'py' : language === 'java' ? 'java' : 'txt'}`,
             content: result.testCode,
             purpose: 'test_output',
-            metadata: { sourceTaskId: taskId, language, sourceFile, kind: 'unit_test' },
+            metadata: {
+              sourceTaskId: taskId,
+              language,
+              sourceFile,
+              kind: 'unit_test',
+              outputPath: result.testFilePath || (result.testFile ? `${finalOutputDir}/${result.testFile}` : finalOutputDir),
+            },
           });
           previewFileId = reg.id;
         } catch (regErr: any) {

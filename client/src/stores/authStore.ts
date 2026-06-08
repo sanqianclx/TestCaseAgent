@@ -9,6 +9,8 @@ import * as authApi from '../api/auth';
 import type { UserInfo } from '../api/auth';
 
 const USER_STORAGE_KEY = 'tg_user';
+const ACCESS_TOKEN_KEY = 'accessToken';
+const REFRESH_TOKEN_KEY = 'refreshToken';
 
 interface AuthState {
   user: UserInfo | null;
@@ -49,18 +51,24 @@ function setStoredUser(user: UserInfo | null) {
   }
 }
 
+function clearStoredAuth() {
+  localStorage.removeItem(ACCESS_TOKEN_KEY);
+  localStorage.removeItem(REFRESH_TOKEN_KEY);
+  setStoredUser(null);
+}
+
 export const useAuthStore = create<AuthState>((set) => ({
   user: getStoredUser(),
-  isAuthenticated: !!localStorage.getItem('accessToken'),
-  isLoading: false,
+  isAuthenticated: false,
+  isLoading: true,
   error: null,
 
   login: async (email: string, password: string) => {
     set({ isLoading: true, error: null });
     try {
       const result = await authApi.login({ email, password });
-      localStorage.setItem('accessToken', result.accessToken);
-      localStorage.setItem('refreshToken', result.refreshToken);
+      localStorage.setItem(ACCESS_TOKEN_KEY, result.accessToken);
+      localStorage.setItem(REFRESH_TOKEN_KEY, result.refreshToken);
       setStoredUser(result.user as UserInfo);
       set({
         user: result.user as UserInfo,
@@ -80,8 +88,8 @@ export const useAuthStore = create<AuthState>((set) => ({
     set({ isLoading: true, error: null });
     try {
       const result = await authApi.register({ username, email, password });
-      localStorage.setItem('accessToken', result.accessToken);
-      localStorage.setItem('refreshToken', result.refreshToken);
+      localStorage.setItem(ACCESS_TOKEN_KEY, result.accessToken);
+      localStorage.setItem(REFRESH_TOKEN_KEY, result.refreshToken);
       setStoredUser(result.user as UserInfo);
       set({
         user: result.user as UserInfo,
@@ -98,27 +106,20 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   logout: () => {
-    localStorage.removeItem('accessToken');
-    localStorage.removeItem('refreshToken');
-    setStoredUser(null);
-    set({ user: null, isAuthenticated: false });
+    clearStoredAuth();
+    set({ user: null, isAuthenticated: false, isLoading: false, error: null });
   },
 
   fetchUser: async () => {
-    const token = localStorage.getItem('accessToken');
-    if (!token) {
-      set({ user: null, isAuthenticated: false, isLoading: false });
-      return;
-    }
-
-    set({ isLoading: true });
+    set({ isLoading: true, error: null });
     try {
       const user = await authApi.getMe();
       setStoredUser(user);
       set({ user, isAuthenticated: true, isLoading: false });
     } catch (error) {
       console.error('获取用户信息失败:', error);
-      set({ isLoading: false });
+      clearStoredAuth();
+      set({ user: null, isAuthenticated: false, isLoading: false });
     }
   },
 

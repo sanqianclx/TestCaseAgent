@@ -41,6 +41,11 @@ const messageQuerySchema = z.object({
   before: z.coerce.number().int().positive().optional(),
 });
 
+const outputPathQuerySchema = z.object({
+  path: z.string().optional(),
+  encoding: z.string().optional(),
+});
+
 /**
  * GET /api/v1/sessions/stats
  * 获取会话统计
@@ -88,6 +93,18 @@ router.post('/:id/archive', validateParams(idParamSchema), sessionController.arc
  * 获取消息历史
  */
 router.get('/:id/messages', validateParams(idParamSchema), validateQuery(messageQuerySchema), sessionController.getMessages);
+
+/**
+ * GET /api/v1/sessions/:id/output-files
+ * 浏览当前会话输出目录
+ */
+router.get('/:id/output-files', validateParams(idParamSchema), validateQuery(outputPathQuerySchema), sessionController.getSessionOutputFiles);
+
+/**
+ * GET /api/v1/sessions/:id/output-file
+ * 读取当前会话输出目录中的文件内容
+ */
+router.get('/:id/output-file', validateParams(idParamSchema), validateQuery(outputPathQuerySchema), sessionController.getSessionOutputFileContent);
 
 /**
  * POST /api/v1/sessions/:id/messages

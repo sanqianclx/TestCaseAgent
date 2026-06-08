@@ -7,6 +7,10 @@
 import prisma from '../config/database.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { ErrorCode, createPagination } from '../utils/response.js';
+import { cancelSessionTaskRuns } from './task-runtime-registry.js';
+import fs from 'fs/promises';
+import path from 'path';
+import iconv from 'iconv-lite';
 
 /**
  * 创建会话参数
@@ -28,6 +32,7 @@ export interface UpdateSessionParams {
   status?: 'active' | 'archived';
   modelConfig?: Record<string, any>;
   workspaceId?: number;
+  outputDir?: string | null;
 }
 
 /**
@@ -39,6 +44,151 @@ export interface SendMessageParams {
   metadata?: Record<string, any>;
   fileIds?: number[];
   taskMode?: 'workflow' | 'autonomous';
+}
+
+function parseSessionContext(context: unknown): Record<string, any> | null {
+  if (!context) return null;
+  if (typeof context === 'string') {
+    try {
+      return JSON.parse(context);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof context === 'object') {
+    return context as Record<string, any>;
+  }
+  return null;
+}
+
+async function getResolvedSessionOutputDir(userId: number, sessionId: number): Promise<string> {
+  const session = await prisma.session.findFirst({
+    where: {
+      id: sessionId,
+      userId,
+      status: { not: 'deleted' },
+    },
+    select: {
+      context: true,
+      workspace: {
+        select: {
+          basePath: true,
+        },
+      },
+    },
+  });
+
+  if (!session) {
+    throw new AppError(ErrorCode.SESSION_NOT_FOUND, '会话不存在');
+  }
+
+  const sessionContext = parseSessionContext(session.context) || {};
+  const resolvedOutputDir =
+    typeof sessionContext.outputDir === 'string' && sessionContext.outputDir.trim()
+      ? sessionContext.outputDir.trim()
+      : session.workspace?.basePath;
+
+  if (!resolvedOutputDir) {
+    throw new AppError(ErrorCode.WORKSPACE_PATH_INVALID, '当前会话未配置输出目录');
+  }
+
+  return path.resolve(resolvedOutputDir);
+}
+
+const HIDDEN_DIRECTORY_NAMES = new Set([
+  '__pycache__',
+  '.git',
+  '.idea',
+  '.vscode',
+  'node_modules',
+]);
+
+const TEXT_FILE_EXTENSIONS = new Set([
+  '.py',
+  '.pyi',
+  '.java',
+  '.kt',
+  '.kts',
+  '.scala',
+  '.groovy',
+  '.cpp',
+  '.cc',
+  '.cxx',
+  '.c',
+  '.h',
+  '.hpp',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+  '.ts',
+  '.tsx',
+  '.json',
+  '.md',
+  '.txt',
+  '.xml',
+  '.html',
+  '.htm',
+  '.css',
+  '.scss',
+  '.less',
+  '.yaml',
+  '.yml',
+  '.ini',
+  '.toml',
+  '.sh',
+  '.bat',
+  '.cmd',
+  '.ps1',
+  '.sql',
+  '.csv',
+  '.log',
+  '.env',
+  '.dockerfile',
+]);
+
+function getFileLanguage(filename: string): string {
+  const ext = path.extname(filename).toLowerCase();
+  const languageMap: Record<string, string> = {
+    '.py': 'python',
+    '.pyi': 'python',
+    '.java': 'java',
+    '.cpp': 'cpp',
+    '.cc': 'cpp',
+    '.cxx': 'cpp',
+    '.c': 'cpp',
+    '.h': 'cpp',
+    '.hpp': 'cpp',
+    '.js': 'javascript',
+    '.jsx': 'javascript',
+    '.mjs': 'javascript',
+    '.cjs': 'javascript',
+    '.ts': 'typescript',
+    '.tsx': 'typescript',
+    '.json': 'json',
+    '.md': 'markdown',
+    '.txt': 'text',
+    '.xml': 'xml',
+    '.yml': 'yaml',
+    '.yaml': 'yaml',
+    '.html': 'html',
+    '.htm': 'html',
+    '.css': 'css',
+    '.scss': 'scss',
+    '.less': 'less',
+    '.sql': 'sql',
+    '.sh': 'bash',
+    '.bat': 'batch',
+    '.cmd': 'batch',
+    '.ps1': 'powershell',
+  };
+  return languageMap[ext] || 'text';
+}
+
+function isPreviewableTextFile(filename: string): boolean {
+  const lowerName = filename.toLowerCase();
+  if (lowerName === 'dockerfile' || lowerName === '.env') return true;
+  return TEXT_FILE_EXTENSIONS.has(path.extname(lowerName));
 }
 
 /**
@@ -219,11 +369,14 @@ export async function getSessionById(userId: number, sessionId: number) {
     throw new AppError(ErrorCode.SESSION_NOT_FOUND, '会话不存在');
   }
 
+  const parsedContext = parseSessionContext(session.context);
+
   return {
     ...session,
     id: Number(session.id),
     messageCount: Number(session.messageCount),
     totalTokens: Number(session.totalTokens || 0),
+    outputDir: typeof parsedContext?.outputDir === 'string' ? parsedContext.outputDir : null,
     workspace: session.workspace
       ? { ...session.workspace, id: Number(session.workspace.id) }
       : null,
@@ -269,6 +422,16 @@ export async function updateSession(
       throw new AppError(ErrorCode.WORKSPACE_NOT_FOUND, '工作空间不存在');
     }
     updateData.workspaceId = params.workspaceId;
+  }
+  if (params.outputDir !== undefined) {
+    const existingContext = parseSessionContext(existing.context) || {};
+    const nextContext = { ...(existingContext as Record<string, unknown>) };
+    if (params.outputDir) {
+      nextContext.outputDir = params.outputDir;
+    } else {
+      delete nextContext.outputDir;
+    }
+    updateData.context = JSON.stringify(nextContext);
   }
 
   const session = await prisma.session.update({
@@ -319,6 +482,21 @@ export async function deleteSession(userId: number, sessionId: number): Promise<
   await prisma.session.update({
     where: { id: sessionId },
     data: { status: 'deleted' },
+  });
+
+  cancelSessionTaskRuns(sessionId);
+
+  await prisma.task.updateMany({
+    where: {
+      userId,
+      sessionId,
+      status: { in: ['pending', 'running'] },
+    },
+    data: {
+      status: 'cancelled',
+      errorMessage: '会话已删除，任务已取消',
+      completedAt: new Date(),
+    },
   });
 }
 
@@ -475,6 +653,18 @@ export async function sendMessage(
   // 验证会话是否存在
   const session = await prisma.session.findFirst({
     where: { id: sessionId, userId },
+    select: {
+      id: true,
+      status: true,
+      workspaceId: true,
+      context: true,
+      workspace: {
+        select: {
+          id: true,
+          basePath: true,
+        },
+      },
+    },
   });
 
   if (!session) {
@@ -550,6 +740,12 @@ export async function sendMessage(
 
   // 从会话上下文获取工作空间信息
   const workspaceId = session.workspaceId ? Number(session.workspaceId) : undefined;
+  const sessionContext = parseSessionContext(session.context) || {};
+  const workspaceBasePath = session.workspace?.basePath || undefined;
+  const resolvedOutputDir =
+    typeof sessionContext.outputDir === 'string' && sessionContext.outputDir.trim()
+      ? sessionContext.outputDir.trim()
+      : workspaceBasePath;
 
   try {
     // 创建并执行任务
@@ -561,6 +757,7 @@ export async function sendMessage(
       language: 'python', // 默认语言，后续可以从上下文推断
       requirements: params.content,
       mode: taskMode,
+      outputDir: resolvedOutputDir,
     });
 
     assistantContent = `已收到您的请求，正在使用 ${taskMode === 'workflow' ? 'Workflow 工作流' : 'Agent 自主模式'} 处理。\n\n任务 ID: ${taskId}\n\n您可以在任务管理页面查看执行进度。`;
@@ -629,5 +826,100 @@ export async function getSessionStats(userId: number) {
     archived,
     totalMessages: totalMessages._sum.messageCount || 0,
     totalTokens: totalTokens._sum.totalTokens || 0,
+  };
+}
+
+export async function getSessionOutputFiles(
+  userId: number,
+  sessionId: number,
+  subPath: string = ''
+) {
+  const outputDir = await getResolvedSessionOutputDir(userId, sessionId);
+  const normalizedSubPath = subPath && subPath !== '/' ? subPath.replace(/^[/\\]+/, '') : '';
+  const fullPath = path.resolve(outputDir, normalizedSubPath);
+
+  if (!fullPath.startsWith(outputDir)) {
+    throw new AppError(ErrorCode.WORKSPACE_NO_PERMISSION, '路径越界');
+  }
+
+  const stat = await fs.stat(fullPath).catch(() => null);
+  if (!stat || !stat.isDirectory()) {
+    throw new AppError(ErrorCode.WORKSPACE_PATH_INVALID, '输出目录不存在');
+  }
+
+  const entries = await fs.readdir(fullPath, { withFileTypes: true });
+  const files = await Promise.all(
+    entries.map(async (entry) => {
+      if (entry.isDirectory() && HIDDEN_DIRECTORY_NAMES.has(entry.name)) {
+        return null;
+      }
+
+      if (entry.isFile() && !isPreviewableTextFile(entry.name)) {
+        return null;
+      }
+
+      const entryPath = path.join(fullPath, entry.name);
+      const entryStat = await fs.stat(entryPath).catch(() => null);
+      if (!entryStat) return null;
+      const relativePath = path.relative(outputDir, entryPath).replace(/\\/g, '/');
+
+      return {
+        name: entry.name,
+        path: relativePath,
+        type: entry.isDirectory() ? 'directory' : 'file',
+        size: entry.isFile() ? entryStat.size : null,
+        language: entry.isFile() ? getFileLanguage(entry.name) : null,
+        lastModified: entryStat.mtime.toISOString(),
+      };
+    })
+  );
+
+  const visibleFiles = files.filter((file): file is NonNullable<typeof file> => Boolean(file));
+  visibleFiles.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  return {
+    outputDir,
+    currentPath: normalizedSubPath || '/',
+    parentPath: normalizedSubPath ? path.dirname(normalizedSubPath).replace(/\\/g, '/') : null,
+    files: visibleFiles,
+  };
+}
+
+export async function getSessionOutputFileContent(
+  userId: number,
+  sessionId: number,
+  filePath: string,
+  encoding: string = 'utf-8'
+) {
+  const outputDir = await getResolvedSessionOutputDir(userId, sessionId);
+  const normalizedFilePath = filePath.replace(/^[/\\]+/, '');
+  const fullPath = path.resolve(outputDir, normalizedFilePath);
+
+  if (!fullPath.startsWith(outputDir)) {
+    throw new AppError(ErrorCode.WORKSPACE_NO_PERMISSION, '路径越界');
+  }
+
+  const stat = await fs.stat(fullPath).catch(() => null);
+  if (!stat || !stat.isFile()) {
+    throw new AppError(ErrorCode.FILE_NOT_FOUND, '文件不存在');
+  }
+
+  const normalizedEncoding = (encoding || 'utf-8').trim().toLowerCase();
+  if (!iconv.encodingExists(normalizedEncoding)) {
+    throw new AppError(ErrorCode.SYSTEM_VALIDATION_ERROR, `不支持的编码: ${encoding}`);
+  }
+
+  const raw = await fs.readFile(fullPath);
+  const content = iconv.decode(raw, normalizedEncoding);
+  return {
+    outputDir,
+    path: normalizedFilePath.replace(/\\/g, '/'),
+    filename: path.basename(fullPath),
+    content,
+    encoding: normalizedEncoding,
+    lineCount: content.split('\n').length,
   };
 }

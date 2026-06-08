@@ -16,7 +16,6 @@ import {
   LogoutOutlined,
   SettingOutlined,
   ExperimentOutlined,
-  UnorderedListOutlined,
 } from '@ant-design/icons';
 import { useAuthStore } from '../../stores/authStore';
 
@@ -43,11 +42,6 @@ const menuItems = [
     key: '/sessions',
     icon: <ExperimentOutlined />,
     label: '会话历史',
-  },
-  {
-    key: '/tasks',
-    icon: <UnorderedListOutlined />,
-    label: '测试任务',
   },
   {
     key: '/workspaces',

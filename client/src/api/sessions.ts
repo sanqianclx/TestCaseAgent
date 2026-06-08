@@ -17,10 +17,20 @@ export interface Session {
   totalTokens: number;
   lastMessageAt: string | null;
   createdAt: string;
+  outputDir?: string | null;
   workspace: {
     id: number;
     name: string;
   } | null;
+}
+
+export interface SessionOutputEntry {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  size: number | null;
+  language: string | null;
+  lastModified: string;
 }
 
 /**
@@ -154,5 +164,37 @@ export async function getSessionStats(): Promise<{
   totalTokens: number;
 }> {
   const response = await apiClient.get('/sessions/stats');
+  return response.data.data;
+}
+
+export async function getSessionOutputFiles(
+  sessionId: number,
+  path?: string
+): Promise<{
+  outputDir: string;
+  currentPath: string;
+  parentPath: string | null;
+  files: SessionOutputEntry[];
+}> {
+  const response = await apiClient.get(`/sessions/${sessionId}/output-files`, {
+    params: path ? { path } : undefined,
+  });
+  return response.data.data;
+}
+
+export async function getSessionOutputFileContent(
+  sessionId: number,
+  path: string
+): Promise<{
+  outputDir: string;
+  path: string;
+  filename: string;
+  content: string;
+  encoding: string;
+  lineCount: number;
+}> {
+  const response = await apiClient.get(`/sessions/${sessionId}/output-file`, {
+    params: { path },
+  });
   return response.data.data;
 }

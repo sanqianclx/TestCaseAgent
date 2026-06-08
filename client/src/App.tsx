@@ -17,7 +17,6 @@ import Register from './pages/Auth/Register';
 import Dashboard from './pages/Dashboard/index';
 import Chat from './pages/Chat/index';
 import Sessions from './pages/Sessions/index';
-import Tasks from './pages/Tasks/index';
 import Workspaces from './pages/Workspaces/index';
 import Files from './pages/Files/index';
 import Profile from './pages/Profile/index';
@@ -40,12 +39,20 @@ const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) =
  * 应用主组件
  */
 const App: React.FC = () => {
-  const { fetchUser, isLoading } = useAuthStore();
+  const { fetchUser, logout, isLoading } = useAuthStore();
 
   // 应用启动时，尝试获取用户信息（通过 cookie 自动认证）
   useEffect(() => {
     fetchUser();
   }, [fetchUser]);
+
+  useEffect(() => {
+    const handleLogout = () => logout();
+    window.addEventListener('auth:logout', handleLogout);
+    return () => {
+      window.removeEventListener('auth:logout', handleLogout);
+    };
+  }, [logout]);
 
   // 首次加载时显示加载状态
   if (isLoading) {
@@ -73,7 +80,6 @@ const App: React.FC = () => {
             <Route path="dashboard" element={<Dashboard />} />
             <Route path="chat" element={<Chat />} />
             <Route path="sessions" element={<Sessions />} />
-            <Route path="tasks" element={<Tasks />} />
             <Route path="workspaces" element={<Workspaces />} />
             <Route path="files" element={<Files />} />
             <Route path="profile" element={<Profile />} />
