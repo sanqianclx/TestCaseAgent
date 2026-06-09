@@ -180,9 +180,15 @@ export async function executeAgentNonInteractive(
       const r: any = call.result;
       if (!r || typeof r !== 'object') continue;
       const toolName = call.toolName;
-      // measureCoverage 返回 { line, branch, function } 或 { symbol_coverage, ... }
+      // measureCoverage 返回统一覆盖率字段 { line_rate, branch_rate, ... }；兼容旧字段。
       if (toolName === 'measureCoverage' || toolName === 'measure-coverage') {
-        if (typeof r.line === 'number') {
+        if (typeof r.line_rate === 'number') {
+          coverage = {
+            line: r.line_rate,
+            branch: Number(r.branch_rate ?? 0),
+            function: Number(r.function_rate ?? 0),
+          };
+        } else if (typeof r.line === 'number') {
           coverage = {
             line: r.line,
             branch: r.branch ?? 0,

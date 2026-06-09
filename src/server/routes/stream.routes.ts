@@ -6,7 +6,13 @@
 
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth.js';
-import { streamAutonomousAgent, streamWorkflow } from '../services/stream.service.js';
+import {
+  isIncompleteAgentFinishReason,
+  rememberAgentText,
+  rememberAgentToolResult,
+  streamAutonomousAgent,
+  streamWorkflow,
+} from '../services/stream.service.js';
 import { registerGeneratedFile } from '../services/file.service.js';
 import {
   registerTaskRun,
@@ -27,6 +33,32 @@ const router = Router();
  * @param fileIds 文件 ID 列表
  * @returns 拼装好的附件 markdown 块
  */
+async function resolveSessionFileIds(userId: number, params: { fileIds?: number[]; sessionId?: number }): Promise<number[]> {
+  const explicitIds = Array.isArray(params.fileIds)
+    ? params.fileIds.map(Number).filter((id) => Number.isFinite(id) && id > 0)
+    : [];
+
+  if (explicitIds.length > 0) {
+    if (params.sessionId) {
+      await prisma.uploadedFile.updateMany({
+        where: { id: { in: explicitIds }, userId },
+        data: { sessionId: params.sessionId },
+      }).catch((error: any) => {
+        logger.warn('system', { scope: 'stream/agent', event_name: 'uploadedFile.attachSession.failed', error: error?.message });
+      });
+    }
+    return explicitIds;
+  }
+
+  if (!params.sessionId) return [];
+  const sessionFiles = await prisma.uploadedFile.findMany({
+    where: { userId, sessionId: params.sessionId, purpose: 'source' },
+    select: { id: true },
+    orderBy: { createdAt: 'asc' },
+  });
+  return sessionFiles.map((file: any) => Number(file.id));
+}
+
 async function buildAttachmentsBlock(userId: number, fileIds: number[]): Promise<string> {
   if (!Array.isArray(fileIds) || fileIds.length === 0) return '';
   const files = await prisma.uploadedFile.findMany({
@@ -48,6 +80,53 @@ async function buildAttachmentsBlock(userId: number, fileIds: number[]): Promise
       return `### 附件: ${f.originalName}\n\`\`\`${lang}\n${truncated}\n\`\`\``;
     });
   return blocks.join('\n\n');
+}
+
+async function resolveWorkflowSourceInput(
+  userId: number,
+  params: {
+    sourceCode?: string;
+    sourceFile?: string;
+    language?: string;
+    fileIds?: number[];
+  }
+): Promise<{ sourceCode: string; sourceFile: string; language: string }> {
+  if (typeof params.sourceCode === 'string' && params.sourceCode.trim()) {
+    return {
+      sourceCode: params.sourceCode,
+      sourceFile: params.sourceFile || 'chat-input',
+      language: params.language || inferLanguage(params.sourceFile || ''),
+    };
+  }
+
+  const firstFileId = Array.isArray(params.fileIds) ? params.fileIds[0] : undefined;
+  if (!firstFileId) {
+    throw new Error('Workflow 模式需要上传或选择一个源代码文件');
+  }
+
+  const file = await prisma.uploadedFile.findFirst({
+    where: { id: firstFileId, userId },
+    include: { contents: { take: 1, orderBy: { chunkIndex: 'asc' } } },
+  });
+
+  if (!file || !file.contents?.[0]) {
+    throw new Error('Workflow 源文件不存在或内容为空');
+  }
+
+  const sourceFile = params.sourceFile || file.originalName;
+  return {
+    sourceCode: file.contents[0].content?.toString('utf-8') || '',
+    sourceFile,
+    language: params.language || inferLanguage(sourceFile),
+  };
+}
+
+function inferLanguage(sourceFile: string): string {
+  const ext = sourceFile.split('.').pop()?.toLowerCase();
+  if (ext === 'py') return 'python';
+  if (ext === 'java') return 'java';
+  if (ext === 'cpp' || ext === 'cc' || ext === 'cxx' || ext === 'c') return 'cpp';
+  return 'python';
 }
 
 function parseSessionContext(context: unknown): Record<string, any> | null {
@@ -98,7 +177,7 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
   const resolvedMode = mode === 'workflow' ? 'workflow' : 'autonomous';
   const createdTaskId = taskId || generateUUID();
   const resolvedSessionId = sessionId ? Number(sessionId) : undefined;
-  const resolvedLanguage = language || 'python';
+  let resolvedLanguage = language || 'python';
   const resolvedSourceFile = sourceFile || 'chat-input';
 
   let sessionRecord:
@@ -164,6 +243,27 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
       ? sessionContext.outputDir.trim()
       : workspaceRecord?.basePath || undefined;
 
+  let workflowSourceInput: { sourceCode: string; sourceFile: string; language: string } | null = null;
+  const resolvedFileIds = await resolveSessionFileIds(userId, {
+    fileIds,
+    sessionId: resolvedSessionId,
+  });
+
+  if (resolvedMode === 'workflow') {
+    try {
+      workflowSourceInput = await resolveWorkflowSourceInput(userId, {
+        sourceCode,
+        sourceFile: resolvedSourceFile,
+        language: resolvedLanguage,
+        fileIds: resolvedFileIds,
+      });
+      resolvedLanguage = workflowSourceInput.language;
+    } catch (e: any) {
+      sendEvent('error', { message: e?.message || 'Workflow 源文件解析失败', taskId: createdTaskId });
+      return res.end();
+    }
+  }
+
   try {
     await prisma.task.create({
       data: {
@@ -173,8 +273,8 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
         taskId: createdTaskId,
         status: 'running',
         mode: resolvedMode as any,
-        sourceFile: resolvedSourceFile,
-        sourceContent: sourceCode || content || '',
+        sourceFile: workflowSourceInput?.sourceFile || resolvedSourceFile,
+        sourceContent: workflowSourceInput?.sourceCode || sourceCode || content || '',
         language: resolvedLanguage,
         requirements: content || '',
         outputDir: resolvedOutputDir,
@@ -242,6 +342,40 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
       unregisterTaskRun(createdTaskId);
       res.end();
     },
+    onIncomplete: async (e: any) => {
+      try {
+        await prisma.task.update({
+          where: { taskId: createdTaskId },
+          data: {
+            status: 'completed',
+            outputDir: e.outputDir || resolvedOutputDir,
+            result: {
+              incomplete: true,
+              finishReason: e.finishReason || '',
+              message: e.message || '',
+              outputDir: e.outputDir || resolvedOutputDir,
+            },
+            errorMessage: null,
+            completedAt: new Date(),
+          },
+        });
+        await prisma.taskLog.create({
+          data: {
+            taskId: createdTaskId,
+            sessionId: resolvedSessionId,
+            level: 'info',
+            step: 'incomplete',
+            message: e.message || 'Agent 本轮未完成，等待继续',
+            metadata: { finishReason: e.finishReason || '' },
+          },
+        });
+      } catch (err: any) {
+        logger.warn('system', { scope: 'stream/agent', event_name: 'task.incomplete.failed', error: err?.message });
+      }
+      sendEvent('complete', { ...e, taskId: createdTaskId });
+      unregisterTaskRun(createdTaskId);
+      res.end();
+    },
     onError: async (e: Error) => {
       const isCancelled = e instanceof TaskCancelledError;
       try {
@@ -280,7 +414,7 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
   // 把上传的附件内容拼到 prompt
   let enrichedContent = content || '';
   try {
-    const attachBlock = await buildAttachmentsBlock(userId, fileIds || []);
+    const attachBlock = await buildAttachmentsBlock(userId, resolvedFileIds);
     if (attachBlock) {
       enrichedContent = `${content || ''}\n\n## 用户上传的附件\n\n${attachBlock}`;
     }
@@ -293,18 +427,18 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
     sessionId: resolvedSessionId,
     workspaceId: resolvedWorkspaceId,
     outputDir: resolvedOutputDir,
-    sourceFile: resolvedSourceFile,
+    sourceFile: workflowSourceInput?.sourceFile || resolvedSourceFile,
     language: resolvedLanguage,
   };
 
-  if (mode === 'workflow' && (sourceCode || enrichedContent)) {
+  if (resolvedMode === 'workflow' && workflowSourceInput) {
     // Workflow 模式
     await streamWorkflow(
       userId,
-      sourceCode || enrichedContent,
-      resolvedSourceFile,
+      workflowSourceInput.sourceCode,
+      workflowSourceInput.sourceFile,
       resolvedLanguage,
-      enrichedContent,
+      content || '',
       callbacks,
       streamOptions
     );
@@ -377,10 +511,8 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
         decision,
         answer: answer || '(no answer)',
       });
-      // 不需要准确的 sessionId——Mastra 框架以 runId 区分 run，
-      // memoryStore 注入只是辅助上下文
-      const sessionId = `api-agent-resume-${runId}`;
-      memoryStore.addMessage(sessionId, 'tool', toolMsg, {
+      const memorySessionId = sessionId ? `api-agent-session-${Number(sessionId)}` : `api-agent-resume-${runId}`;
+      memoryStore.addMessage(memorySessionId, 'tool', toolMsg, {
         toolName: pendingToolName || 'tool',
         toolCallId,
         decision,
@@ -412,11 +544,14 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
     let testCode = '';
     let testFile = '';
     const toolCalls: Array<{ toolName: string; args: any; result: any }> = [];
+    const memorySessionId = sessionId ? `api-agent-session-${Number(sessionId)}` : `api-agent-resume-${runId}`;
+    let fullText = '';
     for await (const chunk of (resumeStream as any).fullStream) {
       throwIfTaskRunCancelled(taskId);
       const type = (chunk as any).type;
       const payload = (chunk as any).payload;
       if (type === 'text-delta' && payload?.text) {
+        fullText += payload.text;
         sendEvent('progress', {
           type: 'text',
           step: 'response',
@@ -443,6 +578,9 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
         const result = payload?.result ?? payload?.output ?? null;
         if (lastCall && lastCall.result === null) {
           lastCall.result = result;
+        }
+        if (lastCall) {
+          rememberAgentToolResult(memorySessionId, lastCall);
         }
         if (lastCall && (lastCall.toolName === 'writeFile' || lastCall.toolName === 'write-file')) {
           const r: any = result;
@@ -497,6 +635,7 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
 
     const finalFinishReason = (fullOutput?.finishReason as string | undefined) ?? lastFinishReason ?? '';
     const finalRunId = (fullOutput?.runId as string | undefined) ?? lastRunId ?? '';
+    const finalText = typeof fullOutput?.text === 'string' ? fullOutput.text : fullText;
 
     if (finalFinishReason === 'suspended' || suspendPayloadFromChunk) {
       throwIfTaskRunCancelled(taskId);
@@ -532,6 +671,47 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
         res.end();
         return;
       }
+    }
+
+    if (finalText.trim()) {
+      rememberAgentText(memorySessionId, finalText, { source: 'resume', finishReason: finalFinishReason, runId: finalRunId });
+    }
+
+    if (isIncompleteAgentFinishReason(finalFinishReason)) {
+      const pauseMessage = `Agent 审批恢复后未自然完成：${finalFinishReason}。进度已保存，请发送“继续”接着执行。`;
+      try {
+        if (taskId) {
+          await prisma.task.update({
+            where: { taskId },
+            data: {
+              status: 'completed',
+              result: {
+                incomplete: true,
+                finishReason: finalFinishReason,
+                message: pauseMessage,
+              },
+              errorMessage: null,
+              completedAt: new Date(),
+            },
+          });
+          await prisma.taskLog.create({
+            data: {
+              taskId,
+              sessionId: sessionId ? Number(sessionId) : undefined,
+              level: 'info',
+              step: 'incomplete',
+              message: pauseMessage,
+              metadata: { finishReason: finalFinishReason, runId: finalRunId },
+            },
+          });
+        }
+      } catch (e: any) {
+        logger.warn('system', { scope: 'stream/agent/resume', event_name: 'task.incomplete.failed', error: e?.message });
+      }
+      sendEvent('complete', { success: false, incomplete: true, finishReason: finalFinishReason, message: pauseMessage, error: pauseMessage, taskId });
+      if (taskId) unregisterTaskRun(taskId);
+      res.end();
+      return;
     }
 
     if (writtenFileContent) {

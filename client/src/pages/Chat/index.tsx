@@ -95,8 +95,9 @@ interface WorkflowLogEntry {
   step: string;
   message: string;
   progress: number;
-  type: 'progress' | 'complete' | 'error';
+  type: 'progress' | 'trace' | 'complete' | 'error';
   at: string;
+  data?: Record<string, any>;
 }
 
 interface WorkflowSessionState {
@@ -119,6 +120,9 @@ const WORKFLOW_STEP_TITLES: Record<string, string> = {
   execute: '执行测试',
   heal: '自愈修复',
   export: '导出结果',
+  input: '准备输入',
+  'workflow-start': '启动运行',
+  'workflow-result': '结果摘要',
   workflow: '执行工作流',
   register: '登记产物',
   complete: '完成',
@@ -134,10 +138,15 @@ const WORKFLOW_STEP_ORDER = [
   'execute',
   'heal',
   'export',
+  'input',
+  'workflow-start',
   'workflow',
+  'workflow-result',
   'register',
   'complete',
 ];
+
+const DRAFT_SESSION_ID = -1;
 
 /**
  * 聊天页面
@@ -273,7 +282,8 @@ const Chat: React.FC = () => {
   const previewLanguage = currentPreview?.previewLanguage ?? 'python';
   const activeTaskId = currentPreview?.activeTaskId ?? null;
   const previewCode = currentPreview?.previewCode ?? null;
-  const attachments = currentSessionId != null ? attachmentsBySession[currentSessionId] || [] : [];
+  const attachmentSessionKey = currentSessionId ?? DRAFT_SESSION_ID;
+  const attachments = attachmentsBySession[attachmentSessionKey] || [];
   const outputEntries = currentSessionId != null ? outputEntriesBySession[currentSessionId] || [] : [];
   const outputDir = currentSessionId != null ? outputDirBySession[currentSessionId] ?? null : null;
   const currentOutputPath = currentSessionId != null ? currentOutputPathBySession[currentSessionId] || '/' : '/';
@@ -347,14 +357,28 @@ const Chat: React.FC = () => {
   const setAttachments = useCallback(
     (updater: React.SetStateAction<AttachedFile[]>) => {
       setAttachmentsBySession((prev) => {
-        if (currentSessionId == null) return prev;
-        const cur = prev[currentSessionId] || [];
+        const sid = currentSessionId ?? DRAFT_SESSION_ID;
+        const cur = prev[sid] || [];
         const next = typeof updater === 'function' ? (updater as (s: AttachedFile[]) => AttachedFile[])(cur) : updater;
-        return { ...prev, [currentSessionId]: next };
+        return { ...prev, [sid]: next };
       });
     },
     [currentSessionId]
   );
+  const migrateDraftAttachmentsToSession = useCallback((sessionId: number) => {
+    setAttachmentsBySession((prev) => {
+      const draft = prev[DRAFT_SESSION_ID] || [];
+      if (draft.length === 0) return prev;
+      const existing = prev[sessionId] || [];
+      const merged = [...existing];
+      for (const file of draft) {
+        if (!merged.some((item) => item.id === file.id)) merged.push(file);
+      }
+      const next = { ...prev, [sessionId]: merged };
+      delete next[DRAFT_SESSION_ID];
+      return next;
+    });
+  }, []);
   const setSessionOutputState = useCallback(
     (
       sessionId: number,
@@ -576,7 +600,9 @@ const Chat: React.FC = () => {
         });
       if (res.data.code === 0) {
         const newSession = res.data.data;
-        setCurrentSessionId(Number(newSession.id));
+        const newSessionId = Number(newSession.id);
+        setCurrentSessionId(newSessionId);
+        migrateDraftAttachmentsToSession(newSessionId);
         const boundWorkspaceId = newSession.workspace?.id ? Number(newSession.workspace.id) : null;
         setCurrentWorkspaceId(boundWorkspaceId);
         setWorkspaceLocked(Boolean(boundWorkspaceId));
@@ -586,7 +612,7 @@ const Chat: React.FC = () => {
         setPreviewCode(null);
         setError(null);
         setSelectedFile(null);
-        setAttachments([]);
+        setAttachmentsBySession((prev) => ({ ...prev, [newSessionId]: prev[newSessionId] || [] }));
         setOutputEntriesBySession((prev) => ({ ...prev, [Number(newSession.id)]: [] }));
         setCurrentOutputPathBySession((prev) => ({ ...prev, [Number(newSession.id)]: '/' }));
         setParentOutputPathBySession((prev) => ({ ...prev, [Number(newSession.id)]: null }));
@@ -754,6 +780,7 @@ const Chat: React.FC = () => {
     setInputValue('');
     setError(null);
     resetLivePanel();
+    const requestAttachments = attachments;
 
     // 还没有会话就先创建
     let sessionId = currentSessionId;
@@ -773,6 +800,7 @@ const Chat: React.FC = () => {
         if (res.data.code === 0) {
           sessionId = Number(res.data.data.id);
           setCurrentSessionId(sessionId);
+          migrateDraftAttachmentsToSession(sessionId);
           const boundWorkspaceId = res.data.data.workspace?.id ? Number(res.data.data.workspace.id) : null;
           setCurrentWorkspaceId(boundWorkspaceId);
           setWorkspaceLocked(Boolean(boundWorkspaceId));
@@ -831,9 +859,9 @@ const Chat: React.FC = () => {
       const requestData: any = {
         content,
         mode: taskMode,
-        sessionId,
-        workspaceId: currentWorkspaceId != null ? Number(currentWorkspaceId) : undefined,
-        fileIds: attachments.map((a) => a.id),
+          sessionId,
+          workspaceId: currentWorkspaceId != null ? Number(currentWorkspaceId) : undefined,
+        fileIds: requestAttachments.map((a) => a.id),
       };
 
       if (currentWorkspaceId) {
@@ -843,12 +871,12 @@ const Chat: React.FC = () => {
         }
       }
 
-      if (taskMode === 'workflow' && (selectedFile || attachments[0])) {
-        const srcName = selectedFile?.name || attachments[0].originalName;
+      if (taskMode === 'workflow' && (selectedFile || requestAttachments[0])) {
+        const srcName = selectedFile?.name || requestAttachments[0].originalName;
         requestData.sourceFile = srcName;
         requestData.language =
           selectedFile?.language ||
-          attachments[0].language ||
+          requestAttachments[0].language ||
           (srcName.endsWith('.py') ? 'python' : srcName.endsWith('.java') ? 'java' : 'python');
       }
 
@@ -910,6 +938,7 @@ const Chat: React.FC = () => {
           const nextProgress = typeof ev.progress === 'number' ? ev.progress : 0;
           const nextStep = ev.step || 'workflow';
           const nextMessage = ev.message || '';
+          const nextType = ev.type === 'trace' ? 'trace' : 'progress';
           setProgress(nextProgress);
           setCurrentStep(nextMessage);
           updateWorkflowState(sessionId, (prev) => ({
@@ -921,8 +950,9 @@ const Chat: React.FC = () => {
                 step: nextStep,
                 message: nextMessage,
                 progress: nextProgress,
-                type: 'progress',
+                type: nextType,
                 at: new Date().toISOString(),
+                data: ev.data,
               },
             ],
             progress: nextProgress,
@@ -1208,6 +1238,14 @@ const Chat: React.FC = () => {
           if (ev.previewFileId) setPreviewFileId(ev.previewFileId, sessionId);
           if (ev.testCode) setPreviewCode(ev.testCode, sessionId);
           void loadSessionOutputFiles(sessionId);
+          if (ev.incomplete) {
+            const pauseText = ev.error || ev.message || 'Agent 本轮未完成，进度已保存。发送“继续”可接着执行。';
+            setStreamMessages((prev) => prev.map((m) => m.id === assistantId ? { ...m, isStreaming: false } : m));
+            setCurrentStep(`⏸️ ${pauseText}`);
+            setProgress((prev) => Math.max(prev, 90));
+            if (fullAssistantText) saveMessageToServer(sessionId, 'assistant', fullAssistantText);
+            continue;
+          }
           if (ev.outputDir && !ev.previewFileId && ev.testCode) {
             setCurrentStep(`✅ 完成，产物目录：${ev.outputDir}`);
           }
@@ -1389,7 +1427,7 @@ const Chat: React.FC = () => {
                     <List.Item style={{ paddingInline: 0 }}>
                       <Space direction="vertical" size={2} style={{ width: '100%' }}>
                         <Space size={8}>
-                          <Tag color={log.type === 'error' ? 'error' : log.type === 'complete' ? 'success' : 'processing'}>
+                          <Tag color={log.type === 'error' ? 'error' : log.type === 'complete' ? 'success' : log.type === 'trace' ? 'blue' : 'processing'}>
                             {WORKFLOW_STEP_TITLES[log.step] || log.step}
                           </Tag>
                           <Text type="secondary" style={{ fontSize: 12 }}>
@@ -1397,6 +1435,26 @@ const Chat: React.FC = () => {
                           </Text>
                         </Space>
                         <Text style={{ fontSize: 13 }}>{log.message}</Text>
+                        {log.data ? (
+                          <div
+                            style={{
+                              marginTop: 4,
+                              padding: '6px 8px',
+                              background: '#fafafa',
+                              border: '1px solid #f0f0f0',
+                              borderRadius: 4,
+                              fontSize: 12,
+                              color: '#555',
+                              whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-word',
+                            }}
+                          >
+                            {Object.entries(log.data)
+                              .filter(([, value]) => value !== undefined && value !== null && value !== '')
+                              .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`)
+                              .join('\n')}
+                          </div>
+                        ) : null}
                       </Space>
                     </List.Item>
                   )}

@@ -1197,7 +1197,7 @@ function normalizeSymbolName(value: string): string {
 
 /**
  * 运行真实的代码行覆盖率测量
- * Python 用 coverage.py，Java 解析 jacoco.xml，C++ 预留
+ * Python 用 coverage.py，Java 解析 jacoco.xml，C++ 用 gcov
  */
 async function measureRealCoverage(
   inputData: z.infer<typeof executionStepOutputSchema>,
@@ -1206,11 +1206,11 @@ async function measureRealCoverage(
   const base = calculateCoverage(inputData.test_cases, inputData.analysis as SourceAnalysis)
   const lang = inputData.language
 
-  if (lang !== "python" && lang !== "java") {
+  if (lang !== "python" && lang !== "java" && lang !== "cpp") {
     return { ...base, coverage_tool: "not-available-for-language" }
   }
 
-  const toolLabel = lang === "python" ? "coverage.py" : "JaCoCo"
+  const toolLabel = lang === "python" ? "coverage.py" : lang === "java" ? "JaCoCo" : "gcov"
 
   try {
     logAgentProgress("正在测量真实代码覆盖率（" + toolLabel + "）")

@@ -10,6 +10,12 @@ export interface WorkflowRunParams {
   maxAttempts?: number;
   llmRetries?: number;
   outputDir?: string;
+  onTrace?: (event: {
+    step: string;
+    message: string;
+    progress?: number;
+    data?: Record<string, unknown>;
+  }) => void;
 }
 
 export interface WorkflowRunResult {
@@ -80,5 +86,50 @@ export async function runGenerateTestWorkflow(params: WorkflowRunParams): Promis
     language: normalizeLanguage(params.language),
   };
 
-  return await (generateTestWorkflow as any).execute(workflowInput) as WorkflowRunResult;
+  params.onTrace?.({
+    step: 'input',
+    message: `源文件已准备：${path.basename(filePath)}，${params.sourceCode.split(/\r?\n/).length} 行`,
+    progress: 5,
+    data: {
+      sourceFile: filePath,
+      outputDir,
+      language: workflowInput.language,
+      sourceLines: params.sourceCode.split(/\r?\n/).length,
+      requirementsLength: params.requirements?.length || 0,
+    },
+  });
+
+  const run = await (generateTestWorkflow as any).createRun();
+  params.onTrace?.({
+    step: 'workflow-start',
+    message: 'Mastra workflow run 已创建，开始按 7 步流水线执行',
+    progress: 10,
+  });
+  const result = await run.start({ inputData: workflowInput });
+
+  if (result.status !== 'success') {
+    const errorMessage =
+      result.status === 'failed'
+        ? result.error?.message || 'Workflow 执行失败'
+        : JSON.stringify(result);
+    throw new Error(errorMessage);
+  }
+
+  const output = result.result as WorkflowRunResult;
+  params.onTrace?.({
+    step: 'workflow-result',
+    message: `工作流完成：生成 ${output.test_cases_count ?? 0} 个测试用例，导出 ${output.exported_files?.length ?? 0} 个文件`,
+    progress: 92,
+    data: {
+      language: output.language,
+      testCasesCount: output.test_cases_count,
+      testCodeLength: output.test_code?.length || 0,
+      passed: output.passed,
+      exportedFiles: output.exported_files || [],
+      execution: output.execution_detail,
+      coverage: output.coverage,
+    },
+  });
+
+  return output;
 }

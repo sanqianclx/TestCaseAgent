@@ -1,6 +1,7 @@
 import { createTool } from "@mastra/core/tools"
 import { z } from "zod"
 import fs from "fs"
+import os from "os"
 import path from "path"
 import { spawnSync } from "child_process"
 import { callPythonScript } from "../runtime/python-bridge.js"
@@ -306,43 +307,331 @@ function extractXmlCounter(xml: string, type: string): { covered: number; missed
 }
 
 // ============================================================
-// C++ 覆盖率：gcov / OpenCppCoverage（预留）
+// C++ 覆盖率：gcov
 // ============================================================
 
-/**
- * TODO: C++ 覆盖率接入 —— gcov（Linux） 或 OpenCppCoverage（Windows）
- *
- * Linux 实现思路（gcov + lcov）：
- * 1. g++ --coverage -o test_binary source.cpp test.cpp
- * 2. 执行 test_binary
- * 3. lcov --capture --directory . --output-file coverage.info
- * 4. lcov --summary coverage.info
- * 5. 解析覆盖率摘要，提取 line rate
- *
- * Windows 实现思路（OpenCppCoverage）：
- * 1. 安装 OpenCppCoverage
- * 2. OpenCppCoverage --sources <source_dir> --export_type cobertura:coverage.xml -- <exe>
- * 3. 解析 coverage.xml，提取行覆盖率
- */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function _cppCoverageStub(_input: {
+function runCppCoverage(input: {
   test_code: string
   source_code: string
   source_file: string
+  filename: string
+  timeout?: number
 }): UnifiedCoverageResult {
+  const start = Date.now()
+  if (!commandAvailable("g++", ["--version"])) {
+    return buildCppCoverageFailure("GXX_NOT_FOUND", "g++ 不在 PATH 中，无法执行 C++ 覆盖率测量", start)
+  }
+  if (!commandAvailable("gcov", ["--version"])) {
+    return buildCppCoverageFailure("GCOV_NOT_FOUND", "gcov 不在 PATH 中，无法执行 C++ 覆盖率测量", start)
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "testgenerate-cpp-cov-"))
+  const sourceName = path.basename(input.source_file || input.filename || "source.cpp")
+  const sourcePath = path.join(tempDir, sourceName)
+  const testPath = path.join(tempDir, `coverage_test_${path.basename(sourceName, path.extname(sourceName))}.cpp`)
+  const exeName = process.platform === "win32" ? "coverage_tests.exe" : "coverage_tests"
+  const exePath = path.join(tempDir, exeName)
+
+  fs.writeFileSync(sourcePath, input.source_code, "utf-8")
+  fs.writeFileSync(testPath, input.test_code, "utf-8")
+
+  const gtest = resolveGtestCompileConfig(input.test_code)
+  const toolchainDirs = resolveToolchainBinDirs("g++")
+  const compileArgs = [
+    path.basename(testPath),
+    "-std=c++17",
+    "--coverage",
+    "-O0",
+    "-g",
+    ...gtest.args,
+    "-pthread",
+    "-o",
+    exeName,
+  ]
+  const compile = runRaw("g++", compileArgs, tempDir, input.timeout ?? 60, toolchainDirs)
+  if (compile.timeout) {
+    return buildCppCoverageFailure("CPP_COVERAGE_COMPILE_TIMEOUT", "C++ 覆盖率编译超时", start)
+  }
+  if (compile.exitCode !== 0) {
+    return buildCppCoverageFailure(
+      "CPP_COVERAGE_COMPILE_FAILED",
+      [`exitCode=${compile.exitCode}`, compile.command, compile.stderr, compile.stdout].filter(Boolean).join("\n") || "C++ 覆盖率编译失败",
+      start
+    )
+  }
+
+  const run = runRaw(exePath, [], tempDir, input.timeout ?? 60, toolchainDirs)
+  if (run.timeout) {
+    return buildCppCoverageFailure("CPP_COVERAGE_RUN_TIMEOUT", "C++ 覆盖率测试执行超时", start)
+  }
+  if (run.exitCode !== 0) {
+    return buildCppCoverageFailure("CPP_COVERAGE_RUN_FAILED", [run.command, run.stderr, run.stdout].filter(Boolean).join("\n") || "C++ 覆盖率测试执行失败", start)
+  }
+
+  const gcovTarget = findGcovInputFile(tempDir, sourceName) ?? sourceName
+  const gcov = runRaw("gcov", ["-b", "-c", path.basename(gcovTarget)], tempDir, input.timeout ?? 60, toolchainDirs)
+  if (gcov.exitCode !== 0) {
+    return buildCppCoverageFailure("GCOV_FAILED", [gcov.command, gcov.stderr, gcov.stdout].filter(Boolean).join("\n") || "gcov 执行失败", start)
+  }
+
+  const gcovFile = findGcovFile(tempDir, sourceName)
+  if (!gcovFile) {
+    return buildCppCoverageFailure("GCOV_FILE_NOT_FOUND", "gcov 未生成源文件覆盖率报告", start)
+  }
+
+  try {
+    const parsed = parseGcovFile(gcovFile)
+    return {
+      ok: true,
+      line_rate: parsed.lineRate,
+      branch_rate: parsed.branchRate,
+      covered_lines: parsed.coveredLines,
+      total_lines: parsed.totalLines,
+      missing_lines: parsed.totalLines - parsed.coveredLines,
+      excluded_lines: 0,
+      per_file: {
+        [sourceName]: {
+          line_rate: parsed.lineRate,
+          covered_lines: parsed.coveredLines,
+          total_lines: parsed.totalLines,
+          missing_lines: parsed.totalLines - parsed.coveredLines,
+          branch_rate: parsed.branchRate,
+        },
+      },
+      tool: "gcov",
+      duration_ms: Date.now() - start,
+    }
+  } catch (error) {
+    return buildCppCoverageFailure("GCOV_PARSE_FAILED", `解析 gcov 报告失败：${String(error)}`, start)
+  }
+}
+
+function buildCppCoverageFailure(code: string, message: string, start: number): UnifiedCoverageResult {
+  const hint =
+    code === "CPP_COVERAGE_COMPILE_FAILED"
+      ? "\n诊断建议：确认 C++ 测试执行本身可通过，并确认 g++/GoogleTest 使用同一 MinGW/MSYS2 工具链。"
+      : ""
   return {
     ok: false,
-    error: { code: "NOT_IMPLEMENTED", message: "C++ 覆盖率（gcov/OpenCppCoverage）尚未接入，敬请期待" },
-    line_rate: 0,
-    branch_rate: 0,
-    covered_lines: 0,
-    total_lines: 0,
-    missing_lines: 0,
-    excluded_lines: 0,
-    per_file: {},
-    tool: "gcov（预留）",
-    duration_ms: 0,
+    error: { code, message: `${message}${hint}` },
+    line_rate: 0, branch_rate: 0, covered_lines: 0, total_lines: 0,
+    missing_lines: 0, excluded_lines: 0, per_file: {}, tool: "gcov",
+    duration_ms: Date.now() - start,
   }
+}
+
+function runRaw(command: string, args: string[], cwd: string, timeoutSeconds: number, extraPathDirs: string[] = []) {
+  const started = Date.now()
+  const env = buildToolchainEnv(command, extraPathDirs)
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: "utf-8",
+    timeout: timeoutSeconds * 1000,
+    windowsHide: true,
+    maxBuffer: 10 * 1024 * 1024,
+    shell: process.platform === "win32" && !/\.exe$/i.test(command),
+    env,
+  })
+  return {
+    command: [command, ...args].join(" "),
+    stdout: result.stdout ?? "",
+    stderr: [
+      result.error?.message,
+      result.stderr,
+      typeof result.signal === "string" ? `signal=${result.signal}` : "",
+    ].filter(Boolean).join("\n"),
+    exitCode: typeof result.status === "number" ? result.status : -1,
+    durationMs: Date.now() - started,
+    timeout: Boolean(result.error && result.error.name === "TimeoutError"),
+  }
+}
+
+function commandAvailable(command: string, args: string[]): boolean {
+  const env = buildToolchainEnv(command)
+  const result = spawnSync(command, args, {
+    encoding: "utf-8",
+    windowsHide: true,
+    shell: process.platform === "win32" && /\.cmd$/i.test(command),
+    env,
+  })
+  return !result.error && result.status === 0
+}
+
+function buildToolchainEnv(command: string, extraPathDirs: string[] = []): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  if (process.platform !== "win32") return env
+
+  const dirs = [...extraPathDirs, ...resolveToolchainBinDirs(command)]
+  if (dirs.length === 0) return env
+
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "Path"
+  const currentPath = env[pathKey] ?? ""
+  env[pathKey] = prependPathDirs(currentPath, dirs)
+  return env
+}
+
+function resolveToolchainBinDirs(command: string): string[] {
+  const dirs = new Set<string>()
+  const lower = command.toLowerCase()
+
+  if (lower.includes("\\msys2\\") || lower.includes("/msys2/")) {
+    dirs.add(path.dirname(command))
+  }
+
+  const base = path.basename(command).toLowerCase()
+  if (["g++.exe", "g++", "gcc.exe", "gcc", "gcov.exe", "gcov"].includes(base)) {
+    for (const fallback of ["D:\\msys2\\ucrt64\\bin", "D:\\msys64\\ucrt64\\bin"]) {
+      if (fs.existsSync(fallback)) dirs.add(fallback)
+    }
+    for (const dir of findCompilerOnPath(base)) dirs.add(dir)
+  }
+
+  return Array.from(dirs)
+}
+
+function findCompilerOnPath(command: string): string[] {
+  const pathValue = process.env.Path ?? process.env.PATH ?? ""
+  const commandNames = command.endsWith(".exe") ? [command, command.replace(/\.exe$/i, "")] : [command, `${command}.exe`]
+  const found: string[] = []
+
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir) continue
+    for (const name of commandNames) {
+      const candidate = path.join(dir, name)
+      if (fs.existsSync(candidate)) {
+        found.push(dir)
+        break
+      }
+    }
+  }
+
+  return found
+}
+
+function prependPathDirs(currentPath: string, dirs: string[]): string {
+  const existing = currentPath.split(path.delimiter).filter(Boolean)
+  const prepend = dirs
+    .filter((dir) => fs.existsSync(dir))
+  const prependLower = new Set(prepend.map((item) => path.resolve(item).toLowerCase()))
+  const tail = existing.filter((item) => !prependLower.has(path.resolve(item).toLowerCase()))
+
+  return [...prepend, ...tail].join(path.delimiter)
+}
+
+function findGcovFile(cwd: string, sourceName: string): string | undefined {
+  const candidates = [
+    path.join(cwd, `${sourceName}.gcov`),
+    ...fs.readdirSync(cwd)
+      .filter((name) => name.endsWith(".gcov") && name.includes(sourceName))
+      .map((name) => path.join(cwd, name)),
+    ...fs.readdirSync(cwd)
+      .filter((name) => name.endsWith(".gcov"))
+      .map((name) => path.join(cwd, name)),
+  ]
+  return candidates.find((candidate) => fs.existsSync(candidate))
+}
+
+function findGcovInputFile(cwd: string, sourceName: string): string | undefined {
+  const sourceStem = path.basename(sourceName, path.extname(sourceName))
+  const entries = fs.readdirSync(cwd)
+
+  const preferred = entries
+    .filter((name) => name.endsWith(".gcno"))
+    .filter((name) => name.includes(sourceName) || name.includes(sourceStem))
+    .map((name) => path.join(cwd, name))
+
+  if (preferred.length > 0) return preferred[0]
+
+  const all = entries
+    .filter((name) => name.endsWith(".gcno"))
+    .map((name) => path.join(cwd, name))
+
+  return all[0]
+}
+
+function parseGcovFile(filePath: string): {
+  coveredLines: number
+  totalLines: number
+  lineRate: number
+  branchRate: number
+} {
+  const text = fs.readFileSync(filePath, "utf-8")
+  let coveredLines = 0
+  let totalLines = 0
+  let branchCovered = 0
+  let branchTotal = 0
+
+  for (const line of text.split(/\r?\n/)) {
+    const lineMatch = line.match(/^\s*([^:]+):\s*(\d+):/)
+    if (lineMatch) {
+      const count = lineMatch[1].trim()
+      if (count !== "-" && count !== "") {
+        totalLines += 1
+        if (count !== "#####" && count !== "=====" && Number(count) > 0) {
+          coveredLines += 1
+        }
+      }
+      continue
+    }
+
+    const branchMatch = line.match(/branch\s+\d+\s+(taken|never executed)(?:\s+(\d+)%|\s+\d+)?/i)
+    if (branchMatch) {
+      branchTotal += 1
+      if (branchMatch[1].toLowerCase() === "taken") {
+        const percent = branchMatch[2] ? Number(branchMatch[2]) : 100
+        if (percent > 0) branchCovered += 1
+      }
+    }
+  }
+
+  return {
+    coveredLines,
+    totalLines,
+    lineRate: totalLines > 0 ? Math.round((coveredLines / totalLines) * 100 * 100) / 100 : 0,
+    branchRate: branchTotal > 0 ? Math.round((branchCovered / branchTotal) * 100 * 100) / 100 : 0,
+  }
+}
+
+function resolveGtestCompileConfig(testCode: string): { args: string[]; mode: "source" | "installed" } {
+  const root = findGtestSourceRoot()
+  if (root) {
+    const gtestDir = path.join(root, "googletest")
+    const args = [
+      "-I" + toCompilerPath(path.join(gtestDir, "include")),
+      "-I" + toCompilerPath(gtestDir),
+      toCompilerPath(path.join(gtestDir, "src", "gtest-all.cc")),
+    ]
+    if (!/\bmain\s*\(/.test(testCode)) {
+      args.push(toCompilerPath(path.join(gtestDir, "src", "gtest_main.cc")))
+    }
+    return { args, mode: "source" }
+  }
+  return { args: ["-lgtest", "-lgtest_main"], mode: "installed" }
+}
+
+function toCompilerPath(value: string): string {
+  return process.platform === "win32" ? value.replace(/\\/g, "/") : value
+}
+
+function findGtestSourceRoot(): string | undefined {
+  const candidates = [
+    process.env.GTEST_ROOT,
+    process.env.GOOGLETEST_ROOT,
+    process.env.GTEST_HOME,
+    process.env.GOOGLETEST_HOME,
+    "D:\\gtest\\googletest-1.17.0",
+  ].filter((item): item is string => Boolean(item))
+
+  for (const candidate of candidates) {
+    const root = path.resolve(candidate)
+    if (
+      fs.existsSync(path.join(root, "googletest", "include", "gtest", "gtest.h")) &&
+      fs.existsSync(path.join(root, "googletest", "src", "gtest-all.cc"))
+    ) {
+      return root
+    }
+  }
+  return undefined
 }
 
 // ============================================================
@@ -394,10 +683,12 @@ export function measureCoverage(inputData: {
   }
 
   if (language === "cpp" || language === "c++") {
-    return _cppCoverageStub({
+    return runCppCoverage({
       test_code: inputData.test_code,
       source_code: inputData.source_code,
       source_file: inputData.source_file ?? inputData.filename,
+      filename: inputData.filename,
+      timeout: inputData.timeout,
     })
   }
 
@@ -423,14 +714,14 @@ export function measureCoverage(inputData: {
 export const measureCoverageTool = createTool({
   id: "measure-coverage",
   description:
-    "对已生成的测试代码执行真实的代码行覆盖率测量。Python 使用 coverage.py，Java 和 C++ 预留。" +
+    "对已生成的测试代码执行真实的代码行覆盖率测量。Python 使用 coverage.py，Java 使用 JaCoCo，C++ 使用 gcov。" +
     "在 execute-tests 通过后调用此工具，可获取行覆盖率、分支覆盖率和逐文件覆盖详情。" +
     "与质量检查工具互补：quality-check 检查断言质量，measure-coverage 检查代码覆盖广度。",
   inputSchema: z.object({
     test_code: z.string().describe("完整的测试代码内容"),
     source_code: z.string().describe("完整的被测源代码内容"),
     filename: z.string().describe("源文件名（如 user_service.py），用于保持导入模块名"),
-    language: z.enum(["python", "java", "cpp"]).describe("语言标识"),
+    language: z.enum(["python", "py", "java", "cpp", "c++"]).describe("语言标识"),
     source_file: z.string().optional().describe("源文件完整路径（Java/C++ 需要）"),
     timeout: z.number().default(60).describe("覆盖率执行超时秒数"),
     cwd: z.string().optional().describe("Java/C++ 的临时执行目录（Maven/g++ 编译测试的地方）"),

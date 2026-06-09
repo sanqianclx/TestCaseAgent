@@ -55,6 +55,13 @@ export interface EnvConfig {
     deepseekApiKey: string;
   };
 
+  // Agent 运行配置
+  agent: {
+    maxSteps: number;
+    maxOutputTokens: number;
+    memoryLimit: number;
+  };
+
   // 日志配置
   log: {
     level: string;
@@ -129,6 +136,12 @@ export const env: EnvConfig = {
 
   llm: {
     deepseekApiKey: getEnv('DEEPSEEK_API_KEY'),
+  },
+
+  agent: {
+    maxSteps: getEnvNumber('AGENT_MAX_STEPS', 80),
+    maxOutputTokens: getEnvNumber('AGENT_MAX_OUTPUT_TOKENS', 8192),
+    memoryLimit: getEnvNumber('AGENT_MEMORY_LIMIT', 30),
   },
 
   log: {

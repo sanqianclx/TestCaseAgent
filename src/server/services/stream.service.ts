@@ -12,6 +12,7 @@ import { registerGeneratedFile } from './file.service.js';
 import { logger } from '../../mastra/runtime/logger.js';
 import { runGenerateTestWorkflow } from './workflow-runner.js';
 import { throwIfTaskRunCancelled } from './task-runtime-registry.js';
+import { env } from '../config/env.js';
 
 type StreamExecutionOptions = {
   taskId?: string;
@@ -21,6 +22,19 @@ type StreamExecutionOptions = {
   sourceFile?: string;
   language?: string;
 };
+
+type AgentContinuationState = {
+  reason: string;
+  lastRunId?: string;
+  lastUpdatedAt: string;
+};
+
+type AgentProgressState = {
+  lastUpdatedAt: string;
+  entries: string[];
+};
+
+const INCOMPLETE_FINISH_REASONS = new Set(['length', 'tool-calls', 'content-filter', 'error']);
 
 /**
  * 流式回调
@@ -32,8 +46,17 @@ export interface StreamCallbacks {
     testCode?: string;
     testFile?: string;
     error?: string;
+    incomplete?: boolean;
+    finishReason?: string;
     taskId?: string;
     previewFileId?: number | null;
+    outputDir?: string;
+  }) => void | Promise<void>;
+  onIncomplete?: (result: {
+    success: false;
+    incomplete: true;
+    finishReason: string;
+    message: string;
     outputDir?: string;
   }) => void | Promise<void>;
   onError: (error: Error) => void | Promise<void>;
@@ -49,6 +72,84 @@ export interface StreamCallbacks {
     toolName?: string;
     args?: Record<string, any>;
   }) => void;
+}
+
+type AgentToolCallRecord = { toolName: string; args: any; result: any };
+
+function compactJson(value: unknown, maxLength = 1200): string {
+  let text = '';
+  try {
+    text = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  text = text.replace(/\s+/g, ' ').trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function summarizeToolResult(call: AgentToolCallRecord): string {
+  const args = call.args || {};
+  const result = call.result || {};
+  const toolName = call.toolName || 'unknown';
+
+  if (toolName === 'writeFile' || toolName === 'write-file') {
+    const filePath = result.path || result.filePath || result.file_path || args.path || args.filePath || '(unknown path)';
+    const content = typeof result.content === 'string' ? result.content : typeof args.content === 'string' ? args.content : '';
+    return `write-file 完成: ${filePath}${content ? `, content_chars=${content.length}` : ''}`;
+  }
+
+  if (toolName === 'executeTests' || toolName === 'execute-tests') {
+    return `execute-tests 完成: language=${args.language || 'python'}, filename=${args.filename || args.source_file || ''}, status=${result.status}, passed=${Number(result.passed ?? 0)}, failed=${Number(result.failed ?? 0)}, errors=${Number(result.errors ?? 0)}, exit_code=${result.exit_code ?? 'n/a'}`;
+  }
+
+  if (toolName === 'measureCoverage' || toolName === 'measure-coverage') {
+    return `measure-coverage 完成: language=${args.language || ''}, filename=${args.filename || args.source_file || ''}, ok=${Boolean(result.ok)}, line_rate=${Number(result.line_rate ?? 0)}, branch_rate=${Number(result.branch_rate ?? 0)}, tool=${result.tool || ''}${result.error ? `, error=${compactJson(result.error, 300)}` : ''}`;
+  }
+
+  if (toolName === 'parseSourceCode' || toolName === 'parse-source-code') {
+    const symbols = Array.isArray(result.symbols) ? result.symbols.length : undefined;
+    const functions = Array.isArray(result.functions) ? result.functions.length : undefined;
+    const classes = Array.isArray(result.classes) ? result.classes.length : undefined;
+    return `parse-source-code 完成: filename=${args.filename || args.path || ''}, module=${result.module_name || result.moduleName || ''}, symbols=${symbols ?? 'n/a'}, functions=${functions ?? 'n/a'}, classes=${classes ?? 'n/a'}`;
+  }
+
+  if (toolName === 'readFile' || toolName === 'read-file') {
+    const text = typeof result.content === 'string' ? result.content : typeof result.text === 'string' ? result.text : '';
+    return `read-file 完成: path=${args.path || result.path || ''}${text ? `, chars=${text.length}` : ''}`;
+  }
+
+  if (toolName === 'shellRun' || toolName === 'shell-run') {
+    return `shell-run 完成: command=${compactJson(args.command || result.command || '', 180)}, exit_code=${result.exit_code ?? result.exitCode ?? 'n/a'}, timed_out=${Boolean(result.timed_out ?? result.timedOut)}`;
+  }
+
+  return `${toolName} 完成: args=${compactJson(args, 350)}, result=${compactJson(result, 650)}`;
+}
+
+export function rememberAgentToolResult(sessionId: string, call: AgentToolCallRecord): void {
+  const summary = summarizeToolResult(call);
+  memoryStore.addMessage(sessionId, 'tool', summary, {
+    toolName: call.toolName,
+    args: call.args,
+  });
+  const existing = memoryStore.getFact<string[]>(sessionId, 'agentProgressLog') || [];
+  const entries = [...existing, summary].slice(-env.agent.memoryLimit);
+  memoryStore.setFact(sessionId, 'agentProgressLog', entries);
+  memoryStore.setFact(sessionId, 'agentProgressState', {
+    lastUpdatedAt: new Date().toISOString(),
+    entries,
+  });
+  memoryStore.setFact(sessionId, 'lastAgentToolResult', summary);
+}
+
+export function rememberAgentText(sessionId: string, text: string, metadata?: Record<string, unknown>): void {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  memoryStore.addMessage(sessionId, 'agent', trimmed, metadata);
+  memoryStore.setFact(sessionId, 'lastAgentText', trimmed.slice(-2000));
+}
+
+export function isIncompleteAgentFinishReason(finishReason: string): boolean {
+  return INCOMPLETE_FINISH_REASONS.has(finishReason);
 }
 
 /**
@@ -87,7 +188,10 @@ export async function streamAutonomousAgent(
     // 3. 使用稳定会话 ID，避免 Web 端每轮追问都丢失上下文。
     const sessionId = options.sessionId ? `api-agent-session-${options.sessionId}` : `api-agent-${Date.now()}`;
     memoryStore.getOrCreate(sessionId);
-    memoryStore.addMessage(sessionId, 'system', 'API Agent session started');
+    if (!memoryStore.getFact<boolean>(sessionId, 'webAgentSessionInitialized')) {
+      memoryStore.addMessage(sessionId, 'system', 'API Agent session started');
+      memoryStore.setFact(sessionId, 'webAgentSessionInitialized', true);
+    }
 
     callbacks.onProgress({
       type: 'progress',
@@ -100,17 +204,25 @@ export async function streamAutonomousAgent(
     memoryStore.addMessage(sessionId, 'user', input);
 
     // 5. 构建消息：把最近会话记忆交还给 Agent，避免反复读取/解析已处理文件。
-    const memorySummary = memoryStore.summarize(sessionId, 10);
+    const memorySummary = memoryStore.summarize(sessionId, Math.max(18, Math.min(env.agent.memoryLimit, 40)));
+    const continuationState = memoryStore.getFact<AgentContinuationState | null>(sessionId, 'agentContinuationNeeded');
+    const progressState = memoryStore.getFact<AgentProgressState | null>(sessionId, 'agentProgressState');
     const outputDirInstruction =
       typeof options.outputDir === 'string' && options.outputDir.trim()
         ? `\n\n[系统约束]\n本次任务的目标输出目录是：${options.outputDir.trim()}\n除非用户另行明确指定，否则生成的测试文件、导出结果和中间产物都应放在这个目录下。`
         : '';
+    const continuationInstruction = continuationState
+      ? `\n\n[续跑约束]\n当前会话存在上一轮未完成的 Agent 运行状态（reason=${continuationState.reason}, lastUpdatedAt=${continuationState.lastUpdatedAt}）。必须先阅读上方 Facts/Recent messages 中的 agentProgressLog、lastAgentToolResult、lastAgentText，判断哪些文件/语言/步骤已经完成，哪些还没完成；不要重新开始，不要重复生成或重复执行已经完成的部分。若看到某一步失败，应从失败点继续修复。`
+      : '';
+    const progressInstruction = progressState
+      ? `\n\n[进度约束]\n当前会话已有工具执行进度（lastUpdatedAt=${progressState.lastUpdatedAt}）。回答或继续任务前必须参考 agentProgressLog；已经完成的读取、解析、写入、测试执行和覆盖率测量不要无故重复。若用户要求补做/继续/完善，应从最近未完成或失败的步骤继续。`
+      : '';
     const messages = [
       {
         role: 'user',
         content: memorySummary
-          ? `以下是本 Web 会话的近期上下文。若源文件内容和附件未变化，不要重复读取或解析已经完成过的内容，直接基于已有结论继续。\n\n${memorySummary}\n\n当前用户消息：\n${input}${outputDirInstruction}`
-          : `${input}${outputDirInstruction}`,
+          ? `以下是本 Web 会话的近期上下文。若源文件内容和附件未变化，不要重复读取或解析已经完成过的内容，直接基于已有结论继续。\n\n${memorySummary}\n\n当前用户消息：\n${input}${outputDirInstruction}${progressInstruction}${continuationInstruction}`
+          : `${input}${outputDirInstruction}${progressInstruction}${continuationInstruction}`,
       },
     ];
 
@@ -129,7 +241,7 @@ export async function streamAutonomousAgent(
     let writtenFilePath: string | null = null;
     let latestRegisteredFileId: number | null = null;
     // 工具调用记录
-    const toolCalls: Array<{ toolName: string; args: any; result: any }> = [];
+    const toolCalls: AgentToolCallRecord[] = [];
     // 是否已经触发 ask-user（决定是否还要发 onComplete）
     let asked = false;
     // 挂起信息（从 chunk 累积）
@@ -141,8 +253,9 @@ export async function streamAutonomousAgent(
     // ask-user 检测策略：在 LLM 文本里匹配 <<ASK_USER:问题>> 标记
     // 出现则触发前端弹窗，让用户输入
     const stream = await (agent as any).stream(messages, {
-      maxSteps: 25,
-      modelSettings: { temperature: 0, maxOutputTokens: 4096 },
+      maxSteps: env.agent.maxSteps,
+      experimental_continueSteps: true,
+      modelSettings: { temperature: 0, maxOutputTokens: env.agent.maxOutputTokens },
     });
 
     callbacks.onProgress({
@@ -304,6 +417,9 @@ export async function streamAutonomousAgent(
         if (lastCall && lastCall.result === null) {
           lastCall.result = result;
         }
+        if (lastCall) {
+          rememberAgentToolResult(sessionId, lastCall);
+        }
 
         // 抓 writeFile 工具的内容/路径
         if (lastCall && (lastCall.toolName === 'writeFile' || lastCall.toolName === 'write-file')) {
@@ -392,6 +508,7 @@ export async function streamAutonomousAgent(
 
     const finalFinishReason = (fullOutput?.finishReason as string | undefined) ?? lastFinishReason ?? '';
     const finalRunId = (fullOutput?.runId as string | undefined) ?? lastRunId ?? '';
+    const finalText = typeof fullOutput?.text === 'string' ? fullOutput.text : fullText;
 
     if (!asked && (finalFinishReason === 'suspended' || suspendPayloadFromChunk)) {
       throwIfTaskRunCancelled(options.taskId);
@@ -445,6 +562,44 @@ export async function streamAutonomousAgent(
         });
         return;
       }
+    }
+
+    if (isIncompleteAgentFinishReason(finalFinishReason)) {
+      rememberAgentText(sessionId, finalText, {
+        finishReason: finalFinishReason,
+        runId: finalRunId,
+        source: 'stream-incomplete',
+      });
+      memoryStore.setFact(sessionId, 'agentContinuationNeeded', {
+        reason: finalFinishReason,
+        lastRunId: finalRunId,
+        lastUpdatedAt: new Date().toISOString(),
+      });
+      callbacks.onProgress({
+        type: 'progress',
+        step: 'incomplete',
+        message: `⏸️ Agent 本轮达到模型限制（${finalFinishReason}），已保存当前进度；发送“继续”会从断点接着做。`,
+        progress: 90,
+      });
+      const message = `Agent 本轮未自然完成：${finalFinishReason}。进度已保存，请发送“继续”接着执行。`;
+      if (callbacks.onIncomplete) {
+        await callbacks.onIncomplete({
+          success: false,
+          incomplete: true,
+          finishReason: finalFinishReason,
+          message,
+          outputDir: options.outputDir,
+        });
+      } else {
+        await callbacks.onComplete({
+          success: false,
+          incomplete: true,
+          finishReason: finalFinishReason,
+          error: message,
+          outputDir: options.outputDir,
+        });
+      }
+      return;
     }
 
     // 7. 提取测试代码：优先用 writeFile 工具真正写入的内容
@@ -528,8 +683,9 @@ export async function streamAutonomousAgent(
       previewFileId,
       outputDir: options.outputDir,
     });
-    if (fullText.trim()) {
-      memoryStore.addMessage(sessionId, 'agent', fullText.trim(), { previewFileId, testFile });
+    if (finalText.trim()) {
+      rememberAgentText(sessionId, finalText, { previewFileId, testFile, finishReason: finalFinishReason });
+      memoryStore.setFact(sessionId, 'agentContinuationNeeded', null);
     }
 
   } catch (error: any) {
@@ -613,6 +769,15 @@ export async function streamWorkflow(
       requirements,
       maxAttempts: 3,
       outputDir: workflowOutputDir,
+      onTrace: (event) => {
+        callbacks.onProgress({
+          type: 'trace',
+          step: event.step,
+          message: event.message,
+          progress: event.progress,
+          data: event.data,
+        });
+      },
     });
     testCode = result.test_code || '';
     testFile =

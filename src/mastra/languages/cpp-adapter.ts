@@ -88,6 +88,7 @@ function executeCppTests(input: {
   fs.writeFileSync(testPath, input.testCode, "utf-8")
 
   const gtest = resolveGtestCompileConfig(input.testCode)
+  const toolchainDirs = resolveToolchainBinDirs("g++")
   const compileArgs = [
     path.basename(testPath),
     "-std=c++17",
@@ -96,7 +97,7 @@ function executeCppTests(input: {
     "-o",
     exePath,
   ]
-  const compile = runRaw("g++", compileArgs, tempDir, input.timeoutSeconds)
+  const compile = runRaw("g++", compileArgs, tempDir, input.timeoutSeconds, toolchainDirs)
   if (compile.timeout) {
     return baseExecution("timeout", compile.stdout, compile.stderr || "C++ 编译超时", compile.exitCode, compile.durationMs, true, compile.command, tempDir)
   }
@@ -108,7 +109,7 @@ function executeCppTests(input: {
     }
   }
 
-  const run = runRaw(exePath, [], tempDir, input.timeoutSeconds)
+  const run = runRaw(exePath, [], tempDir, input.timeoutSeconds, toolchainDirs)
   if (run.timeout) {
     return baseExecution("timeout", run.stdout, run.stderr || "C++ 测试执行超时", run.exitCode, compile.durationMs + run.durationMs, true, run.command, tempDir)
   }
@@ -286,14 +287,17 @@ function extractReturnExpr(sourceCode: string, startLine: number, endLine: numbe
   return undefined
 }
 
-function runRaw(command: string, args: string[], cwd: string, timeoutSeconds: number) {
+function runRaw(command: string, args: string[], cwd: string, timeoutSeconds: number, extraPathDirs: string[] = []) {
   const started = Date.now()
+  const env = buildToolchainEnv(command, extraPathDirs)
   const result = spawnSync(command, args, {
     cwd,
     encoding: "utf-8",
     timeout: timeoutSeconds * 1000,
     windowsHide: true,
     maxBuffer: 10 * 1024 * 1024,
+    shell: process.platform === "win32" && !/\.exe$/i.test(command),
+    env,
   })
   return {
     command: [command, ...args].join(" "),
@@ -323,8 +327,67 @@ function baseExecution(
 }
 
 function commandAvailable(command: string, args: string[]): boolean {
-  const result = spawnSync(command, args, { encoding: "utf-8", windowsHide: true })
-  return !result.error
+  const result = spawnSync(command, args, { encoding: "utf-8", windowsHide: true, env: buildToolchainEnv(command) })
+  return !result.error && result.status === 0
+}
+
+function buildToolchainEnv(command: string, extraPathDirs: string[] = []): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  if (process.platform !== "win32") return env
+
+  const dirs = [...extraPathDirs, ...resolveToolchainBinDirs(command)]
+  if (dirs.length === 0) return env
+
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "Path"
+  const currentPath = env[pathKey] ?? ""
+  env[pathKey] = prependPathDirs(currentPath, dirs)
+  return env
+}
+
+function resolveToolchainBinDirs(command: string): string[] {
+  const dirs = new Set<string>()
+  const lower = command.toLowerCase()
+
+  if (lower.includes("\\msys2\\") || lower.includes("/msys2/")) {
+    dirs.add(path.dirname(command))
+  }
+
+  const base = path.basename(command).toLowerCase()
+  if (["g++.exe", "g++", "gcc.exe", "gcc"].includes(base)) {
+    for (const fallback of ["D:\\msys2\\ucrt64\\bin", "D:\\msys64\\ucrt64\\bin"]) {
+      if (fs.existsSync(fallback)) dirs.add(fallback)
+    }
+    for (const dir of findCompilerOnPath(base)) dirs.add(dir)
+  }
+
+  return Array.from(dirs)
+}
+
+function findCompilerOnPath(command: string): string[] {
+  const pathValue = process.env.Path ?? process.env.PATH ?? ""
+  const commandNames = command.endsWith(".exe") ? [command, command.replace(/\.exe$/i, "")] : [command, `${command}.exe`]
+  const found: string[] = []
+
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir) continue
+    for (const name of commandNames) {
+      const candidate = path.join(dir, name)
+      if (fs.existsSync(candidate)) {
+        found.push(dir)
+        break
+      }
+    }
+  }
+
+  return found
+}
+
+function prependPathDirs(currentPath: string, dirs: string[]): string {
+  const existing = currentPath.split(path.delimiter).filter(Boolean)
+  const prepend = dirs.filter((dir) => fs.existsSync(dir))
+  const prependLower = new Set(prepend.map((item) => path.resolve(item).toLowerCase()))
+  const tail = existing.filter((item) => !prependLower.has(path.resolve(item).toLowerCase()))
+  return [...prepend, ...tail].join(path.delimiter)
 }
 
 function inferCppMissingDependencies(output: string): string[] {
