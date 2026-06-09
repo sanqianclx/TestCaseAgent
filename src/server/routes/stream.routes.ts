@@ -10,6 +10,7 @@ import {
   isIncompleteAgentFinishReason,
   rememberAgentText,
   rememberAgentToolResult,
+  summarizeToolResult,
   streamAutonomousAgent,
   streamWorkflow,
 } from '../services/stream.service.js';
@@ -142,6 +143,63 @@ function parseSessionContext(context: unknown): Record<string, any> | null {
     return context as Record<string, any>;
   }
   return null;
+}
+
+function stripPresentationMarks(message: string): string {
+  return String(message || '')
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '')
+    .replace(/^[\s·:：-]+/, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function stripPresentationSymbols(message: string): string {
+  return String(message || '').replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
+}
+
+function normalizeTimelineText(message: string): string {
+  return stripPresentationSymbols(message)
+    .replace(/[ \t]+\r?\n/g, '\n')
+    .replace(/\r?\n[ \t]+/g, '\n')
+    .replace(/(?:\r?\n){2,}/g, '\n')
+    .trim();
+}
+
+function compactTimelineText(message: string): string {
+  return stripPresentationSymbols(message)
+    .replace(/[ \t]+\r?\n/g, '\n')
+    .replace(/\r?\n[ \t]+/g, '\n')
+    .replace(/(?:\r?\n){2,}/g, '\n');
+}
+
+function shouldPersistTimelineLine(message: string): boolean {
+  const normalized = stripPresentationMarks(message);
+  if (!normalized) return false;
+  return normalized !== '...' && normalized !== '…';
+}
+
+function normalizeToolName(toolName?: string): string {
+  return String(toolName || '').replace(/-/g, '').toLowerCase();
+}
+
+function shouldShowToolOnTimeline(toolName?: string): boolean {
+  const tool = normalizeToolName(toolName);
+  return tool === 'readfile' || tool === 'writefile' || tool === 'shellrun';
+}
+
+type PersistedTimelineEvent = {
+  kind: string;
+  title: string;
+  at: number;
+  step?: string;
+  toolName?: string;
+  args?: any;
+  result?: any;
+  status?: string;
+};
+
+function serializeTimelineEvents(events: PersistedTimelineEvent[]): string {
+  return JSON.stringify({ version: 1, events });
 }
 
 /**
@@ -304,9 +362,120 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
   }
 
   let askSent = false;
+  let assistantTimelineMessageId: bigint | null = null;
+  let assistantTimelineEvents: PersistedTimelineEvent[] = [];
+  const appendTimelineEvent = async (event: PersistedTimelineEvent, options: { inline?: boolean } = {}) => {
+    if (!resolvedSessionId) return;
+    const cleaned = event.kind === 'text' || event.kind === 'thinking' ? normalizeTimelineText(event.title) : stripPresentationMarks(event.title);
+    if (!shouldPersistTimelineLine(cleaned)) return;
+    const nextEvent: PersistedTimelineEvent = { ...event, title: cleaned, at: event.at || Date.now() };
+    if ((nextEvent.kind === 'tool' || nextEvent.kind === 'tool-result') && !shouldShowToolOnTimeline(nextEvent.toolName || nextEvent.step)) {
+      return;
+    }
+    if ((nextEvent.kind === 'text' || nextEvent.kind === 'thinking') && assistantTimelineEvents.length > 0) {
+      const barrier = new Set(['ask', 'complete', 'error']);
+      for (let i = assistantTimelineEvents.length - 1; i >= 0; i -= 1) {
+        if (barrier.has(assistantTimelineEvents[i].kind)) break;
+        if (assistantTimelineEvents[i].kind === nextEvent.kind) {
+          assistantTimelineEvents[i] = {
+            ...assistantTimelineEvents[i],
+            title: compactTimelineText(`${assistantTimelineEvents[i].title}${nextEvent.title}`),
+            at: nextEvent.at,
+          };
+          nextEvent.title = '';
+          break;
+        }
+      }
+    }
+    if (nextEvent.title) {
+      if (nextEvent.kind === 'tool-result') {
+        const idx = [...assistantTimelineEvents].reverse().findIndex((item) =>
+          item.kind === 'tool' &&
+          normalizeToolName(item.toolName || item.step) === normalizeToolName(nextEvent.toolName || nextEvent.step)
+        );
+        if (idx >= 0) {
+          const realIndex = assistantTimelineEvents.length - 1 - idx;
+          assistantTimelineEvents[realIndex] = { ...assistantTimelineEvents[realIndex], ...nextEvent };
+        } else {
+          assistantTimelineEvents.push(nextEvent);
+        }
+      } else {
+        assistantTimelineEvents.push(nextEvent);
+      }
+    }
+    const assistantTimelineContent = serializeTimelineEvents(assistantTimelineEvents);
+    try {
+      if (!assistantTimelineMessageId) {
+        const created = await prisma.message.create({
+          data: {
+            sessionId: resolvedSessionId,
+            role: 'assistant',
+            content: assistantTimelineContent,
+            messageType: 'task_result',
+            metadata: {
+              mode: resolvedMode,
+              taskId: createdTaskId,
+              timeline: true,
+            },
+          },
+          select: { id: true },
+        });
+        assistantTimelineMessageId = created.id;
+      } else {
+        await prisma.message.update({
+          where: { id: assistantTimelineMessageId },
+          data: {
+            content: assistantTimelineContent,
+            metadata: {
+              mode: resolvedMode,
+              taskId: createdTaskId,
+              timeline: true,
+            },
+          },
+        });
+      }
+      await prisma.session.update({
+        where: { id: resolvedSessionId },
+        data: {
+          lastMessageAt: new Date(),
+        },
+      });
+    } catch (err: any) {
+      logger.warn('system', { scope: 'stream/agent', event_name: 'timeline.persist.failed', error: err?.message });
+    }
+  };
+  const appendTimelineLine = async (line: string, options: { inline?: boolean; kind?: string; step?: string; toolName?: string; args?: any; result?: any; status?: string } = {}) => {
+    await appendTimelineEvent({
+      kind: options.kind || (options.inline ? 'text' : 'text'),
+      title: line,
+      at: Date.now(),
+      step: options.step,
+      toolName: options.toolName,
+      args: options.args,
+      result: options.result,
+      status: options.status,
+    }, options);
+  };
   const callbacks = {
     onProgress: (e: any) => {
-      sendEvent('progress', e);
+      const eventType = e.type || 'progress';
+      const cleanEvent = {
+        ...e,
+        message: eventType === 'text'
+          ? stripPresentationSymbols(e.message || '')
+          : stripPresentationMarks(e.message || ''),
+      };
+      sendEvent('progress', cleanEvent);
+      if (resolvedMode === 'autonomous' && (eventType === 'text' || eventType === 'thinking' || eventType === 'tool' || eventType === 'tool-result')) {
+        void appendTimelineLine(cleanEvent.message || cleanEvent.step || eventType, {
+          inline: eventType === 'text' || eventType === 'thinking',
+          kind: eventType,
+          step: cleanEvent.step,
+          toolName: cleanEvent.data?.toolName,
+          args: cleanEvent.data?.args,
+          result: cleanEvent.data?.result,
+        });
+      }
     },
     onComplete: async (e: any) => {
       try {
@@ -338,6 +507,7 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
       } catch (err: any) {
         logger.warn('system', { scope: 'stream/agent', event_name: 'task.complete.failed', error: err?.message });
       }
+      void appendTimelineLine(e.incomplete ? (e.message || e.error || '本轮未完成，等待继续') : '完成', { kind: 'complete' });
       sendEvent('complete', { ...e, taskId: createdTaskId });
       unregisterTaskRun(createdTaskId);
       res.end();
@@ -372,6 +542,7 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
       } catch (err: any) {
         logger.warn('system', { scope: 'stream/agent', event_name: 'task.incomplete.failed', error: err?.message });
       }
+      void appendTimelineLine(e.message || '本轮未完成，等待继续', { kind: 'complete' });
       sendEvent('complete', { ...e, taskId: createdTaskId });
       unregisterTaskRun(createdTaskId);
       res.end();
@@ -399,7 +570,8 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
       } catch (err: any) {
         logger.warn('system', { scope: 'stream/agent', event_name: 'task.error.failed', error: err?.message });
       }
-      sendEvent('error', { message: e.message, taskId: createdTaskId });
+      void appendTimelineLine(`错误: ${e.message}`, { kind: 'error' });
+      sendEvent('error', { message: stripPresentationMarks(e.message), taskId: createdTaskId });
       unregisterTaskRun(createdTaskId);
       res.end();
     },
@@ -407,6 +579,13 @@ router.post('/agent', authenticate, async (req: Request, res: Response) => {
       // Agent 调用了 ask-user 工具：发 ask 事件给前端弹窗
       // 本次 SSE 在 stream 返回后结束；前端回答后通过 /resume 继续。
       askSent = true;
+      void appendTimelineLine(info.question || `等待审批: ${info.toolName || 'tool'}`, {
+        kind: 'ask',
+        step: info.toolName,
+        toolName: info.toolName,
+        args: info.args,
+        status: 'pending',
+      });
       sendEvent('ask', { ...info, taskId: createdTaskId });
     },
   };
@@ -481,6 +660,125 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
+  let assistantTimelineMessageId: bigint | null = null;
+  let assistantTimelineEvents: PersistedTimelineEvent[] = [];
+  const appendTimelineEvent = async (event: PersistedTimelineEvent, options: { inline?: boolean } = {}) => {
+    const numericSessionId = sessionId ? Number(sessionId) : null;
+    if (!numericSessionId) return;
+    const cleaned = event.kind === 'text' || event.kind === 'thinking' ? normalizeTimelineText(event.title) : stripPresentationMarks(event.title);
+    if (!shouldPersistTimelineLine(cleaned)) return;
+    const nextEvent: PersistedTimelineEvent = { ...event, title: cleaned, at: event.at || Date.now() };
+    if ((nextEvent.kind === 'tool' || nextEvent.kind === 'tool-result') && !shouldShowToolOnTimeline(nextEvent.toolName || nextEvent.step)) {
+      return;
+    }
+    try {
+      if (!assistantTimelineMessageId) {
+        const latestTimeline = await prisma.message.findFirst({
+          where: {
+            sessionId: numericSessionId,
+            role: 'assistant',
+            messageType: 'task_result',
+          },
+          orderBy: { createdAt: 'desc' },
+          select: { id: true, content: true },
+        });
+        if (latestTimeline && taskId) {
+          assistantTimelineMessageId = latestTimeline.id;
+          const existingContent = latestTimeline.content || '';
+          try {
+            const parsed = JSON.parse(existingContent);
+            assistantTimelineEvents = Array.isArray(parsed?.events) ? parsed.events : [];
+          } catch {
+            assistantTimelineEvents = existingContent
+              .split(/\r?\n/)
+              .map((line) => stripPresentationMarks(line))
+              .filter(Boolean)
+              .map((line) => ({ kind: 'text', title: line, at: Date.now() }));
+          }
+        }
+      }
+      if ((nextEvent.kind === 'text' || nextEvent.kind === 'thinking') && assistantTimelineEvents.length > 0) {
+        const barrier = new Set(['ask', 'complete', 'error']);
+        for (let i = assistantTimelineEvents.length - 1; i >= 0; i -= 1) {
+          if (barrier.has(assistantTimelineEvents[i].kind)) break;
+          if (assistantTimelineEvents[i].kind === nextEvent.kind) {
+            assistantTimelineEvents[i] = {
+              ...assistantTimelineEvents[i],
+              title: compactTimelineText(`${assistantTimelineEvents[i].title}${nextEvent.title}`),
+              at: nextEvent.at,
+            };
+            nextEvent.title = '';
+            break;
+          }
+        }
+      }
+      if (nextEvent.title) {
+        if (nextEvent.kind === 'tool-result') {
+          const idx = [...assistantTimelineEvents].reverse().findIndex((item) =>
+            item.kind === 'tool' &&
+            normalizeToolName(item.toolName || item.step) === normalizeToolName(nextEvent.toolName || nextEvent.step)
+          );
+          if (idx >= 0) {
+            const realIndex = assistantTimelineEvents.length - 1 - idx;
+            assistantTimelineEvents[realIndex] = { ...assistantTimelineEvents[realIndex], ...nextEvent };
+          } else {
+            assistantTimelineEvents.push(nextEvent);
+          }
+        } else {
+          assistantTimelineEvents.push(nextEvent);
+        }
+      }
+      const assistantTimelineContent = serializeTimelineEvents(assistantTimelineEvents);
+      if (!assistantTimelineMessageId) {
+          const created = await prisma.message.create({
+            data: {
+              sessionId: numericSessionId,
+              role: 'assistant',
+              content: assistantTimelineContent,
+              messageType: 'task_result',
+              metadata: {
+                mode: 'autonomous',
+                taskId: taskId || null,
+                timeline: true,
+              },
+            },
+            select: { id: true },
+          });
+          assistantTimelineMessageId = created.id;
+      } else {
+        await prisma.message.update({
+          where: { id: assistantTimelineMessageId },
+          data: {
+            content: assistantTimelineContent,
+            metadata: {
+              mode: 'autonomous',
+              taskId: taskId || null,
+              timeline: true,
+            },
+          },
+        });
+      }
+      await prisma.session.update({
+        where: { id: numericSessionId },
+        data: { lastMessageAt: new Date() },
+      });
+    } catch (err: any) {
+      logger.warn('system', { scope: 'stream/agent/resume', event_name: 'timeline.persist.failed', error: err?.message });
+    }
+  };
+  const appendTimelineLine = async (line: string, options: { inline?: boolean; kind?: string; step?: string; toolName?: string; args?: any; result?: any; status?: string } = {}) => {
+    await appendTimelineEvent({
+      kind: options.kind || (options.inline ? 'text' : 'text'),
+      title: line,
+      at: Date.now(),
+      step: options.step,
+      toolName: options.toolName,
+      args: options.args,
+      result: options.result,
+      status: options.status,
+    }, options);
+  };
+
   try {
     if (taskId) {
       const existingTask = await prisma.task.findFirst({
@@ -529,7 +827,7 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
     sendEvent('progress', {
       type: 'progress',
       step: 'resumed',
-      message: `▶️ Agent 已${decision === 'approve' ? '继续执行' : '收到拒绝信号'}`,
+      message: `Agent 已${decision === 'approve' ? '继续执行' : '收到拒绝信号'}`,
       progress: 30,
     });
 
@@ -552,21 +850,37 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
       const payload = (chunk as any).payload;
       if (type === 'text-delta' && payload?.text) {
         fullText += payload.text;
+        void appendTimelineLine(payload.text, { inline: true, kind: 'text' });
         sendEvent('progress', {
           type: 'text',
           step: 'response',
-          message: payload.text,
+          message: stripPresentationSymbols(payload.text),
         });
+      } else if (type === 'reasoning-delta') {
+        const text = payload?.text ?? (chunk as any).delta ?? '';
+        if (typeof text === 'string' && text.length > 0) {
+          sendEvent('progress', {
+            type: 'thinking',
+            step: 'thinking',
+            message: stripPresentationSymbols(text),
+          });
+          void appendTimelineLine(text, { inline: true, kind: 'thinking' });
+        }
       } else if (type === 'tool-call') {
         const toolName = payload?.toolName || 'unknown';
         const args = payload?.args || payload?.input || {};
         toolCalls.push({ toolName, args, result: null });
         progress = Math.min(progress + 8, 88);
+        void appendTimelineLine(`调用工具: ${toolName}`, { kind: 'tool', step: toolName, toolName, args });
         sendEvent('progress', {
           type: 'tool',
           step: toolName,
-          message: `🔧 调用工具: ${toolName}`,
+          message: `调用工具: ${toolName}`,
           progress,
+          data: {
+            toolName,
+            args,
+          },
         });
       } else if (type === 'tool-call-suspended' || type === 'tool-suspended') {
         const sp = payload?.suspendPayload || payload;
@@ -603,11 +917,26 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
           }
         }
         progress = Math.min(progress + 4, 92);
+        const summary = lastCall ? summarizeToolResult(lastCall) : '工具执行完成';
+        void appendTimelineLine(summary, {
+          kind: 'tool-result',
+          step: lastCall?.toolName || 'tool',
+          toolName: lastCall?.toolName || '',
+          args: lastCall?.args || null,
+          result,
+        });
         sendEvent('progress', {
           type: 'tool-result',
           step: 'tool',
-          message: '✅ 工具执行完成',
+          message: summary,
           progress,
+          data: {
+            toolName: lastCall?.toolName || '',
+            args: lastCall?.args || null,
+            result,
+            filePath: writtenFilePath,
+            content: writtenFileContent,
+          },
         });
       } else if (type === 'finish') {
         const finishPayload = payload || chunk;
@@ -667,6 +996,7 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
           question = `Agent 想调用工具 ${toolName}，请确认`;
         }
 
+        void appendTimelineLine(question, { kind: 'ask', step: toolName, toolName, args, status: 'pending' });
         sendEvent('ask', { question, runId, toolCallId, toolName, args });
         res.end();
         return;
@@ -709,6 +1039,7 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
         logger.warn('system', { scope: 'stream/agent/resume', event_name: 'task.incomplete.failed', error: e?.message });
       }
       sendEvent('complete', { success: false, incomplete: true, finishReason: finalFinishReason, message: pauseMessage, error: pauseMessage, taskId });
+      void appendTimelineLine(pauseMessage, { kind: 'complete' });
       if (taskId) unregisterTaskRun(taskId);
       res.end();
       return;
@@ -774,6 +1105,7 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
       }
     }
 
+    void appendTimelineLine('完成', { kind: 'complete' });
     sendEvent('complete', { success: true, testCode, testFile, previewFileId, taskId });
     if (taskId) unregisterTaskRun(taskId);
     res.end();
@@ -794,7 +1126,9 @@ router.post('/agent/resume', authenticate, async (req: Request, res: Response) =
       }
       unregisterTaskRun(taskId);
     }
-    sendEvent('error', { message: isCancelled ? '任务已取消' : err?.message || 'resume 失败', taskId });
+    const errorMessage = isCancelled ? '任务已取消' : err?.message || 'resume 失败';
+    void appendTimelineLine(`错误: ${errorMessage}`, { kind: 'error' });
+    sendEvent('error', { message: errorMessage, taskId });
     res.end();
   }
 });

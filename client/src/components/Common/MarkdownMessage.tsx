@@ -66,6 +66,17 @@ const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content }) => {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
+          p: ({ node, ...props }) => (
+            <p
+              {...props}
+              style={{
+                margin: '0 0 8px',
+              }}
+            />
+          ),
+          ul: ({ node, ...props }) => <ul {...props} style={{ margin: '4px 0 8px', paddingLeft: 20 }} />,
+          ol: ({ node, ...props }) => <ol {...props} style={{ margin: '4px 0 8px', paddingLeft: 20 }} />,
+          li: ({ node, ...props }) => <li {...props} style={{ margin: '2px 0' }} />,
           // 自定义代码块渲染
           code({ inline, className, children, ...props }: any) {
             const match = /language-(\w+)/.exec(className || '');

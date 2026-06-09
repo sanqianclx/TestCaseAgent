@@ -87,7 +87,7 @@ function compactJson(value: unknown, maxLength = 1200): string {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
-function summarizeToolResult(call: AgentToolCallRecord): string {
+export function summarizeToolResult(call: AgentToolCallRecord): string {
   const args = call.args || {};
   const result = call.result || {};
   const toolName = call.toolName || 'unknown';
@@ -178,7 +178,7 @@ export async function streamAutonomousAgent(
     callbacks.onProgress({
       type: 'start',
       step: 'init',
-      message: '🚀 启动自主 Agent...',
+      message: '启动自主 Agent...',
       progress: 0,
     });
 
@@ -196,7 +196,7 @@ export async function streamAutonomousAgent(
     callbacks.onProgress({
       type: 'progress',
       step: 'init',
-      message: '📨 接收用户消息...',
+      message: '接收用户消息...',
       progress: 5,
     });
 
@@ -229,7 +229,7 @@ export async function streamAutonomousAgent(
     callbacks.onProgress({
       type: 'progress',
       step: 'thinking',
-      message: '🧠 Agent 正在分析请求...',
+      message: 'Agent 正在分析请求...',
       progress: 10,
     });
 
@@ -261,7 +261,7 @@ export async function streamAutonomousAgent(
     callbacks.onProgress({
       type: 'progress',
       step: 'streaming',
-      message: '💬 Agent 流式输出中...',
+      message: 'Agent 流式输出中...',
       progress: 20,
     });
 
@@ -288,7 +288,7 @@ export async function streamAutonomousAgent(
           callbacks.onProgress({
             type: 'progress',
             step: 'awaiting-user-input',
-            message: '⏸️ 等待你的输入...',
+            message: '等待你的输入...',
             progress: 60,
           });
           // 把标记从 fullText 中剥掉，避免最终保存到消息里
@@ -301,35 +301,35 @@ export async function streamAutonomousAgent(
           callbacks.onProgress({
             type: 'tool',
             step: 'read-file',
-            message: '📖 正在读取文件...',
+            message: '正在读取文件...',
             progress: Math.min(progress + 2, 90),
           });
         } else if (text.includes('解析') || text.includes('parsing')) {
           callbacks.onProgress({
             type: 'tool',
             step: 'parse-source',
-            message: '🔍 正在解析源代码...',
+            message: '正在解析源代码...',
             progress: Math.min(progress + 3, 90),
           });
         } else if (text.includes('执行测试') || text.includes('execute')) {
           callbacks.onProgress({
             type: 'tool',
             step: 'execute-tests',
-            message: '🧪 正在执行测试...',
+            message: '正在执行测试...',
             progress: Math.min(progress + 5, 90),
           });
         } else if (text.includes('覆盖率') || text.includes('coverage')) {
           callbacks.onProgress({
             type: 'tool',
             step: 'measure-coverage',
-            message: '📊 正在测量覆盖率...',
+            message: '正在测量覆盖率...',
             progress: Math.min(progress + 5, 90),
           });
         } else if (text.includes('写入') || text.includes('writing')) {
           callbacks.onProgress({
             type: 'tool',
             step: 'write-file',
-            message: '✍️  正在写入测试文件...',
+            message: '正在写入测试文件...',
             progress: Math.min(progress + 5, 90),
           });
         }
@@ -347,6 +347,16 @@ export async function streamAutonomousAgent(
           message: text,
           progress,
         });
+      } else if (type === 'reasoning-delta') {
+        const text = payload?.text ?? (chunk as any).delta ?? '';
+        if (typeof text === 'string' && text.length > 0) {
+          callbacks.onProgress({
+            type: 'thinking',
+            step: 'thinking',
+            message: text,
+            progress,
+          });
+        }
       } else if (type === 'tool-call') {
         const toolName = payload?.toolName || 'unknown';
         const args = payload?.args || payload?.input || {};
@@ -356,8 +366,12 @@ export async function streamAutonomousAgent(
         callbacks.onProgress({
           type: 'tool',
           step: toolName,
-          message: `🔧 调用工具: ${toolName}`,
+          message: `调用工具: ${toolName}`,
           progress: Math.min(progress + 2, 85),
+          data: {
+            toolName,
+            args,
+          },
         });
       } else if (type === 'tool-call-suspended' || type === 'tool-suspended') {
         // 工具挂起：框架通知需要用户审批
@@ -405,7 +419,7 @@ export async function streamAutonomousAgent(
             callbacks.onProgress({
               type: 'progress',
               step: 'awaiting-user-input',
-              message: '⏸️ 等待你的输入...',
+              message: '等待你的输入...',
               progress: 60,
             });
             return;
@@ -479,10 +493,11 @@ export async function streamAutonomousAgent(
           }
         }
 
+        const summary = lastCall ? summarizeToolResult(lastCall) : '工具执行完成';
         callbacks.onProgress({
           type: 'tool-result',
           step: 'tool',
-          message: `✅ 工具执行完成`,
+          message: summary,
           progress: Math.min(progress + 3, 90),
           data: {
             toolName: lastCall?.toolName || '',
@@ -557,7 +572,7 @@ export async function streamAutonomousAgent(
         callbacks.onProgress({
           type: 'progress',
           step: 'awaiting-user-approval',
-          message: '⏸️ 等待你的确认...',
+          message: '等待你的确认...',
           progress: 60,
         });
         return;
@@ -578,7 +593,7 @@ export async function streamAutonomousAgent(
       callbacks.onProgress({
         type: 'progress',
         step: 'incomplete',
-        message: `⏸️ Agent 本轮达到模型限制（${finalFinishReason}），已保存当前进度；发送“继续”会从断点接着做。`,
+        message: `Agent 本轮达到模型限制（${finalFinishReason}），已保存当前进度；发送“继续”会从断点接着做。`,
         progress: 90,
       });
       const message = `Agent 本轮未自然完成：${finalFinishReason}。进度已保存，请发送“继续”接着执行。`;
@@ -608,7 +623,7 @@ export async function streamAutonomousAgent(
       callbacks.onProgress({
         type: 'progress',
         step: 'awaiting-user-input',
-        message: '⏸️ 已通知前端等待用户输入...',
+        message: '已通知前端等待用户输入...',
         progress: 60,
       });
       return;
@@ -634,7 +649,7 @@ export async function streamAutonomousAgent(
     callbacks.onProgress({
       type: 'progress',
       step: 'register',
-      message: '💾 正在保存测试代码到文件库...',
+      message: '正在保存测试代码到文件库...',
       progress: 95,
     });
 
@@ -672,7 +687,7 @@ export async function streamAutonomousAgent(
     callbacks.onProgress({
       type: 'progress',
       step: 'complete',
-      message: '✅ Agent 执行完成',
+      message: 'Agent 执行完成',
       progress: 100,
     });
 
@@ -722,19 +737,19 @@ export async function streamWorkflow(
     callbacks.onProgress({
       type: 'start',
       step: 'init',
-      message: '🚀 启动 Workflow 流水线...',
+      message: '启动 Workflow 流水线...',
       progress: 0,
     });
 
     // 2. 7 步流水线
     const steps = [
-      { step: 'parse', message: '📖 步骤 1/7: 读取并解析源文件...', delay: 500 },
-      { step: 'design', message: '🎯 步骤 2/7: 设计测试用例...', delay: 800 },
-      { step: 'exportPlan', message: '📋 步骤 3/7: 导出测试计划...', delay: 400 },
-      { step: 'generate', message: '✍️  步骤 4/7: 生成测试代码...', delay: 1000 },
-      { step: 'execute', message: '🧪 步骤 5/7: 执行测试...', delay: 1500 },
-      { step: 'heal', message: '🔄 步骤 6/7: 自愈修复（如需要）...', delay: 800 },
-      { step: 'export', message: '📦 步骤 7/7: 导出结果...', delay: 500 },
+      { step: 'parse', message: '步骤 1/7: 读取并解析源文件...', delay: 500 },
+      { step: 'design', message: '步骤 2/7: 设计测试用例...', delay: 800 },
+      { step: 'exportPlan', message: '步骤 3/7: 导出测试计划...', delay: 400 },
+      { step: 'generate', message: '步骤 4/7: 生成测试代码...', delay: 1000 },
+      { step: 'execute', message: '步骤 5/7: 执行测试...', delay: 1500 },
+      { step: 'heal', message: '步骤 6/7: 自愈修复（如需要）...', delay: 800 },
+      { step: 'export', message: '步骤 7/7: 导出结果...', delay: 500 },
     ];
 
     let progress = 0;
@@ -754,7 +769,7 @@ export async function streamWorkflow(
     callbacks.onProgress({
       type: 'progress',
       step: 'workflow',
-      message: '⚙️  执行 7 步工作流...',
+      message: '执行 7 步工作流...',
       progress: 90,
     });
 
@@ -787,7 +802,7 @@ export async function streamWorkflow(
     callbacks.onProgress({
       type: 'progress',
       step: 'register',
-      message: '💾 正在保存测试代码到文件库...',
+      message: '正在保存测试代码到文件库...',
       progress: 96,
     });
 
@@ -815,7 +830,7 @@ export async function streamWorkflow(
     callbacks.onProgress({
       type: 'progress',
       step: 'complete',
-      message: '✅ Workflow 执行完成',
+      message: 'Workflow 执行完成',
       progress: 100,
     });
 

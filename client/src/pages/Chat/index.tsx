@@ -18,7 +18,6 @@ import {
   Button,
   Typography,
   Segmented,
-  Avatar,
   Tag,
   Progress,
   Alert,
@@ -33,17 +32,17 @@ import {
   Upload,
   Select,
   Steps,
+  Tooltip,
 } from 'antd';
 import {
   SendOutlined,
-  RobotOutlined,
-  UserOutlined,
   BranchesOutlined,
   CodeOutlined,
   ThunderboltOutlined,
   PlusOutlined,
   DeleteOutlined,
-  MessageOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
   PaperClipOutlined,
   FileTextOutlined,
   FolderOutlined,
@@ -69,6 +68,26 @@ interface StreamMessage {
   content: string;
   isStreaming?: boolean;
   createdAt: string;
+  messageType?: string;
+}
+
+type TimelineEventKind = 'thinking' | 'text' | 'tool' | 'tool-result' | 'ask' | 'complete' | 'error';
+
+interface TimelineEvent {
+  id: string;
+  kind: TimelineEventKind;
+  title: string;
+  content?: string;
+  step?: string;
+  at: number;
+  status?: ToolEvent['status'];
+  runId?: string;
+  toolCallId?: string;
+  toolName?: string;
+  taskId?: string;
+  args?: Record<string, any>;
+  result?: any;
+  details?: string;
 }
 
 interface Session {
@@ -148,6 +167,219 @@ const WORKFLOW_STEP_ORDER = [
 
 const DRAFT_SESSION_ID = -1;
 
+const stripPresentationMarks = (value: string) =>
+  String(value || '')
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '')
+    .replace(/^[\s·:：-]+/, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+const stripPresentationSymbols = (value: string) =>
+  String(value || '').replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
+
+const normalizeTimelineText = (value: string) =>
+  stripPresentationSymbols(value)
+    .replace(/[ \t]+\r?\n/g, '\n')
+    .replace(/\r?\n[ \t]+/g, '\n')
+    .replace(/(?:\r?\n){2,}/g, '\n')
+    .trim();
+
+const compactTimelineText = (value: string) =>
+  stripPresentationSymbols(value)
+    .replace(/[ \t]+\r?\n/g, '\n')
+    .replace(/\r?\n[ \t]+/g, '\n')
+    .replace(/(?:\r?\n){2,}/g, '\n');
+
+const repairPersistedTokenLines = (value: string) => {
+  const text = compactTimelineText(value);
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length < 6) return text;
+  const shortLines = lines.filter((line) => line.trim().length <= 4).length;
+  if (shortLines / lines.length < 0.65) return text;
+  return lines.join('');
+};
+
+const isNoisyPersistedLine = (line: string) => {
+  const normalized = stripPresentationMarks(line);
+  return [
+    '接收用户消息...',
+    'Agent 正在分析请求...',
+    'Agent 流式输出中...',
+    '正在解析源代码...',
+    '正在读取文件...',
+    '正在写入测试文件...',
+    '正在执行测试...',
+    '正在测量覆盖率...',
+  ].includes(normalized);
+};
+
+const hasTimelineContent = (event: TimelineEvent) => {
+  const title = stripPresentationMarks(event.title);
+  const content = stripPresentationMarks(event.content || '');
+  if (title === '...' || title === '…') return false;
+  if (title === '工具执行完成') return false;
+  if (title === '执行完成') return false;
+  return Boolean(title || content);
+};
+
+const createTimelineEvent = (
+  kind: TimelineEventKind,
+  title: string,
+  extra: Partial<TimelineEvent> = {}
+): TimelineEvent => {
+  const eventKind = (extra.kind || kind) as TimelineEventKind;
+  const rawTitle = extra.title ?? title;
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: eventKind,
+    at: Date.now(),
+    ...extra,
+    title: eventKind === 'text' || eventKind === 'thinking' ? compactTimelineText(rawTitle) : stripPresentationMarks(rawTitle),
+    content: extra.content
+      ? eventKind === 'text' || eventKind === 'thinking'
+        ? compactTimelineText(extra.content)
+        : stripPresentationMarks(extra.content)
+      : extra.content,
+  };
+};
+
+const timelineFromPersistedMessage = (message: StreamMessage): TimelineEvent[] => {
+  if (message.messageType !== 'task_result') return [];
+  try {
+    const parsed = JSON.parse(message.content);
+    const rawEvents = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.events) ? parsed.events : [];
+    if (rawEvents.length > 0) {
+      return rawEvents
+        .filter((event: any) => {
+          const kind = event.kind || 'text';
+          if (kind !== 'tool' && kind !== 'tool-result') return true;
+          const tool = String(event.toolName || event.step || '').replace(/-/g, '').toLowerCase();
+          return tool === 'readfile' || tool === 'writefile' || tool === 'shellrun';
+        })
+        .map((event: any, index: number) => {
+          const kind = (event.kind || 'text') as TimelineEventKind;
+          const repairedTitle = kind === 'text' || kind === 'thinking'
+            ? repairPersistedTokenLines(event.title || event.content || '')
+            : event.title || event.content || '';
+          const repairedContent = event.content && (kind === 'text' || kind === 'thinking')
+            ? repairPersistedTokenLines(event.content)
+            : event.content;
+          return createTimelineEvent(kind, repairedTitle, {
+            ...event,
+            id: `${message.id}-${event.id || index}`,
+            at: typeof event.at === 'number' ? event.at : new Date(message.createdAt).getTime() + index,
+            title: repairedTitle,
+            content: repairedContent,
+          });
+        })
+        .filter(hasTimelineContent);
+    }
+  } catch {
+    // Older records were persisted as plain text lines.
+  }
+  const lines = message.content
+    .split(/\r?\n/)
+    .map((line) => stripPresentationMarks(line))
+    .filter((line) => Boolean(line) && line !== '...' && line !== '…' && !isNoisyPersistedLine(line));
+  if (lines.length === 0) return [];
+  return message.content
+    ? [
+        createTimelineEvent('text', lines.join('\n'), {
+          id: `${message.id}-legacy-text`,
+          at: new Date(message.createdAt).getTime(),
+        }),
+      ]
+    : [];
+};
+
+const normalizeToolName = (toolName?: string) => String(toolName || '').replace(/-/g, '').toLowerCase();
+
+const shouldShowToolOnTimeline = (toolName?: string) => {
+  const tool = normalizeToolName(toolName);
+  return tool === 'readfile' || tool === 'writefile' || tool === 'shellrun';
+};
+
+const extractPathFromText = (value?: string) => {
+  const text = String(value || '');
+  const match =
+    text.match(/(?:file_path|filePath|path)=([^,\n]+)/i) ||
+    text.match(/(?:读取|写入|Read|Edit)\s+([A-Za-z]:[^\n,]+)/i);
+  return match?.[1]?.trim() || '';
+};
+
+const getToolPath = (args?: Record<string, any>, result?: any, fallbackText?: string) =>
+  result?.file_path ||
+  result?.filePath ||
+  result?.path ||
+  args?.path ||
+  args?.filePath ||
+  args?.file_path ||
+  extractPathFromText(fallbackText) ||
+  '';
+
+const sentenceIsComplete = (value?: string) => {
+  const text = normalizeTimelineText(value || '');
+  if (!text) return true;
+  return /[。！？!?；;：:\n]$/.test(text);
+};
+
+const summarizeTimelineTool = (event: TimelineEvent) => {
+  const tool = normalizeToolName(event.toolName || event.step);
+  const args = event.args || {};
+  const result = event.result || {};
+  const path = getToolPath(args, result, event.title);
+  if (tool === 'readfile') {
+    const lineCount = result?.line_count ?? result?.lineCount;
+    return {
+      label: 'Read',
+      main: path,
+      sub: lineCount ? `lines ${lineCount}` : '',
+    };
+  }
+  if (tool === 'writefile') {
+    const size = result?.size;
+    const chars = typeof args.content === 'string' ? args.content.length : undefined;
+    return {
+      label: 'Edit',
+      main: path,
+      sub: size ? `${size} bytes` : chars ? `${chars} chars` : '',
+    };
+  }
+  if (tool === 'shellrun') {
+    return {
+      label: 'Shell',
+      main: args.command || result?.command || event.title,
+      sub: `exit=${result?.exit_code ?? result?.exitCode ?? 'n/a'}${result?.timed_out || result?.timedOut ? ', timeout' : ''}`,
+    };
+  }
+  return {
+    label: event.toolName || event.step || 'Tool',
+    main: event.title,
+    sub: '',
+  };
+};
+
+const buildToolDetails = (event: TimelineEvent) => {
+  const tool = normalizeToolName(event.toolName || event.step);
+  const args = event.args || {};
+  const result = event.result || {};
+  if (tool === 'shellrun') {
+    const stdout = result?.stdout || '';
+    const stderr = result?.stderr || '';
+    return [
+      stdout ? `stdout:\n${stdout}` : '',
+      stderr ? `stderr:\n${stderr}` : '',
+    ].filter(Boolean).join('\n\n');
+  }
+  if (tool === 'readfile') {
+    return result?.content ? `content:\n${result.content}` : '';
+  }
+  if (tool === 'writefile') {
+    return typeof args.content === 'string' ? `content:\n${args.content}` : '';
+  }
+  return event.details || '';
+};
+
 /**
  * 聊天页面
  */
@@ -178,6 +410,12 @@ const Chat: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [newSessionModal, setNewSessionModal] = useState(false);
   const [newSessionTitle, setNewSessionTitle] = useState('');
+  const [autoScrollEnabled, setAutoScrollEnabled] = useState(true);
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
+  const timelineScrollRef = useRef<HTMLDivElement | null>(null);
+  const autoScrollResumeTimerRef = useRef<number | null>(null);
+  const pendingTimelineEventsRef = useRef<Record<number, TimelineEvent[]>>({});
+  const activeTextBufferRef = useRef<Record<number, string>>({});
 
   // === Agent 工具审批 ===
   // 后端检测到 requireApproval 工具（writeFile / shellRun / exportCases）挂起时
@@ -233,6 +471,14 @@ const Chat: React.FC = () => {
       return {};
     }
   });
+  const [timelineBySession, setTimelineBySession] = useState<Record<number, TimelineEvent[]>>(() => {
+    try {
+      const raw = localStorage.getItem('chat:agent:timeline');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
   const [outputEntriesBySession, setOutputEntriesBySession] = useState<
     Record<number, sessionsApi.SessionOutputEntry[]>
   >(() => {
@@ -277,6 +523,7 @@ const Chat: React.FC = () => {
   });
   // 派生当前会话的数据
   const toolEvents = currentSessionId != null ? toolEventsBySession[currentSessionId] || [] : [];
+  const timelineEvents = currentSessionId != null ? timelineBySession[currentSessionId] || [] : [];
   const currentPreview = currentSessionId != null ? previewBySession[currentSessionId] : undefined;
   const previewFileId = currentPreview?.previewFileId ?? null;
   const previewLanguage = currentPreview?.previewLanguage ?? 'python';
@@ -320,6 +567,123 @@ const Chat: React.FC = () => {
       }));
     },
     [currentSessionId]
+  );
+  const setTimelineEvents = useCallback(
+    (sessionId: number, updater: React.SetStateAction<TimelineEvent[]>) => {
+      setTimelineBySession((prev) => {
+        const cur = prev[sessionId] || [];
+        const rawNext = typeof updater === 'function' ? (updater as (s: TimelineEvent[]) => TimelineEvent[])(cur) : updater;
+        const next = rawNext.filter(hasTimelineContent);
+        return { ...prev, [sessionId]: next.slice(-500) };
+      });
+    },
+    []
+  );
+  const appendTimelineEvent = useCallback(
+    (sessionId: number, event: TimelineEvent) => {
+      if (!hasTimelineContent(event)) return;
+      setTimelineEvents(sessionId, (prev) => {
+        if ((event.kind === 'text' || event.kind === 'thinking') && prev.length > 0) {
+          const last = prev[prev.length - 1];
+          if (last.kind === event.kind) {
+            const mergedTitle = compactTimelineText(`${last.title}${event.title}`);
+            const next = [...prev];
+            next[next.length - 1] = { ...last, title: mergedTitle, content: mergedTitle, at: event.at };
+            return next;
+          }
+        }
+        if (event.kind !== 'text') {
+          activeTextBufferRef.current[sessionId] = '';
+        }
+        if (event.kind === 'tool-result') {
+          const idx = [...prev].reverse().findIndex((item) => (
+            item.kind === 'tool' &&
+            normalizeToolName(item.toolName || item.step) === normalizeToolName(event.toolName || event.step)
+          ));
+          if (idx >= 0) {
+            const realIndex = prev.length - 1 - idx;
+            const target = prev[realIndex];
+            const next = [...prev];
+            next[realIndex] = {
+              ...target,
+              ...event,
+              id: target.id,
+              kind: 'tool-result',
+              title: event.title || target.title,
+              args: event.args || target.args,
+              toolName: event.toolName || target.toolName,
+              step: event.step || target.step,
+            };
+            return next;
+          }
+        }
+        return [...prev, event];
+      });
+    },
+    [setTimelineEvents]
+  );
+  const flushPendingTimelineEvents = useCallback(
+    (sessionId: number) => {
+      const pending = pendingTimelineEventsRef.current[sessionId] || [];
+      if (pending.length === 0) return;
+      pendingTimelineEventsRef.current[sessionId] = [];
+      for (const event of pending) {
+        appendTimelineEvent(sessionId, event);
+      }
+    },
+    [appendTimelineEvent]
+  );
+  const queueTimelineEventUntilSentenceBoundary = useCallback(
+    (sessionId: number, event: TimelineEvent) => {
+      if (event.kind === 'tool-result') {
+        const pending = pendingTimelineEventsRef.current[sessionId] || [];
+        const idx = [...pending].reverse().findIndex((item) => (
+          item.kind === 'tool' &&
+          normalizeToolName(item.toolName || item.step) === normalizeToolName(event.toolName || event.step)
+        ));
+        if (idx >= 0) {
+          const realIndex = pending.length - 1 - idx;
+          const next = [...pending];
+          next[realIndex] = {
+            ...next[realIndex],
+            ...event,
+            id: next[realIndex].id,
+            kind: 'tool-result',
+            title: event.title || next[realIndex].title,
+            args: event.args || next[realIndex].args,
+            toolName: event.toolName || next[realIndex].toolName,
+            step: event.step || next[realIndex].step,
+          };
+          pendingTimelineEventsRef.current[sessionId] = next;
+          return;
+        }
+      }
+      const activeText = activeTextBufferRef.current[sessionId] || '';
+      if (!activeText || sentenceIsComplete(activeText)) {
+        appendTimelineEvent(sessionId, event);
+        activeTextBufferRef.current[sessionId] = '';
+        return;
+      }
+      pendingTimelineEventsRef.current[sessionId] = [
+        ...(pendingTimelineEventsRef.current[sessionId] || []),
+        event,
+      ];
+    },
+    [appendTimelineEvent]
+  );
+  const updateTimelineAskStatus = useCallback(
+    (sessionId: number, event: ToolEvent, status: ToolEvent['status']) => {
+      setTimelineEvents(sessionId, (prev) =>
+        prev.map((item) =>
+          item.kind === 'ask' &&
+          item.runId === event.runId &&
+          item.toolCallId === event.toolCallId
+            ? { ...item, status }
+            : item
+        )
+      );
+    },
+    [setTimelineEvents]
   );
   const setPreviewLanguage = useCallback(
     (v: string | null, forSessionId?: number) => {
@@ -434,6 +798,9 @@ const Chat: React.FC = () => {
     try { localStorage.setItem('chat:right:all-tools', JSON.stringify(toolEventsBySession)); } catch { /* ignore */ }
   }, [toolEventsBySession]);
   useEffect(() => {
+    try { localStorage.setItem('chat:agent:timeline', JSON.stringify(timelineBySession)); } catch { /* ignore */ }
+  }, [timelineBySession]);
+  useEffect(() => {
     try { localStorage.setItem('chat:right:all-previews', JSON.stringify(previewBySession)); } catch { /* ignore */ }
   }, [previewBySession]);
   useEffect(() => {
@@ -468,8 +835,40 @@ const Chat: React.FC = () => {
 
   // 滚动到底部
   useEffect(() => {
+    if (!autoScrollEnabled) return;
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [streamMessages, isStreaming]);
+  }, [streamMessages, timelineEvents, isStreaming, autoScrollEnabled]);
+
+  const handleTimelineScroll = useCallback(() => {
+    const el = timelineScrollRef.current;
+    if (!el) return;
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const isNearBottom = distanceToBottom < 80;
+    if (isNearBottom) {
+      setAutoScrollEnabled(true);
+      if (autoScrollResumeTimerRef.current != null) {
+        window.clearTimeout(autoScrollResumeTimerRef.current);
+        autoScrollResumeTimerRef.current = null;
+      }
+      return;
+    }
+    setAutoScrollEnabled(false);
+    if (autoScrollResumeTimerRef.current != null) {
+      window.clearTimeout(autoScrollResumeTimerRef.current);
+    }
+    autoScrollResumeTimerRef.current = window.setTimeout(() => {
+      setAutoScrollEnabled(true);
+      autoScrollResumeTimerRef.current = null;
+    }, 8000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (autoScrollResumeTimerRef.current != null) {
+        window.clearTimeout(autoScrollResumeTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -608,6 +1007,7 @@ const Chat: React.FC = () => {
         setWorkspaceLocked(Boolean(boundWorkspaceId));
         setStreamMessages([]);
         setToolEvents([]);
+        setTimelineEvents(newSessionId, []);
         setPreviewFileId(null);
         setPreviewCode(null);
         setError(null);
@@ -642,14 +1042,18 @@ const Chat: React.FC = () => {
       }
       const res = await apiClient.get(`/sessions/${sessionId}/messages`);
       if (res.data.code === 0) {
-        const msgs = res.data.data.items.map((m: any) => ({
+        const allMsgs: StreamMessage[] = res.data.data.items.map((m: any) => ({
           id: String(m.id),
           role: m.role,
           content: m.content,
+          messageType: m.messageType,
           isStreaming: false,
           createdAt: m.createdAt,
         }));
+        const msgs = allMsgs.filter((m) => m.messageType !== 'task_result');
         setStreamMessages(msgs);
+        const persistedTimeline = allMsgs.flatMap(timelineFromPersistedMessage);
+        setTimelineEvents(sessionId, persistedTimeline);
         const sessionPreview = previewBySession[sessionId];
         setPreviewFileId(sessionPreview?.previewFileId ?? null, sessionId);
         setPreviewLanguage(sessionPreview?.previewLanguage ?? 'python', sessionId);
@@ -702,6 +1106,11 @@ const Chat: React.FC = () => {
           return next;
         });
         setWorkflowStateBySession((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
+        setTimelineBySession((prev) => {
           const next = { ...prev };
           delete next[sessionId];
           return next;
@@ -779,6 +1188,7 @@ const Chat: React.FC = () => {
 
     setInputValue('');
     setError(null);
+    setAutoScrollEnabled(true);
     resetLivePanel();
     const requestAttachments = attachments;
 
@@ -817,7 +1227,6 @@ const Chat: React.FC = () => {
     // 保存用户消息
     saveMessageToServer(sessionId, 'user', content);
 
-    let assistantId = '';
     if (!isWorkflowRequest) {
       const userMsg: StreamMessage = {
         id: `user-${Date.now()}`,
@@ -826,17 +1235,6 @@ const Chat: React.FC = () => {
         createdAt: new Date().toISOString(),
       };
       setStreamMessages((prev) => [...prev, userMsg]);
-      assistantId = `assistant-${Date.now()}`;
-      setStreamMessages((prev) => [
-        ...prev,
-        {
-          id: assistantId,
-          role: 'assistant',
-          content: '',
-          isStreaming: true,
-          createdAt: new Date().toISOString(),
-        },
-      ]);
     } else {
       updateWorkflowState(sessionId, {
         input: content,
@@ -897,7 +1295,7 @@ const Chat: React.FC = () => {
       if (isWorkflowRequest) {
         await consumeWorkflowStream(response, sessionId);
       } else {
-        await consumeStream(response, assistantId, sessionId);
+        await consumeStream(response, sessionId);
       }
 
       setSelectedFile(null);
@@ -964,7 +1362,7 @@ const Chat: React.FC = () => {
           }));
         } else if (eventType === 'complete') {
           setProgress(100);
-          setCurrentStep('✅ Workflow 执行完成');
+          setCurrentStep('Workflow 执行完成');
           if (typeof ev.previewFileId === 'number') {
             setPreviewFileId(ev.previewFileId, sessionId);
           }
@@ -985,7 +1383,7 @@ const Chat: React.FC = () => {
               },
             ],
             progress: 100,
-            currentStep: '✅ Workflow 执行完成',
+            currentStep: 'Workflow 执行完成',
             status: 'success',
             outputDir: ev.outputDir || prev?.outputDir || null,
             previewFileId: typeof ev.previewFileId === 'number' ? ev.previewFileId : prev?.previewFileId ?? null,
@@ -1083,6 +1481,8 @@ const Chat: React.FC = () => {
     answer?: string
   ) => {
     if (!event.runId || !event.toolCallId) return;
+    if (currentSessionId == null) return;
+    const sessionId = currentSessionId;
 
     // 立刻更新这条 toolEvent 的状态（视觉反馈）
     setToolEvents((prev) =>
@@ -1092,17 +1492,11 @@ const Chat: React.FC = () => {
           : e
       )
     );
-
-    // 提前创建新的 assistant 消息气泡作为承载
-    const newAssistantId = `assistant-${Date.now()}`;
-    setStreamMessages((prev) => [
-      ...prev,
-      { id: newAssistantId, role: 'assistant', content: '', isStreaming: true, createdAt: new Date().toISOString() },
-    ]);
+    updateTimelineAskStatus(sessionId, event, decision === 'approve' ? 'approved' : 'declined');
 
     setIsStreaming(true);
     setProgress(30);
-    setCurrentStep(decision === 'approve' ? '▶️ Agent 继续执行...' : '🔙 Agent 收到拒绝信号...');
+    setCurrentStep(decision === 'approve' ? 'Agent 继续执行...' : 'Agent 收到拒绝信号...');
 
     try {
       const baseURL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api/v1';
@@ -1119,7 +1513,7 @@ const Chat: React.FC = () => {
           decision,
           answer: answer || '',
           taskId: event.taskId,
-          sessionId: currentSessionId,
+          sessionId,
           workspaceId: currentWorkspaceId != null ? Number(currentWorkspaceId) : undefined,
           sourceFile: selectedFile?.name || attachments[0]?.originalName,
           language:
@@ -1130,9 +1524,8 @@ const Chat: React.FC = () => {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      // 直接传入新 assistant ID，resume 流的文本就追加到这里
-      await consumeStream(response, newAssistantId, currentSessionId!);
-      await loadSessionOutputFiles(currentSessionId!);
+      await consumeStream(response, sessionId);
+      await loadSessionOutputFiles(sessionId);
     } catch (err: any) {
       message.error(err.message || '继续执行失败');
       setIsStreaming(false);
@@ -1142,11 +1535,10 @@ const Chat: React.FC = () => {
   /**
    * 把 SSE 解析抽出来，handleStreamSend 和 handleAskSubmit 都能复用
    */
-  const consumeStream = async (response: Response, assistantId: string, sessionId: number) => {
+  const consumeStream = async (response: Response, sessionId: number) => {
     const reader = response.body?.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let fullAssistantText = '';
     if (!reader) return;
     while (true) {
       const { done, value } = await reader.read();
@@ -1165,17 +1557,61 @@ const Chat: React.FC = () => {
         if (eventType === 'progress') {
           const subType = ev.type || 'progress';
           if (typeof ev.progress === 'number') setProgress(ev.progress);
-          if (ev.message) setCurrentStep(ev.message);
+          const cleanMessage = stripPresentationMarks(ev.message || '');
+          if (cleanMessage) setCurrentStep(cleanMessage);
           if (subType === 'text') {
-            fullAssistantText += ev.message || '';
-            setStreamMessages((prev) =>
-              prev.map((m) => (m.id === assistantId ? { ...m, content: m.content + (ev.message || '') } : m))
-            );
+            const textChunk = stripPresentationSymbols(ev.message || '');
+            if (stripPresentationMarks(textChunk) && stripPresentationMarks(textChunk) !== '...') {
+              appendTimelineEvent(sessionId, createTimelineEvent('text', textChunk));
+              activeTextBufferRef.current[sessionId] = compactTimelineText(`${activeTextBufferRef.current[sessionId] || ''}${textChunk}`);
+              if (sentenceIsComplete(activeTextBufferRef.current[sessionId])) {
+                flushPendingTimelineEvents(sessionId);
+                activeTextBufferRef.current[sessionId] = '';
+              }
+            }
+          } else if (subType === 'thinking') {
+            const thinkingChunk = stripPresentationSymbols(ev.message || '');
+            if (stripPresentationMarks(thinkingChunk)) {
+              appendTimelineEvent(sessionId, createTimelineEvent('thinking', thinkingChunk));
+            }
           } else if (subType === 'tool' || subType === 'tool-result') {
-            setToolEvents((prev) => [...prev, { step: ev.step, message: ev.message || '', at: Date.now() }]);
-            const toolName = ev?.data?.toolName || '';
+            const toolName = ev?.data?.toolName || ev.step || '';
             const toolResult = ev?.data?.result;
             const toolArgs = ev?.data?.args;
+            if (subType === 'tool-result' && !toolName && cleanMessage === '工具执行完成') {
+              continue;
+            }
+            const eventTitle = cleanMessage || toolName || (subType === 'tool' ? 'Tool' : 'Tool result');
+            if (shouldShowToolOnTimeline(toolName || ev.step)) {
+              queueTimelineEventUntilSentenceBoundary(sessionId, createTimelineEvent(subType === 'tool' ? 'tool' : 'tool-result', eventTitle, {
+                step: toolName || ev.step,
+                toolName,
+                args: toolArgs,
+                result: toolResult,
+                details: buildToolDetails({
+                  id: '',
+                  kind: subType === 'tool' ? 'tool' : 'tool-result',
+                  title: eventTitle,
+                  at: Date.now(),
+                  step: toolName || ev.step,
+                  toolName,
+                  args: toolArgs,
+                  result: toolResult,
+                }),
+              }));
+            }
+            setToolEvents((prev) => {
+              const nextEvent = { step: toolName || ev.step, message: eventTitle, at: Date.now(), toolName, args: toolArgs, result: toolResult };
+              if (subType !== 'tool-result') return [...prev, nextEvent];
+              const idx = [...prev].reverse().findIndex((item) => (
+                normalizeToolName(item.toolName || item.step) === normalizeToolName(toolName || ev.step)
+              ));
+              if (idx < 0) return [...prev, nextEvent];
+              const realIndex = prev.length - 1 - idx;
+              const next = [...prev];
+              next[realIndex] = { ...next[realIndex], ...nextEvent };
+              return next;
+            });
             const outputPath =
               ev?.data?.filePath ||
               toolResult?.file_path ||
@@ -1212,11 +1648,12 @@ const Chat: React.FC = () => {
           } else {
           }
         } else if (eventType === 'ask') {
+          flushPendingTimelineEvents(sessionId);
           // Agent 工具挂起：把审批信息附加到 toolEvents
           const tName = ev.toolName || 'tool';
           const pendingTool: ToolEvent = {
             step: tName,
-            message: ev.question || `Agent 等待审批: ${tName}`,
+            message: stripPresentationMarks(ev.question || `Agent 等待审批: ${tName}`),
             at: Date.now(),
             toolName: tName,
             args: ev.args,
@@ -1225,119 +1662,56 @@ const Chat: React.FC = () => {
             taskId: ev.taskId,
             status: 'pending',
           };
+          appendTimelineEvent(sessionId, createTimelineEvent('ask', pendingTool.message, {
+            step: tName,
+            toolName: tName,
+            args: ev.args,
+            runId: ev.runId,
+            toolCallId: ev.toolCallId,
+            taskId: ev.taskId,
+            status: 'pending',
+          }));
           if (ev.taskId) setActiveTaskId(ev.taskId, sessionId);
           setToolEvents((prev) => [...prev, pendingTool]);
-          setStreamMessages((prev) =>
-            prev.map((m) => (m.id === assistantId ? { ...m, isStreaming: false } : m))
-          );
           setIsStreaming(false);
-          setCurrentStep('⏸️ 等待你在右侧面板批准/拒绝...');
+          setCurrentStep('等待你在右侧面板批准/拒绝');
           setProgress((prev) => Math.max(prev, 60));
         } else if (eventType === 'complete') {
+          flushPendingTimelineEvents(sessionId);
           if (ev.taskId) setActiveTaskId(ev.taskId, sessionId);
           if (ev.previewFileId) setPreviewFileId(ev.previewFileId, sessionId);
           if (ev.testCode) setPreviewCode(ev.testCode, sessionId);
           void loadSessionOutputFiles(sessionId);
           if (ev.incomplete) {
-            const pauseText = ev.error || ev.message || 'Agent 本轮未完成，进度已保存。发送“继续”可接着执行。';
-            setStreamMessages((prev) => prev.map((m) => m.id === assistantId ? { ...m, isStreaming: false } : m));
-            setCurrentStep(`⏸️ ${pauseText}`);
+            const pauseText = stripPresentationMarks(ev.error || ev.message || 'Agent 本轮未完成，进度已保存。发送“继续”可接着执行。');
+            appendTimelineEvent(sessionId, createTimelineEvent('complete', pauseText));
+            setCurrentStep(pauseText);
             setProgress((prev) => Math.max(prev, 90));
-            if (fullAssistantText) saveMessageToServer(sessionId, 'assistant', fullAssistantText);
             continue;
           }
           if (ev.outputDir && !ev.previewFileId && ev.testCode) {
-            setCurrentStep(`✅ 完成，产物目录：${ev.outputDir}`);
+            setCurrentStep(`完成，产物目录：${ev.outputDir}`);
           }
-          if (ev.testCode && !fullAssistantText.includes(ev.testCode)) {
+          if (ev.testCode) {
             const lang = ev.previewLanguage || ev.language || previewLanguage || 'python';
             setPreviewLanguage(lang, sessionId);
-            const codeBlock = '\n\n```' + lang + '\n' + ev.testCode + '\n```\n';
-            fullAssistantText += codeBlock;
-            setStreamMessages((prev) => prev.map((m) => m.id === assistantId ? { ...m, content: m.content + codeBlock, isStreaming: false } : m));
-          } else {
-            setStreamMessages((prev) => prev.map((m) => m.id === assistantId ? { ...m, isStreaming: false } : m));
           }
-          setCurrentStep('✅ 完成');
+          appendTimelineEvent(sessionId, createTimelineEvent('complete', '完成'));
+          setCurrentStep('完成');
           setProgress(100);
-          if (fullAssistantText) saveMessageToServer(sessionId, 'assistant', fullAssistantText);
         } else if (eventType === 'error') {
-          setError(ev.message);
-          setStreamMessages((prev) => prev.map((m) => m.id === assistantId ? { ...m, content: m.content + `\n\n❌ 错误: ${ev.message}`, isStreaming: false } : m));
+          flushPendingTimelineEvents(sessionId);
+          const errorMessage = stripPresentationMarks(ev.message || '执行出错');
+          setError(errorMessage);
+          appendTimelineEvent(sessionId, createTimelineEvent('error', errorMessage));
           setCurrentStep('执行出错');
         }
       }
     }
     setIsStreaming(false);
+    flushPendingTimelineEvents(sessionId);
     await loadSessionOutputFiles(sessionId);
     loadSessions();
-  };
-
-  /**
-   * 渲染单条消息
-   */
-  const renderMessage = (msg: StreamMessage) => {
-    const isUser = msg.role === 'user';
-    return (
-      <div
-        key={msg.id}
-        style={{
-          display: 'flex',
-          gap: 10,
-          marginBottom: 16,
-          justifyContent: isUser ? 'flex-end' : 'flex-start',
-        }}
-      >
-        {!isUser && (
-          <Avatar
-            size={32}
-            style={{ backgroundColor: '#52c41a', flexShrink: 0, marginTop: 4 }}
-            icon={<RobotOutlined />}
-          />
-        )}
-        <div style={{ maxWidth: '85%' }}>
-          <div
-            style={{
-              fontSize: 11,
-              color: '#999',
-              marginBottom: 4,
-              textAlign: isUser ? 'right' : 'left',
-            }}
-          >
-            {isUser ? '你' : 'AI 助手'} ·{' '}
-            {new Date(msg.createdAt).toLocaleTimeString()}
-            {msg.isStreaming && (
-              <span style={{ color: '#1890ff', marginLeft: 6 }}>● 生成中</span>
-            )}
-          </div>
-          <div
-            style={{
-              background: isUser ? '#1890ff' : '#fff',
-              color: isUser ? '#fff' : '#222',
-              borderRadius: 8,
-              padding: '10px 14px',
-              border: isUser ? 'none' : '1px solid #f0f0f0',
-              boxShadow: isUser ? 'none' : '0 1px 2px rgba(0,0,0,0.04)',
-            }}
-          >
-            {isUser ? (
-              <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 14 }}>
-                {msg.content}
-              </div>
-            ) : (
-              <MarkdownMessage content={msg.content} />
-            )}
-          </div>
-        </div>
-        {isUser && (
-          <Avatar
-            size={32}
-            style={{ backgroundColor: '#1890ff', flexShrink: 0, marginTop: 4 }}
-            icon={<UserOutlined />}
-          />
-        )}
-      </div>
-    );
   };
 
   const renderWorkflowContent = () => {
@@ -1349,6 +1723,10 @@ const Chat: React.FC = () => {
 
     return (
       <div
+        ref={timelineScrollRef}
+        onScroll={handleTimelineScroll}
+        onWheel={handleTimelineScroll}
+        onTouchMove={handleTimelineScroll}
         style={{
           flex: 1,
           overflow: 'auto',
@@ -1474,6 +1852,245 @@ const Chat: React.FC = () => {
     );
   };
 
+  const timelineStatusColor = (event: TimelineEvent) => {
+    if (event.kind === 'error') return '#ff4d4f';
+    if (event.kind === 'complete') return '#1677ff';
+    if (event.status === 'approved') return '#22c55e';
+    if (event.status === 'declined') return '#ff4d4f';
+    if (event.kind === 'ask' || event.status === 'pending') return '#faad14';
+    if (event.kind === 'tool' || event.kind === 'tool-result') return '#722ed1';
+    return '#1677ff';
+  };
+
+  const timelineLabel = (event: TimelineEvent) => {
+    if (event.kind === 'thinking') return 'Thinking';
+    if (event.kind === 'tool') return 'Tool';
+    if (event.kind === 'tool-result') return 'Tool Result';
+    if (event.kind === 'ask') return 'Approval';
+    if (event.kind === 'complete') return 'Complete';
+    if (event.kind === 'error') return 'Error';
+    return 'Assistant';
+  };
+
+  const renderTimelineEventBody = (event: TimelineEvent) => {
+    if (event.kind === 'tool' || event.kind === 'tool-result') {
+      const summary = summarizeTimelineTool(event);
+      const details = buildToolDetails(event);
+      return (
+        <Space direction="vertical" size={4} style={{ width: '100%' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', minWidth: 0, flexWrap: 'wrap' }}>
+            <Text strong style={{ fontSize: 15, color: '#4b5563' }}>
+              {summary.label}
+            </Text>
+            {summary.main ? (
+              <Tooltip title={summary.main}>
+                <Text code style={{ fontSize: 12, color: '#374151', whiteSpace: 'normal', wordBreak: 'break-all' }}>
+                  {summary.main}
+                </Text>
+              </Tooltip>
+            ) : null}
+            {summary.sub ? (
+              <Text type="secondary" style={{ fontSize: 13 }}>
+                {summary.sub}
+              </Text>
+            ) : null}
+          </div>
+          {details ? (
+            <Collapse
+              size="small"
+              ghost
+              style={{ marginLeft: -8 }}
+              items={[
+                {
+                  key: 'details',
+                  label: normalizeToolName(event.toolName || event.step) === 'shellrun' ? '命令输出' : '详情',
+                  children: (
+                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, color: '#374151' }}>
+                      {details}
+                    </pre>
+                  ),
+                },
+              ]}
+            />
+          ) : null}
+        </Space>
+      );
+    }
+
+    if (event.kind === 'thinking') {
+      const text = normalizeTimelineText(event.title || event.content || '');
+      return (
+        <Collapse
+          size="small"
+          ghost
+          defaultActiveKey={['thinking']}
+          style={{ marginLeft: -8 }}
+          items={[
+            {
+              key: 'thinking',
+              label: 'Thinking',
+              children: (
+                <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 13, color: '#6b7280', lineHeight: 1.7 }}>
+                  {text}
+                </div>
+              ),
+            },
+          ]}
+        />
+      );
+    }
+
+    const title = event.kind === 'text' ? normalizeTimelineText(event.title) : stripPresentationMarks(event.title);
+    const content = event.kind === 'text' ? normalizeTimelineText(event.content || '') : stripPresentationMarks(event.content || '');
+    return (
+      <Space direction="vertical" size={4} style={{ width: '100%' }}>
+        <Space size={8} wrap>
+          <Text strong style={{ color: timelineStatusColor(event), fontSize: 13 }}>
+            {timelineLabel(event)}
+          </Text>
+          {event.status ? (
+            <Tag
+              color={event.status === 'approved' ? 'success' : event.status === 'declined' ? 'error' : 'warning'}
+              style={{ marginRight: 0 }}
+            >
+              {event.status === 'approved' ? '已批准' : event.status === 'declined' ? '已拒绝' : '待审批'}
+            </Tag>
+          ) : null}
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {new Date(event.at).toLocaleTimeString()}
+          </Text>
+        </Space>
+        {title ? (
+          <div style={{ fontSize: 14, lineHeight: 1.55, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {event.kind === 'text' ? <MarkdownMessage content={title} /> : title}
+          </div>
+        ) : null}
+        {content && content !== title ? (
+          <div style={{ fontSize: 13, color: '#555', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {content}
+          </div>
+        ) : null}
+      </Space>
+    );
+  };
+
+  const renderAgentTimelineContent = () => {
+    const userMessages = streamMessages.filter((msg) => msg.role === 'user');
+    return (
+      <div
+        style={{
+          flex: 1,
+          overflow: 'auto',
+          padding: 20,
+          minHeight: 0,
+        }}
+      >
+        {!currentSessionId ? (
+          <div
+            style={{
+              height: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexDirection: 'column',
+            }}
+          >
+            <Text type="secondary" style={{ fontSize: 16 }}>
+              选择左侧会话或新建会话
+            </Text>
+            <Text type="secondary" style={{ marginTop: 8, fontSize: 12 }}>
+              支持拖拽文件、点击上传，或直接粘贴文件
+            </Text>
+          </div>
+        ) : (
+          <div style={{ maxWidth: 980, margin: '0 auto', width: '100%' }}>
+            {userMessages.length > 0 ? (
+              <Space direction="vertical" size={10} style={{ width: '100%', marginBottom: 18 }}>
+                {userMessages.map((msg, index) => (
+                  <div
+                    key={msg.id}
+                    style={{
+                      background: '#fff',
+                      border: '1px solid #e5e7eb',
+                      borderRadius: 8,
+                      padding: '12px 14px',
+                    }}
+                  >
+                    <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                      <Space size={8}>
+                        <Text strong style={{ fontSize: 13 }}>
+                          {userMessages.length > 1 ? `请求 ${index + 1}` : '本次请求'}
+                        </Text>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {new Date(msg.createdAt).toLocaleTimeString()}
+                        </Text>
+                      </Space>
+                      <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 14, lineHeight: 1.65 }}>
+                        {msg.content}
+                      </div>
+                    </Space>
+                  </div>
+                ))}
+              </Space>
+            ) : null}
+
+            <div
+              style={{
+                background: '#fff',
+                border: '1px solid #e5e7eb',
+                borderRadius: 8,
+                padding: '16px 18px',
+              }}
+            >
+              <Text strong style={{ display: 'block', marginBottom: 14 }}>
+                执行时间线
+              </Text>
+              {timelineEvents.length === 0 ? (
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={isStreaming ? '正在等待 Agent 输出' : '暂无执行记录'} />
+              ) : (
+                <div style={{ position: 'relative', paddingLeft: 20 }}>
+                  <div
+                    style={{
+                      position: 'absolute',
+                      left: 5,
+                      top: 8,
+                      bottom: 8,
+                      width: 1,
+                      background: '#e5e7eb',
+                    }}
+                  />
+                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    {timelineEvents.map((event) => {
+                      const color = timelineStatusColor(event);
+                      return (
+                        <div key={event.id} style={{ position: 'relative' }}>
+                          <span
+                            style={{
+                              position: 'absolute',
+                              left: -20,
+                              top: 5,
+                              width: 11,
+                              height: 11,
+                              borderRadius: 999,
+                              background: '#fff',
+                              border: `2px solid ${color}`,
+                            }}
+                          />
+                          {renderTimelineEventBody(event)}
+                        </div>
+                      );
+                    })}
+                  </Space>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+    );
+  };
+
   const rightPanelEvents = isWorkflowSession
     ? (currentWorkflowState?.logs || []).map((log) => ({
         step: log.step,
@@ -1493,7 +2110,7 @@ const Chat: React.FC = () => {
       >
         {/* 左侧会话历史 */}
         <Sider
-          width={240}
+          width={leftPanelCollapsed ? 40 : 240}
           style={{
             background: '#fafafa',
             borderRight: '1px solid #f0f0f0',
@@ -1502,13 +2119,34 @@ const Chat: React.FC = () => {
             flexDirection: 'column',
           }}
         >
+          {leftPanelCollapsed ? (
+            <div style={{ padding: 8, display: 'flex', justifyContent: 'center' }}>
+              <Button
+                type="text"
+                size="small"
+                icon={<MenuUnfoldOutlined />}
+                onClick={() => setLeftPanelCollapsed(false)}
+                title="展开会话列表"
+              />
+            </div>
+          ) : (
+          <>
           <div style={{ padding: 12, borderBottom: '1px solid #f0f0f0' }}>
             <Space direction="vertical" style={{ width: '100%' }} size="small">
-              <Space>
-                <BranchesOutlined style={{ color: '#1890ff' }} />
-                <Text strong style={{ fontSize: 13 }}>
-                  会话列表
-                </Text>
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <Space size={6}>
+                  <BranchesOutlined style={{ color: '#1890ff' }} />
+                  <Text strong style={{ fontSize: 13 }}>
+                    会话列表
+                  </Text>
+                </Space>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<MenuFoldOutlined />}
+                  onClick={() => setLeftPanelCollapsed(true)}
+                  title="收起会话列表"
+                />
               </Space>
               <Button
                 type="dashed"
@@ -1589,6 +2227,8 @@ const Chat: React.FC = () => {
               />
             )}
           </div>
+          </>
+          )}
         </Sider>
 
         {/* 中间聊天 */}
@@ -1718,37 +2358,7 @@ const Chat: React.FC = () => {
           {isWorkflowSession ? (
             renderWorkflowContent()
           ) : (
-            <div
-              style={{
-                flex: 1,
-                overflow: 'auto',
-                padding: 20,
-                minHeight: 0,
-              }}
-            >
-              {streamMessages.length === 0 ? (
-                <div
-                  style={{
-                    height: '100%',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    flexDirection: 'column',
-                  }}
-                >
-                  <MessageOutlined style={{ fontSize: 80, color: '#d9d9d9' }} />
-                  <Text type="secondary" style={{ marginTop: 16, fontSize: 16 }}>
-                    {currentSessionId ? '该会话暂无消息' : '选择左侧会话或新建会话'}
-                  </Text>
-                  <Text type="secondary" style={{ marginTop: 8, fontSize: 12 }}>
-                    支持拖拽文件、点击上传，或直接粘贴文件
-                  </Text>
-                </div>
-              ) : (
-                streamMessages.map(renderMessage)
-              )}
-              <div ref={messagesEndRef} />
-            </div>
+            renderAgentTimelineContent()
           )}
 
           {/* 输入区 */}

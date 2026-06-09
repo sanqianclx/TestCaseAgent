@@ -9,8 +9,8 @@
  * 支持折叠 / 展开，避免占用聊天宽度。
  */
 
-import React, { useMemo, useState } from 'react';
-import { Tabs, List, Tag, Empty, Button, Space, Typography, Badge } from 'antd';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Tabs, List, Tag, Empty, Button, Space, Typography, Badge, Collapse } from 'antd';
 import {
   ToolOutlined,
   FolderOpenOutlined,
@@ -42,6 +42,8 @@ export interface ToolEvent {
   toolName?: string;
   /** 工具参数 */
   args?: Record<string, any>;
+  /** 工具结果 */
+  result?: any;
   /** 框架 runId（用于调 /resume） */
   runId?: string;
   /** 工具调用 ID */
@@ -52,6 +54,31 @@ export interface ToolEvent {
   status?: ToolEventStatus;
   /** 用户填写的附加说明 */
   answer?: string;
+}
+
+function normalizeToolName(toolName?: string) {
+  return String(toolName || '').replace(/-/g, '').toLowerCase();
+}
+
+function renderToolSummary(e: ToolEvent) {
+  const tool = normalizeToolName(e.toolName || e.step);
+  const args = e.args || {};
+  const result = e.result || {};
+  const filePath = result.file_path || result.filePath || result.path || args.path || args.filePath;
+  if (tool === 'readfile') return `Read ${filePath || ''}`.trim();
+  if (tool === 'writefile') return `Edit ${filePath || ''}`.trim();
+  if (tool === 'shellrun') return `Shell ${args.command || result.command || ''}`.trim();
+  return e.message;
+}
+
+function renderToolDetails(e: ToolEvent) {
+  const tool = normalizeToolName(e.toolName || e.step);
+  if (tool !== 'shellrun') return '';
+  const result = e.result || {};
+  return [
+    result.stdout ? `stdout:\n${result.stdout}` : '',
+    result.stderr ? `stderr:\n${result.stderr}` : '',
+  ].filter(Boolean).join('\n\n');
 }
 
 /**
@@ -140,10 +167,18 @@ const ChatRightPanel: React.FC<ChatRightPanelProps> = ({
   onDeclineTool,
 }) => {
   const [activeTab, setActiveTab] = useState<string>('tools');
+  const toolsScrollRef = useRef<HTMLDivElement | null>(null);
   const selectedOutputFile = useMemo(
     () => outputEntries.find((entry) => entry.path === selectedOutputFilePath) || null,
     [outputEntries, selectedOutputFilePath]
   );
+
+  useEffect(() => {
+    if (activeTab !== 'tools') return;
+    const el = toolsScrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  }, [activeTab, toolEvents.length, toolEvents[toolEvents.length - 1]?.status]);
 
   // 折叠时只显示竖排按钮
   if (collapsed) {
@@ -262,7 +297,7 @@ const ChatRightPanel: React.FC<ChatRightPanelProps> = ({
           key="tools"
           style={{ flex: 1, padding: 8, minHeight: 0 }}
         >
-          <div style={{ maxHeight: 'calc(100vh - 180px)', overflowY: 'auto', paddingRight: 4 }}>
+          <div ref={toolsScrollRef} style={{ maxHeight: 'calc(100vh - 180px)', overflowY: 'auto', paddingRight: 4 }}>
             {toolEvents.length === 0 ? (
               <Empty
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
@@ -275,6 +310,7 @@ const ChatRightPanel: React.FC<ChatRightPanelProps> = ({
                 dataSource={toolEvents}
                 renderItem={(e) => {
                 const isPending = e.status === 'pending';
+                const details = renderToolDetails(e);
                 const statusTag = isPending ? (
                   <Tag color="warning" style={{ marginRight: 0, fontSize: 10 }}>待审批</Tag>
                 ) : e.status === 'approved' ? (
@@ -289,8 +325,28 @@ const ChatRightPanel: React.FC<ChatRightPanelProps> = ({
                         {e.step || 'step'}
                       </Tag>
                       {statusTag}
-                      <Text style={{ fontSize: 12, flex: 1 }}>{e.message}</Text>
+                      <Text style={{ fontSize: 12, flex: 1 }} ellipsis={{ tooltip: renderToolSummary(e) }}>
+                        {renderToolSummary(e)}
+                      </Text>
                     </Space>
+                    {details && (
+                      <Collapse
+                        size="small"
+                        ghost
+                        style={{ marginTop: 4 }}
+                        items={[
+                          {
+                            key: 'details',
+                            label: '命令输出',
+                            children: (
+                              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 11 }}>
+                                {details}
+                              </pre>
+                            ),
+                          },
+                        ]}
+                      />
+                    )}
                     {e.answer && (
                       <div style={{ fontSize: 11, color: '#666', marginTop: 2, paddingLeft: 4 }}>
                         备注：{e.answer}
