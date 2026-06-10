@@ -1,76 +1,56 @@
 import { Agent } from "@mastra/core/agent"
+import "../runtime/env.js"
+import { readFileTool } from "../tools/read-file-tool.js"
 
-/*
- * 失败诊断Agent（快速通道）：分析测试失败原因，输出结构化诊断
- * 使用 deepseek-chat 模型，适合首次快速诊断常规错误
- */
+const instructions = `你是 Python、Java 和 C++ 单元测试失败诊断专家。
+
+你的输出直接写入最终报告，所以请写自然语言的诊断文本，而不是 JSON。
+
+关注根本原因：
+- 如果源代码有错误，解释具体的源代码缺陷和正确的预期行为。
+- 如果生成的测试代码有错误，解释测试代码错在哪里。
+- 如果环境缺少工具或依赖，解释缺少什么，并仅以纯文本形式提及命令。
+- 只引用关键的报错行。不要粘贴完整日志。
+- 要直接而有用。`
+
 export const diagnosisAgent = new Agent({
   id: "diagnosis-agent",
-  name: "失败诊断Agent",
-  instructions: `你是一个测试失败诊断专家。
-
-你的职责：
-分析测试执行失败的原因，输出结构化诊断结果。
-
-诊断类型定义：
-1. TEST_CODE_ERROR - 测试代码自身问题
-   判断依据：traceback指向测试文件；导入路径、fixture、参数调用错误；使用了不存在的函数/类
-   
-2. SOURCE_RUNTIME_ERROR - 源代码执行错误
-   判断依据：traceback指向源文件；源代码语法错误、运行时异常、依赖缺失
-   
-3. BEHAVIOR_MISMATCH - 行为不一致
-   判断依据：测试可执行，但返回值与预期不符，且预期有明确依据（docstring、需求文本）
-   
-4. UNKNOWN - 无法确定
-   判断依据：证据不足，无法可靠判断
-
-输出格式（JSON）：
-{
-  "diagnosis_type": "TEST_CODE_ERROR",
-  "confidence": 0.85,
-  "evidence": ["证据1", "证据2"],
-  "next_action": "REGENERATE_TEST_CODE"
-}
-
-置信度低于0.70时不自动处理，向用户报告。`,
-  model: "deepseek/deepseek-chat",
+  name: "失败诊断 Agent",
+  tools: { readFile: readFileTool },
+  instructions,
+  model: "deepseek/deepseek-v4-flash",
 })
 
-/*
- * 失败诊断Agent（深度推理通道）：与 diagnosisAgent 相同的职责
- * 使用 deepseek-v4-pro 模型，具备深度推理能力，
- * 仅在 chat 版本诊断不充分时作为重试使用，提高复杂错误的诊断准确率。
- */
 export const diagnosisAgentPro = new Agent({
   id: "diagnosis-agent-pro",
-  name: "失败诊断Agent(推理增强)",
-  instructions: `你是一个测试失败诊断专家，具备深度推理能力。
+  name: "失败诊断 Agent Pro",
+  tools: { readFile: readFileTool },
+  instructions,
+  model: "deepseek/deepseek-v4-pro",
+})
 
-你的职责：
-深入分析测试执行失败的根本原因，输出结构化诊断结果。仔细推理traceback和输出中的每一条线索。
+export const diagnosisDecisionAgent = new Agent({
+  id: "diagnosis-decision-agent",
+  name: "失败诊断决策 Agent",
+  tools: { readFile: readFileTool },
+  instructions: `你将自然语言的单元测试失败诊断转换为用于自动化的简短 JSON 决策。
+这个 JSON 是内部使用的，不会写入用户的最终报告。
 
-诊断类型定义：
-1. TEST_CODE_ERROR - 测试代码自身问题
-   判断依据：traceback指向测试文件；导入路径、fixture、参数调用错误；使用了不存在的函数/类
-   
-2. SOURCE_RUNTIME_ERROR - 源代码执行错误
-   判断依据：traceback指向源文件；源代码语法错误、运行时异常、依赖缺失
-   
-3. BEHAVIOR_MISMATCH - 行为不一致
-   判断依据：测试可执行，但返回值与预期不符，且预期有明确依据（docstring、需求文本）
-   
-4. UNKNOWN - 无法确定
-   判断依据：证据不足，无法可靠判断
-
-输出格式（JSON）：
+只返回有效的 JSON：
 {
-  "diagnosis_type": "TEST_CODE_ERROR",
-  "confidence": 0.85,
-  "evidence": ["证据1", "证据2"],
-  "next_action": "REGENERATE_TEST_CODE"
+  "diagnosis_type": "TEST_CODE_ERROR|SOURCE_RUNTIME_ERROR|BEHAVIOR_MISMATCH|ENVIRONMENT_ERROR|UNKNOWN",
+  "confidence": 0.0,
+  "summary": "简短决策摘要",
+  "evidence": ["关键证据"],
+  "next_action": "REGENERATE_TEST_CODE|ASK_USER_CONFIRMATION|INSTALL_DEPENDENCY|REPORT_TO_USER",
+  "suggested_commands": ["可选的 shell 命令"]
 }
 
-置信度低于0.70时不自动处理，向用户报告。`,
-  model: "deepseek/deepseek-v4-pro",
+决策规则：
+- TEST_CODE_ERROR -> REGENERATE_TEST_CODE
+- SOURCE_RUNTIME_ERROR -> REPORT_TO_USER
+- BEHAVIOR_MISMATCH -> ASK_USER_CONFIRMATION
+- ENVIRONMENT_ERROR -> INSTALL_DEPENDENCY
+- UNKNOWN -> REPORT_TO_USER`,
+  model: "deepseek/deepseek-v4-flash",
 })

@@ -51,3 +51,4 @@ test
 # ===== 垃圾箱目录 =====
 trash/
 .env
+.claude/settings.json

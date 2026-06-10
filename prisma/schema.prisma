@@ -1,0 +1,373 @@
+// =====================================================
+// TestGenerate Agent - Prisma Schema
+// 数据库: MySQL 8.0+
+// =====================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================
+// 1. 用户表 (users)
+// =====================================================
+model User {
+  id            BigInt    @id @default(autoincrement())
+  username      String    @unique @db.VarChar(50)
+  email         String    @unique @db.VarChar(100)
+  passwordHash  String    @map("password_hash") @db.VarChar(255)
+  avatarUrl     String?   @map("avatar_url") @db.VarChar(500)
+  role          Role      @default(user)
+  status        Status    @default(active)
+  emailVerified Boolean   @default(false) @map("email_verified")
+  preferences   Json?
+  lastLoginAt   DateTime? @map("last_login_at")
+  lastLoginIp   String?   @map("last_login_ip") @db.VarChar(45)
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // 关联关系
+  apiKeys       ApiKey[]
+  workspaces    Workspace[]
+  sessions      Session[]
+  tasks         Task[]
+  uploadedFiles UploadedFile[]
+  usageStats    UsageStat[]
+
+  @@map("users")
+  @@index([email])
+  @@index([username])
+  @@index([status])
+}
+
+// =====================================================
+// 2. API Key 表 (api_keys)
+// =====================================================
+model ApiKey {
+  id          BigInt    @id @default(autoincrement())
+  userId      BigInt    @map("user_id")
+  name        String    @db.VarChar(100)
+  keyHash     String    @map("key_hash") @db.VarChar(255)
+  prefix      String    @db.VarChar(10)
+  permissions Json      @default("[\"read\", \"generate\"]")
+  rateLimit   Int       @default(100) @map("rate_limit")
+  expiresAt   DateTime? @map("expires_at")
+  lastUsedAt  DateTime? @map("last_used_at")
+  lastUsedIp  String?   @map("last_used_ip") @db.VarChar(45)
+  usageCount  BigInt    @default(0) @map("usage_count")
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  // 关联关系
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tasks Task[]
+
+  @@map("api_keys")
+  @@index([userId])
+  @@index([prefix])
+  @@index([isActive])
+}
+
+// =====================================================
+// 3. 工作空间表 (workspaces)
+// =====================================================
+model Workspace {
+  id             BigInt    @id @default(autoincrement())
+  userId         BigInt    @map("user_id")
+  name           String    @db.VarChar(100)
+  basePath       String    @map("base_path") @db.VarChar(500)
+  description    String?   @db.Text
+  isDefault      Boolean   @default(false) @map("is_default")
+  settings       Json?
+  lastAccessedAt DateTime? @map("last_accessed_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  // 关联关系
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions       Session[]
+  tasks          Task[]
+  uploadedFiles  UploadedFile[]
+
+  @@unique([userId, name])
+  @@map("workspaces")
+  @@index([userId])
+}
+
+// =====================================================
+// 4. 会话表 (sessions)
+// =====================================================
+model Session {
+  id            BigInt      @id @default(autoincrement())
+  userId        BigInt      @map("user_id")
+  workspaceId   BigInt?     @map("workspace_id")
+  title         String      @default("新会话") @db.VarChar(200)
+  status        SessionStatus @default(active)
+  mode          TaskMode     @default(autonomous)
+  context       Json?
+  modelConfig   Json?       @map("model_config")
+  messageCount  Int         @default(0) @map("message_count")
+  totalTokens   BigInt      @default(0) @map("total_tokens")
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+  lastMessageAt DateTime?   @map("last_message_at")
+
+  // 关联关系
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace     Workspace?    @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  messages      Message[]
+  tasks         Task[]
+  uploadedFiles UploadedFile[]
+  taskLogs      TaskLog[]
+
+  @@map("sessions")
+  @@index([userId])
+  @@index([workspaceId])
+  @@index([status])
+  @@index([lastMessageAt])
+  @@index([userId, status, lastMessageAt])
+}
+
+// =====================================================
+// 5. 消息表 (messages)
+// =====================================================
+model Message {
+  id          BigInt      @id @default(autoincrement())
+  sessionId   BigInt      @map("session_id")
+  role        MessageRole
+  content     String      @db.Text
+  messageType MessageType @default(text) @map("message_type")
+  metadata    Json?
+  tokenUsage  Json?       @map("token_usage")
+  parentId    BigInt?     @map("parent_id")
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  // 关联关系
+  session  Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  parent   Message? @relation("MessageReplies", fields: [parentId], references: [id])
+  replies  Message[] @relation("MessageReplies")
+
+  @@map("messages")
+  @@index([sessionId])
+  @@index([role])
+  @@index([createdAt])
+  @@index([parentId])
+  @@index([sessionId, createdAt])
+}
+
+// =====================================================
+// 6. 任务表 (tasks)
+// =====================================================
+model Task {
+  id            BigInt       @id @default(autoincrement())
+  userId        BigInt       @map("user_id")
+  workspaceId   BigInt?      @map("workspace_id")
+  sessionId     BigInt?      @map("session_id")
+  apiKeyId      BigInt?      @map("api_key_id")
+  taskId        String       @unique @map("task_id") @db.VarChar(36)
+  status        TaskStatus   @default(pending)
+  mode          TaskMode     @default(workflow)
+  sourceFile    String       @map("source_file") @db.VarChar(500)
+  sourceContent String?      @map("source_content") @db.Text
+  language      String       @db.VarChar(20)
+  requirements  String?      @db.Text
+  outputDir     String?      @map("output_dir") @db.VarChar(500)
+  result        Json?
+  errorMessage  String?      @map("error_message") @db.Text
+  executionTime Int?         @map("execution_time")
+  tokenUsage    Json?        @map("token_usage")
+  attemptCount  Int          @default(0) @map("attempt_count")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+  startedAt     DateTime?    @map("started_at")
+  completedAt   DateTime?    @map("completed_at")
+
+  // 关联关系
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  session   Session?   @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  apiKey    ApiKey?    @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+  logs      TaskLog[]
+
+  @@map("tasks")
+  @@index([userId])
+  @@index([workspaceId])
+  @@index([sessionId])
+  @@index([taskId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([userId, status, createdAt])
+}
+
+// =====================================================
+// 7. 任务日志表 (task_logs)
+// =====================================================
+model TaskLog {
+  id        BigInt    @id @default(autoincrement())
+  taskId    String    @map("task_id") @db.VarChar(36)
+  sessionId BigInt?   @map("session_id")
+  level     LogLevel  @default(info)
+  step      String?   @db.VarChar(50)
+  message   String    @db.Text
+  metadata  Json?
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  // 关联关系
+  task    Task     @relation(fields: [taskId], references: [taskId])
+  session Session? @relation(fields: [sessionId], references: [id])
+
+  @@map("task_logs")
+  @@index([taskId])
+  @@index([sessionId])
+  @@index([level])
+  @@index([createdAt])
+}
+
+// =====================================================
+// 8. 上传文件表 (uploaded_files)
+// =====================================================
+model UploadedFile {
+  id          BigInt      @id @default(autoincrement())
+  userId      BigInt      @map("user_id")
+  workspaceId BigInt?     @map("workspace_id")
+  sessionId   BigInt?     @map("session_id")
+  filename    String      @db.VarChar(255)
+  originalName String    @map("original_name") @db.VarChar(255)
+  mimeType    String      @map("mime_type") @db.VarChar(100)
+  size        BigInt
+  path        String      @db.VarChar(500)
+  hash        String      @db.VarChar(64)
+  purpose     FilePurpose @default(source)
+  metadata    Json?
+  isProcessed Boolean     @default(false) @map("is_processed")
+  processedAt DateTime?   @map("processed_at")
+  expiresAt   DateTime?   @map("expires_at")
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  // 关联关系
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace   Workspace?  @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  session     Session?    @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  contents    FileContent[]
+
+  @@map("uploaded_files")
+  @@index([userId])
+  @@index([workspaceId])
+  @@index([sessionId])
+  @@index([hash])
+  @@index([purpose])
+  @@index([expiresAt])
+  @@index([userId, purpose, createdAt])
+}
+
+// =====================================================
+// 9. 文件内容表 (file_contents)
+// =====================================================
+model FileContent {
+  id        BigInt   @id @default(autoincrement())
+  fileId    BigInt   @map("file_id")
+  chunkIndex Int     @default(0) @map("chunk_index")
+  content   Bytes
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // 关联关系
+  file UploadedFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@unique([fileId, chunkIndex])
+  @@map("file_contents")
+}
+
+// =====================================================
+// 10. 使用统计表 (usage_stats)
+// =====================================================
+model UsageStat {
+  id          BigInt   @id @default(autoincrement())
+  userId      BigInt   @map("user_id")
+  date        DateTime @db.Date
+  taskCount   Int      @default(0) @map("task_count")
+  messageCount Int     @default(0) @map("message_count")
+  tokenUsage  BigInt   @default(0) @map("token_usage")
+  fileCount   Int      @default(0) @map("file_count")
+  storageUsed BigInt   @default(0) @map("storage_used")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // 关联关系
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@map("usage_stats")
+  @@index([date])
+}
+
+// =====================================================
+// 枚举类型
+// =====================================================
+
+enum Role {
+  user
+  admin
+  super_admin
+}
+
+enum Status {
+  active
+  inactive
+  banned
+}
+
+enum SessionStatus {
+  active
+  archived
+  deleted
+}
+
+enum MessageRole {
+  user
+  assistant
+  system
+  tool
+}
+
+enum MessageType {
+  text
+  code
+  file
+  error
+  task_result
+}
+
+enum TaskStatus {
+  pending
+  running
+  completed
+  failed
+  cancelled
+}
+
+enum TaskMode {
+  workflow
+  autonomous
+}
+
+enum LogLevel {
+  info
+  warn
+  error
+  debug
+  step
+}
+
+enum FilePurpose {
+  source
+  reference
+  config
+  other
+  test_output
+  test_plan
+}

@@ -1,4 +1,5 @@
 import { createTool } from "@mastra/core/tools"
+import path from "path"
 import { z } from "zod"
 import { callPythonScript } from "../runtime/python-bridge.js"
 
@@ -27,18 +28,44 @@ export function exportCases(inputData: {
   execution_result?: unknown
   diagnosis?: unknown
   quality?: unknown
+  coverage?: unknown
   versions?: unknown[]
   artifact_prefix?: string
+  skip_py?: boolean
 }): ExportCasesOutput {
-  const result = callPythonScript<ExportCasesOutput>("export_cases.py", inputData, 30_000)
+  const result = callPythonScript<ExportCasesOutput>("export_cases.py", {
+    ...inputData,
+    output_dir: path.resolve(inputData.output_dir),
+  }, 30_000)
   if (!result.ok || !result.data) {
     throw new Error(`导出失败: ${result.error?.message ?? "未知错误"}`)
   }
   return result.data
 }
 
+/**
+ * 判定路径是否在 CWD 之内（用于 export-cases 条件审批）
+ * 对工作流零影响：纯本地路径比较，工作流不调用本函数
+ */
+function isPathInsideCwd(target: string): boolean {
+  if (typeof target !== "string" || target.length === 0) return false
+  const resolved = path.resolve(target)
+  const cwd = process.cwd()
+  const cmp = (s: string) => (process.platform === "win32" ? s.toLowerCase() : s)
+  return cmp(resolved) === cmp(cwd) || cmp(resolved).startsWith(cmp(cwd) + path.sep)
+}
+
 export const exportCasesTool = createTool({
   id: "export-cases",
+  // V2.4: 工具级 requireApproval（agent 级开关已关闭）
+  // 用函数形式做条件审批：仅当 output_dir 在 CWD 外时才需要 y/n；
+  // CWD 内（如 output/exports/...）自动放行
+  // 对工作流零影响：requireApproval 只在 Agent 调用时由框架拦截；工作流不经过这层
+  requireApproval: async (input: { output_dir?: string }) => {
+    const dir = input?.output_dir
+    if (typeof dir !== "string") return true
+    return !isPathInsideCwd(dir)
+  },
   description:
     "将生成完成的测试用例列表和pytest测试代码导出为文件：" +
     "(1) test_generated.py 可执行pytest测试文件，" +
@@ -53,6 +80,13 @@ export const exportCasesTool = createTool({
     quality: z.any().optional().describe("质量检查结果对象（ok/issues/checked_tests）"),
     versions: z.array(z.any()).optional().describe("测试代码版本记录，用于在报告中展示自愈过程"),
     artifact_prefix: z.string().optional().describe("可选导出文件后缀，如plan会生成test_cases_plan.md"),
+    // V2.4 新增：LLM 自评风险（CLI 显示）。.optional() 对现有调用方完全向后兼容
+    risk: z.object({
+      level: z.enum(["low", "medium", "high"])
+        .describe("你评估的导出操作风险等级；output_dir 在 CWD 外时建议给 high"),
+      reasons: z.array(z.string())
+        .describe("1-3 条具体风险原因"),
+    }).optional(),
   }),
   outputSchema: z.object({
     exported_files: z.array(z.string()).describe("生成的文件绝对路径列表"),

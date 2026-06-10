@@ -1,0 +1,584 @@
+# 数据库详细设计文档
+
+## 📊 完整 ER 图
+
+```
+┌─────────────┐       ┌──────────────┐       ┌─────────────────┐
+│    users     │       │   api_keys   │       │  workspaces     │
+├─────────────┤       ├──────────────┤       ├─────────────────┤
+│ id (PK)     │──┐    │ id (PK)      │       │ id (PK)         │
+│ username    │  │    │ user_id (FK) │       │ user_id (FK)    │
+│ email       │  │    │ name         │       │ name            │
+│ password    │  │    │ key_hash     │       │ base_path       │
+│ avatar      │  │    │ prefix       │       │ description     │
+│ role        │  │    │ permissions  │       │ is_default      │
+│ status      │  │    │ expires_at   │       │ settings (JSON) │
+│ created_at  │  │    │ last_used_at │       │ created_at      │
+│ updated_at  │  │    │ created_at   │       │ updated_at      │
+└─────────────┘  │    └──────────────┘       └─────────────────┘
+       │         │           │                        │
+       │         │    ┌──────────────┐                │
+       │         │    │    tasks     │                │
+       │         │    ├──────────────┤                │
+       │         └────│ id (PK)      │                │
+       │              │ user_id (FK) │                │
+       │              │ workspace_id │────────────────┘
+       │              │ api_key_id   │
+       │              │ session_id   │──────────────────┐
+       │              │ status       │                  │
+       │              │ mode         │       ┌──────────────────┐
+       │              │ source_file  │       │    sessions      │
+       │              │ language     │       ├──────────────────┤
+       │              │ result       │       │ id (PK)          │
+       │              │ created_at   │       │ user_id (FK)     │
+       │              └──────────────┘       │ workspace_id     │
+       │                     │               │ title            │
+       │              ┌──────────────┐       │ status           │
+       │              │  task_logs   │       │ context (JSON)   │
+       │              ├──────────────┤       │ model_config     │
+       │              │ id (PK)      │       │ created_at       │
+       │              │ task_id (FK) │       │ updated_at       │
+       │              │ level        │       │ last_message_at  │
+       │              │ message      │       └──────────────────┘
+       │              │ created_at   │               │
+       │              └──────────────┘               │
+       │                                             │
+       │         ┌──────────────────┐       ┌──────────────────┐
+       │         │  uploaded_files  │       │    messages      │
+       │         ├──────────────────┤       ├──────────────────┤
+       │         │ id (PK)          │       │ id (PK)          │
+       └─────────│ user_id (FK)     │       │ session_id (FK)  │
+                 │ workspace_id     │───────│ role             │
+                 │ filename         │       │ content          │
+                 │ original_name    │       │ message_type     │
+                 │ mime_type        │       │ metadata (JSON)  │
+                 │ size             │       │ token_usage      │
+                 │ path             │       │ created_at       │
+                 │ hash             │       └──────────────────┘
+                 │ created_at       │
+                 └──────────────────┘
+```
+
+---
+
+## 📋 表结构详细设计
+
+### 1. users 表 (用户表)
+
+```sql
+CREATE TABLE users (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  username        VARCHAR(50) NOT NULL UNIQUE,
+  email           VARCHAR(100) NOT NULL UNIQUE,
+  password_hash   VARCHAR(255) NOT NULL,
+  avatar_url      VARCHAR(500) DEFAULT NULL,
+  role            ENUM('user', 'admin', 'super_admin') DEFAULT 'user',
+  status          ENUM('active', 'inactive', 'banned') DEFAULT 'active',
+  email_verified  BOOLEAN DEFAULT FALSE,
+  preferences     JSON DEFAULT NULL COMMENT '用户偏好设置',
+  last_login_at   DATETIME DEFAULT NULL,
+  last_login_ip   VARCHAR(45) DEFAULT NULL,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  INDEX idx_email (email),
+  INDEX idx_username (username),
+  INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+**preferences 字段结构**：
+```json
+{
+  "theme": "light",
+  "language": "zh-CN",
+  "defaultModel": "deepseek-v4-flash",
+  "maxAttempts": 3,
+  "autoApprove": false
+}
+```
+
+---
+
+### 2. api_keys 表 (API Key 表)
+
+```sql
+CREATE TABLE api_keys (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id         BIGINT NOT NULL,
+  name            VARCHAR(100) NOT NULL,
+  key_hash        VARCHAR(255) NOT NULL,
+  prefix          VARCHAR(10) NOT NULL,
+  permissions     JSON DEFAULT ('["read", "generate"]') COMMENT '权限列表',
+  rate_limit      INT DEFAULT 100 COMMENT '每小时请求限制',
+  expires_at      DATETIME DEFAULT NULL,
+  last_used_at    DATETIME DEFAULT NULL,
+  last_used_ip    VARCHAR(45) DEFAULT NULL,
+  usage_count     BIGINT DEFAULT 0,
+  is_active       BOOLEAN DEFAULT TRUE,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  INDEX idx_user_id (user_id),
+  INDEX idx_prefix (prefix),
+  INDEX idx_is_active (is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+**permissions 可选值**：
+- `read` - 读取文件
+- `generate` - 生成测试
+- `execute` - 执行测试
+- `export` - 导出结果
+- `admin` - 管理员权限
+
+---
+
+### 3. workspaces 表 (工作空间表)
+
+```sql
+CREATE TABLE workspaces (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id         BIGINT NOT NULL,
+  name            VARCHAR(100) NOT NULL,
+  base_path       VARCHAR(500) NOT NULL COMMENT '工作目录绝对路径',
+  description     TEXT DEFAULT NULL,
+  is_default      BOOLEAN DEFAULT FALSE COMMENT '是否默认工作空间',
+  settings        JSON DEFAULT NULL COMMENT '工作空间配置',
+  last_accessed_at DATETIME DEFAULT NULL,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  INDEX idx_user_id (user_id),
+  UNIQUE KEY uk_user_name (user_id, name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+**settings 字段结构**：
+```json
+{
+  "defaultLanguage": "auto",
+  "maxAttempts": 3,
+  "llmRetries": 2,
+  "outputDir": "./output",
+  "excludePatterns": ["node_modules", ".git", "__pycache__"],
+  "autoDetectLanguage": true
+}
+```
+
+---
+
+### 4. sessions 表 (会话表)
+
+```sql
+CREATE TABLE sessions (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id         BIGINT NOT NULL,
+  workspace_id    BIGINT DEFAULT NULL,
+  title           VARCHAR(200) DEFAULT '新会话',
+  status          ENUM('active', 'archived', 'deleted') DEFAULT 'active',
+  context         JSON DEFAULT NULL COMMENT '会话上下文信息',
+  model_config    JSON DEFAULT NULL COMMENT '模型配置',
+  message_count   INT DEFAULT 0,
+  total_tokens    BIGINT DEFAULT 0,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  last_message_at DATETIME DEFAULT NULL,
+  
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL,
+  INDEX idx_user_id (user_id),
+  INDEX idx_workspace_id (workspace_id),
+  INDEX idx_status (status),
+  INDEX idx_last_message_at (last_message_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+**context 字段结构**：
+```json
+{
+  "currentTask": null,
+  "uploadedFiles": [1, 2, 3],
+  "workingDirectory": "/path/to/project",
+  "selectedLanguage": "python",
+  "customRequirements": ""
+}
+```
+
+**model_config 字段结构**：
+```json
+{
+  "provider": "deepseek",
+  "model": "v4-flash",
+  "temperature": 0.7,
+  "maxTokens": 4096,
+  "systemPrompt": ""
+}
+```
+
+---
+
+### 5. messages 表 (消息表)
+
+```sql
+CREATE TABLE messages (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  session_id      BIGINT NOT NULL,
+  role            ENUM('user', 'assistant', 'system', 'tool') NOT NULL,
+  content         TEXT NOT NULL,
+  message_type    ENUM('text', 'code', 'file', 'error', 'task_result') DEFAULT 'text',
+  metadata        JSON DEFAULT NULL COMMENT '消息元数据',
+  token_usage     JSON DEFAULT NULL COMMENT 'Token 使用统计',
+  parent_id       BIGINT DEFAULT NULL COMMENT '父消息 ID（用于回复链）',
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+  INDEX idx_session_id (session_id),
+  INDEX idx_role (role),
+  INDEX idx_created_at (created_at),
+  INDEX idx_parent_id (parent_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+**metadata 字段结构（根据 message_type 不同）**：
+```json
+// text 类型
+{
+  "format": "markdown"
+}
+
+// code 类型
+{
+  "language": "python",
+  "filename": "test_example.py",
+  "highlight": true
+}
+
+// file 类型
+{
+  "fileId": 123,
+  "filename": "example.py",
+  "size": 1024,
+  "mimeType": "text/x-python"
+}
+
+// task_result 类型
+{
+  "taskId": "uuid",
+  "status": "completed",
+  "coverage": 85.5,
+  "passed": 10,
+  "failed": 0,
+  "outputFiles": ["test_example.py"]
+}
+```
+
+**token_usage 字段结构**：
+```json
+{
+  "promptTokens": 150,
+  "completionTokens": 300,
+  "totalTokens": 450,
+  "model": "deepseek-v4-flash",
+  "cost": 0.001
+}
+```
+
+---
+
+### 6. tasks 表 (测试生成任务表)
+
+```sql
+CREATE TABLE tasks (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id         BIGINT NOT NULL,
+  workspace_id    BIGINT DEFAULT NULL,
+  session_id      BIGINT DEFAULT NULL,
+  api_key_id      BIGINT DEFAULT NULL,
+  task_id         VARCHAR(36) NOT NULL UNIQUE COMMENT 'UUID',
+  status          ENUM('pending', 'running', 'completed', 'failed', 'cancelled') DEFAULT 'pending',
+  mode            ENUM('workflow', 'autonomous') DEFAULT 'workflow',
+  source_file     VARCHAR(500) NOT NULL,
+  source_content  TEXT DEFAULT NULL COMMENT '源代码内容快照',
+  language        VARCHAR(20) NOT NULL,
+  requirements    TEXT DEFAULT NULL,
+  output_dir      VARCHAR(500) DEFAULT NULL,
+  result          JSON DEFAULT NULL,
+  error_message   TEXT DEFAULT NULL,
+  execution_time  INT DEFAULT NULL COMMENT '执行耗时（毫秒）',
+  token_usage     JSON DEFAULT NULL,
+  attempt_count   INT DEFAULT 0 COMMENT '尝试次数',
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  started_at      DATETIME DEFAULT NULL,
+  completed_at    DATETIME DEFAULT NULL,
+  
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL,
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL,
+  FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE SET NULL,
+  INDEX idx_user_id (user_id),
+  INDEX idx_workspace_id (workspace_id),
+  INDEX idx_session_id (session_id),
+  INDEX idx_task_id (task_id),
+  INDEX idx_status (status),
+  INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+**result 字段结构**：
+```json
+{
+  "testCode": "import pytest\n...",
+  "testFile": "test_example.py",
+  "coverage": {
+    "line": 85.5,
+    "branch": 72.3,
+    "function": 90.0
+  },
+  "execution": {
+    "passed": 10,
+    "failed": 0,
+    "skipped": 1,
+    "duration": 2.5
+  },
+  "diagnosis": null,
+  "exportedFiles": [
+    "./output/test_example.py",
+    "./output/report.md"
+  ]
+}
+```
+
+---
+
+### 7. task_logs 表 (任务日志表)
+
+```sql
+CREATE TABLE task_logs (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  task_id         VARCHAR(36) NOT NULL,
+  session_id      BIGINT DEFAULT NULL,
+  level           ENUM('info', 'warn', 'error', 'debug', 'step') DEFAULT 'info',
+  step            VARCHAR(50) DEFAULT NULL COMMENT '当前步骤',
+  message         TEXT NOT NULL,
+  metadata        JSON DEFAULT NULL,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  
+  INDEX idx_task_id (task_id),
+  INDEX idx_session_id (session_id),
+  INDEX idx_level (level),
+  INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+**step 可选值**：
+- `parse` - 解析源代码
+- `design` - 设计测试用例
+- `generate` - 生成测试代码
+- `execute` - 执行测试
+- `diagnose` - 诊断失败
+- `heal` - 自愈修复
+- `export` - 导出结果
+
+---
+
+### 8. uploaded_files 表 (上传文件表)
+
+```sql
+CREATE TABLE uploaded_files (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id         BIGINT NOT NULL,
+  workspace_id    BIGINT DEFAULT NULL,
+  session_id      BIGINT DEFAULT NULL,
+  filename        VARCHAR(255) NOT NULL COMMENT '存储文件名',
+  original_name   VARCHAR(255) NOT NULL COMMENT '原始文件名',
+  mime_type       VARCHAR(100) NOT NULL,
+  size            BIGINT NOT NULL COMMENT '文件大小（字节）',
+  path            VARCHAR(500) NOT NULL COMMENT '存储路径',
+  hash            VARCHAR(64) NOT NULL COMMENT '文件 SHA256',
+  purpose         ENUM('source', 'reference', 'config', 'other') DEFAULT 'source',
+  metadata        JSON DEFAULT NULL COMMENT '文件元数据',
+  is_processed    BOOLEAN DEFAULT FALSE COMMENT '是否已处理',
+  processed_at    DATETIME DEFAULT NULL,
+  expires_at      DATETIME DEFAULT NULL COMMENT '过期时间',
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL,
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL,
+  INDEX idx_user_id (user_id),
+  INDEX idx_workspace_id (workspace_id),
+  INDEX idx_session_id (session_id),
+  INDEX idx_hash (hash),
+  INDEX idx_purpose (purpose),
+  INDEX idx_expires_at (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+**metadata 字段结构**：
+```json
+{
+  "language": "python",
+  "lineCount": 150,
+  "functionCount": 5,
+  "classCount": 2,
+  "encoding": "utf-8"
+}
+```
+
+---
+
+### 9. file_contents 表 (文件内容表 - 用于大文件分块存储)
+
+```sql
+CREATE TABLE file_contents (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  file_id         BIGINT NOT NULL,
+  chunk_index     INT NOT NULL DEFAULT 0,
+  content         LONGBLOB NOT NULL,
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  
+  FOREIGN KEY (file_id) REFERENCES uploaded_files(id) ON DELETE CASCADE,
+  UNIQUE KEY uk_file_chunk (file_id, chunk_index)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+---
+
+### 10. usage_stats 表 (使用统计表)
+
+```sql
+CREATE TABLE usage_stats (
+  id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id         BIGINT NOT NULL,
+  date            DATE NOT NULL,
+  task_count      INT DEFAULT 0,
+  message_count   INT DEFAULT 0,
+  token_usage     BIGINT DEFAULT 0,
+  file_count      INT DEFAULT 0,
+  storage_used    BIGINT DEFAULT 0 COMMENT '存储使用量（字节）',
+  created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  UNIQUE KEY uk_user_date (user_id, date),
+  INDEX idx_date (date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+---
+
+## 🔑 索引策略
+
+### 复合索引
+
+```sql
+-- 会话查询优化
+CREATE INDEX idx_sessions_user_status ON sessions(user_id, status, last_message_at DESC);
+
+-- 消息查询优化
+CREATE INDEX idx_messages_session_created ON messages(session_id, created_at);
+
+-- 任务查询优化
+CREATE INDEX idx_tasks_user_status ON tasks(user_id, status, created_at DESC);
+
+-- 文件查询优化
+CREATE INDEX idx_files_user_purpose ON uploaded_files(user_id, purpose, created_at DESC);
+```
+
+---
+
+## 📊 数据量预估
+
+| 表 | 单行大小 | 日增长量 | 月增长量 | 年增长量 |
+|----|----------|----------|----------|----------|
+| users | ~1 KB | 100 | 3,000 | 36,000 |
+| api_keys | ~0.5 KB | 50 | 1,500 | 18,000 |
+| workspaces | ~1 KB | 50 | 1,500 | 18,000 |
+| sessions | ~2 KB | 500 | 15,000 | 180,000 |
+| messages | ~5 KB | 5,000 | 150,000 | 1,800,000 |
+| tasks | ~10 KB | 200 | 6,000 | 72,000 |
+| task_logs | ~2 KB | 2,000 | 60,000 | 720,000 |
+| uploaded_files | ~1 KB | 300 | 9,000 | 108,000 |
+| file_contents | ~50 KB | 300 | 9,000 | 108,000 |
+
+**存储预估（年）**：
+- 元数据：~5 GB
+- 文件内容：~5 TB（需要定期清理）
+
+---
+
+## 🗃️ 分区策略
+
+### 按时间分区（适用于大表）
+
+```sql
+-- messages 表按月分区
+ALTER TABLE messages PARTITION BY RANGE (TO_DAYS(created_at)) (
+  PARTITION p202601 VALUES LESS THAN (TO_DAYS('2026-02-01')),
+  PARTITION p202602 VALUES LESS THAN (TO_DAYS('2026-03-01')),
+  -- ...
+  PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+
+-- task_logs 表按月分区
+ALTER TABLE task_logs PARTITION BY RANGE (TO_DAYS(created_at)) (
+  PARTITION p202601 VALUES LESS THAN (TO_DAYS('2026-02-01')),
+  -- ...
+  PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+```
+
+---
+
+## 🧹 数据清理策略
+
+### 自动清理任务
+
+```sql
+-- 清理过期文件
+DELETE FROM uploaded_files WHERE expires_at < NOW();
+
+-- 清理已删除会话的消息（30天后）
+DELETE m FROM messages m
+JOIN sessions s ON m.session_id = s.id
+WHERE s.status = 'deleted' AND s.updated_at < DATE_SUB(NOW(), INTERVAL 30 DAY);
+
+-- 归档旧任务日志（90天后）
+-- 移动到 task_logs_archive 表
+INSERT INTO task_logs_archive SELECT * FROM task_logs WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY);
+DELETE FROM task_logs WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY);
+```
+
+---
+
+## 🔒 安全考虑
+
+### 敏感数据加密
+
+| 字段 | 加密方式 | 说明 |
+|------|----------|------|
+| users.password_hash | bcrypt | 单向哈希 |
+| api_keys.key_hash | bcrypt | 单向哈希 |
+| api_keys.prefix | 明文 | 用于快速查找 |
+| uploaded_files.path | 明文 | 存储路径 |
+
+### 访问控制
+
+```sql
+-- 创建只读用户（用于报表）
+CREATE USER 'tg_readonly'@'%' IDENTIFIED BY 'password';
+GRANT SELECT ON testgenerate.* TO 'tg_readonly'@'%';
+
+-- 创建应用用户
+CREATE USER 'tg_app'@'%' IDENTIFIED BY 'password';
+GRANT SELECT, INSERT, UPDATE, DELETE ON testgenerate.* TO 'tg_app'@'%';
+```
+
+---
+
+*文档版本: 1.1*
+*更新时间: 2026-06-04*

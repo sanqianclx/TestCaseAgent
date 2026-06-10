@@ -3,18 +3,48 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "mastra dev",
+    "dev": "tsx watch src/server/index.ts",
     "build": "tsc",
     "generate": "node dist/cli.js",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "agent": "node dist/cli.js --autonomous",
+    "server": "node dist/server/index.js",
+    "server:dev": "tsx watch src/server/index.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:push": "prisma db push",
+    "prisma:studio": "prisma studio"
   },
   "dependencies": {
     "@ai-sdk/deepseek": "^2.0.35",
     "@mastra/core": "^1.0.0",
+    "@prisma/client": "^5.22.0",
+    "@types/cookie-parser": "^1.4.10",
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-cpp": "^0.23.4",
+    "tree-sitter-java": "^0.23.5",
+    "uuid": "^9.0.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.5",
+    "@types/multer": "^1.4.11",
     "@types/node": "^22.0.0",
+    "@types/uuid": "^9.0.7",
+    "prisma": "^5.22.0",
+    "tsx": "^4.7.0",
     "typescript": "^5.5.0"
   }
 }
