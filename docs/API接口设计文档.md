@@ -1,5 +1,7 @@
 # API 接口详细设计文档
 
+> 📌 **实现状态注记（2026-06-11）**：本文档含设计稿与实际实现两部分内容。下方「实际端点总览」为权威清单（与 `src/server/routes/` 一一对应）；正文中标注 ⚠️ 的章节为设计稿中规划但**当前未实现**的端点，保留以备后续迭代参考。
+
 ## 📡 API 总览
 
 ### 基础信息
@@ -10,6 +12,64 @@
 | 认证方式 | Bearer Token / API Key |
 | 数据格式 | JSON |
 | 字符编码 | UTF-8 |
+
+### 实际端点总览（与代码一致）
+
+| 模块 | 方法 | 路径 | 说明 |
+|------|------|------|------|
+| 健康检查 | GET | `/health` | 服务状态 |
+| 认证 | POST | `/auth/register` | 用户注册 |
+| 认证 | POST | `/auth/login` | 用户登录 |
+| 认证 | POST | `/auth/refresh` | 刷新 Token |
+| 认证 | POST | `/auth/logout` | 退出登录 |
+| 认证 | GET | `/auth/me` | 获取当前用户 |
+| 认证 | PUT | `/auth/profile` | 更新个人资料 |
+| 认证 | PUT | `/auth/password` | 修改密码 |
+| API Key | GET | `/api-keys` | 列表 |
+| API Key | GET | `/api-keys/stats` | 使用统计 |
+| API Key | POST | `/api-keys` | 创建 |
+| API Key | POST | `/api-keys/test` | 测试 Key 有效性 |
+| API Key | POST | `/api-keys/:id/activate` | 启用 |
+| API Key | POST | `/api-keys/:id/deactivate` | 停用 |
+| API Key | DELETE | `/api-keys/:id` | 删除 |
+| 工作空间 | GET | `/workspaces` | 列表 |
+| 工作空间 | POST | `/workspaces` | 创建 |
+| 工作空间 | GET | `/workspaces/:id` | 详情 |
+| 工作空间 | PUT | `/workspaces/:id` | 更新 |
+| 工作空间 | DELETE | `/workspaces/:id` | 删除 |
+| 工作空间 | POST | `/workspaces/:id/validate` | 验证工作目录 |
+| 工作空间 | GET | `/workspaces/:id/files` | 浏览目录文件 |
+| 文件 | GET | `/files` | 列表 |
+| 文件 | GET | `/files/stats` | 统计 |
+| 文件 | POST | `/files/upload` | 上传单文件 |
+| 文件 | POST | `/files/upload-multiple` | 批量上传（≤10） |
+| 文件 | GET | `/files/:id` | 详情 |
+| 文件 | GET | `/files/:id/content` | 获取内容 |
+| 文件 | DELETE | `/files/:id` | 删除 |
+| 文件 | POST | `/files/:id/analyze` | AST 分析 |
+| 会话 | GET | `/sessions` | 列表 |
+| 会话 | GET | `/sessions/stats` | 统计 |
+| 会话 | POST | `/sessions` | 创建 |
+| 会话 | GET | `/sessions/:id` | 详情 |
+| 会话 | PUT | `/sessions/:id` | 更新 |
+| 会话 | DELETE | `/sessions/:id` | 删除（软删除） |
+| 会话 | POST | `/sessions/:id/archive` | 归档 |
+| 会话 | GET | `/sessions/:id/messages` | 消息历史 |
+| 会话 | POST | `/sessions/:id/messages` | 发送消息 |
+| 会话 | GET | `/sessions/:id/output-files` | 列出会话产物文件 |
+| 会话 | GET | `/sessions/:id/output-file` | 读取单个产物文件 |
+| 任务 | GET | `/tasks` | 列表 |
+| 任务 | GET | `/tasks/stats` | 统计 |
+| 任务 | POST | `/tasks` | 创建 |
+| 任务 | GET | `/tasks/:taskId` | 详情 |
+| 任务 | GET | `/tasks/:taskId/logs` | 日志 |
+| 任务 | GET | `/tasks/:taskId/result` | 结果 |
+| 任务 | POST | `/tasks/:taskId/cancel` | 取消 |
+| 任务 | POST | `/tasks/:taskId/retry` | 重试 |
+| 任务 | DELETE | `/tasks/:taskId` | 删除 |
+| 配置 | GET | `/config/llm` | 读取 LLM 配置 |
+| 流式 | POST | `/stream/agent` | SSE 流式运行 Agent |
+| 流式 | POST | `/stream/agent/resume` | SSE 恢复挂起的 Agent 会话 |
 
 ### 统一响应格式
 
@@ -253,7 +313,7 @@
 
 ---
 
-### GET /api-keys/:id - 获取 API Key 详情
+### ⚠️ GET /api-keys/:id - 获取 API Key 详情（设计稿，未实现）
 
 **响应**：
 ```typescript
@@ -278,7 +338,7 @@
 
 ---
 
-### PUT /api-keys/:id - 更新 API Key
+### ⚠️ PUT /api-keys/:id - 更新 API Key（设计稿，未实现，当前以 activate/deactivate 替代）
 
 **请求**：
 ```typescript
@@ -304,7 +364,7 @@
 
 ---
 
-### POST /api-keys/:id/regenerate - 重新生成 API Key
+### ⚠️ POST /api-keys/:id/regenerate - 重新生成 API Key（设计稿，未实现）
 
 **响应**：
 ```typescript
@@ -788,7 +848,7 @@ purpose?: string
 
 ---
 
-### POST /sessions/:id/messages/stream - 流式发送消息
+### ⚠️ POST /sessions/:id/messages/stream - 流式发送消息（设计稿，未实现，流式能力由 POST /stream/agent 提供）
 
 **请求**：同上
 
@@ -982,7 +1042,7 @@ data: {"taskId": "uuid", "status": "pending"}
 
 ---
 
-### GET /tasks/:taskId/stream - 任务状态流
+### ⚠️ GET /tasks/:taskId/stream - 任务状态流（设计稿，未实现，可轮询 GET /tasks/:taskId）
 
 **响应**：Server-Sent Events (SSE)
 
@@ -1054,7 +1114,7 @@ data: {"taskId": "uuid", "status": "completed", "executionTime": 5000}
 
 ---
 
-### GET /tasks/:taskId/export - 导出任务结果
+### ⚠️ GET /tasks/:taskId/export - 导出任务结果（设计稿，未实现，产物经 GET /sessions/:id/output-files 获取）
 
 **查询参数**：
 ```typescript
@@ -1069,7 +1129,7 @@ data: {"taskId": "uuid", "status": "completed", "executionTime": 5000}
 
 ---
 
-## 🌐 语言接口 (Languages)
+## ⚠️ 语言接口 (Languages)（设计稿，整组未实现，语言列表由前端静态维护）
 
 ### GET /languages - 获取支持的语言列表
 
@@ -1111,7 +1171,7 @@ data: {"taskId": "uuid", "status": "completed", "executionTime": 5000}
 
 ---
 
-## 👑 管理员接口 (Admin)
+## ⚠️ 管理员接口 (Admin)（设计稿，整组未实现）
 
 ### GET /admin/users - 获取用户列表
 
