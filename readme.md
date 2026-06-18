@@ -37,7 +37,7 @@ flowchart LR
     D --> E[LLM 生成测试用例]
     E --> F[导出测试计划]
     F --> G[LLM 生成测试代码]
-    G --> H[沙箱执行测试]
+    G --> H[临时目录执行测试]
     H --> I{通过?}
     I -->|是| J[质量检查]
     J --> K{质量合格?}
@@ -58,7 +58,7 @@ flowchart LR
 |  Agent 框架 | **Mastra** (TypeScript)                     | Agent 编排、Workflow 调度、工具注册、Studio 可视化调试                                               |
 |    LLM    | **DeepSeek**（`@ai-sdk/deepseek`）            | 快慢双通道：`deepseek-v4-flash` 负责首次快速生成，`deepseek-v4-pro` 在自愈重试时保证准确率                     |
 |    代码解析   | Python `ast` + **Tree-sitter**              | Python 通过标准库 `ast` 确定性提取；Java/C++ 使用 `tree-sitter-java` / `tree-sitter-cpp` 做 AST 解析 |
-|    测试执行   | pytest / Maven (JUnit 5) / g++ (GoogleTest) | 沙箱隔离执行，自动超时保护                                                                        |
+|    测试执行   | pytest / Maven (JUnit 5) / g++ (GoogleTest) | 在临时工作目录中以子进程方式隔离执行，自动超时保护                                                                  |
 |    覆盖率    | coverage.py / JaCoCo                        | 真实行/分支覆盖率测量，失败时降级到符号覆盖率                                                              |
 |   Web 后端  | **Express + Prisma + MySQL**                | REST API、JWT 鉴权，管理会话 / 任务 / 文件 / 工作空间                                                |
 |   Web 前端  | **React + Vite + Ant Design**               | 仪表盘、对话界面、文件与工作空间管理                                                                   |
@@ -146,7 +146,7 @@ testgenerate-agent/
 │   └── schema.prisma                   ← 数据库模型定义
 ├── python-runtime/                     ← Python 运行时脚本
 │   ├── parse_source.py                AST 代码解析
-│   ├── run_pytest.py                  pytest 执行器（沙箱隔离）
+│   ├── run_pytest.py                  pytest 执行器（临时目录隔离）
 │   ├── coverage_runner.py             coverage.py 覆盖率运行器
 │   ├── export_cases.py                测试报告导出器
 │   └── requirements.txt               Python 依赖
@@ -321,7 +321,7 @@ Mastra Studio 是开发调试利器：`npx mastra dev`
 
 测试代码生成后会经过两道把关：
 
-**1. 执行通过性**：在沙箱中真实运行测试，逐用例返回通过 / 失败结果；任一失败即触发自愈循环（见上）。质量结果以 `{ ok, issues[], checked_tests }` 结构在工作流中传递，并写入最终报告。
+**1. 执行通过性**：在临时工作目录中真实运行测试，逐用例返回通过 / 失败结果；任一失败即触发自愈循环（见上）。质量结果以 `{ ok, issues[], checked_tests }` 结构在工作流中传递，并写入最终报告。
 
 **2. 覆盖率度量**：
 
@@ -386,7 +386,7 @@ V2.2 起，CLI 端的彩色输出由 [`src/mastra/runtime/cli-output.ts`](./src/
 
 |    版本    | 目标                                                                   |   状态   |
 | :------: | :------------------------------------------------------------------- | :----: |
-| **V1.0** | 单文件 Python → AST 解析 → pytest 生成 → 沙箱执行 → 导出                          |  ✅ 已完成 |
+| **V1.0** | 单文件 Python → AST 解析 → pytest 生成 → 临时目录执行 → 导出                          |  ✅ 已完成 |
 | **V2.0** | 失败诊断 + 自愈循环 + 测试代码版本管理 + 质量检查                                        |  ✅ 已完成 |
 | **V2.1** | 多语言支持（Java + C++）+ 自然语言 CLI 交互 + 内存记忆                                |  ✅ 已完成 |
 | **V2.2** | 真实覆盖率接入（Python coverage.py + Java JaCoCo）+ CLI 输出重构（消除 monkey-patch） |  ✅ 已完成 |
@@ -518,3 +518,21 @@ Agent 请求调用工具：shellRun
 | 记忆     | 一次性会话                               | 进程内持续累积（80 条上限）                   |
 
 **完全独立**：自主模式不引用 `generate-test-workflow` 的任何代码，仅复用日志、CLI 输出、记忆、工具工厂等基础设施。
+
+***
+
+## 未来期望
+
+当前系统已通过「执行通过性」和「覆盖率」两道关卡，但覆盖率不等于有效性。未来计划建立更完整的**测试用例质量评估体系**，重点回答两个问题：**生成的测试真的能抓到 bug 吗？** 以及 **测试断言本身是对的、有意义的吗？**
+
+候选方向（按优先级排序）：
+
+| 方向 | 目标 | 预期落地方式 |
+| :--- | :--- | :--- |
+| **断言质量检查** | 堵住「空断言 / 弱断言 / 假通过」漏洞，让 `QualityResult` 真正生效 | 基于 AST 扫描测试代码，识别 `assert True`、无断言测试体、断言密度过低等问题，结果接入 `isPassed` 门禁 |
+| **变异测试（Mutation Testing）** | 用「变异分数」度量测试的真实缺陷发现能力 | 仿 `coverage-tool.ts` 新增 `mutation-tool.ts`：Python 接入 mutmut / cosmic-ray，Java 接入 PIT，C++ 作为远期目标 |
+| **LLM-as-Judge 用例评审** | 自动发现「oracle 反向工程」「边界遗漏」「需求覆盖不足」等 LLM 生成测试的专属问题 | 新增 `test-review-agent`，对每个用例的 `expected_result` 独立打分并输出问题清单 |
+| **Flaky 测试检测** | 识别结果不稳定、依赖执行顺序的测试 | 同一份测试代码在相同环境下重跑 N 次，结果不一致即标记为 flaky |
+| **需求→用例追溯矩阵** | 让 `requirements_text` 不再只是提示词附件 | 生成「需求点 → 覆盖用例」映射表，报告未覆盖需求 |
+
+> 以上能力目前处于规划阶段，尚未进入实现排期。相关基础设施（AST 解析、覆盖率工具、多 Agent 架构）已就绪，后续可按优先级逐个接入。
